@@ -2422,6 +2422,7 @@ pub fn run() {
             gpu_image_cache: Mutex::new(None),
             gpu_processor: Mutex::new(None),
             ai_state: Mutex::new(None),
+            ai_init_lock: TokioMutex::new(()),
             active_ai_tasks: Mutex::new(HashMap::new()),
             patched_warped_cache: Mutex::new(None),
             export_task_token: Arc::new(Mutex::new(None)),
