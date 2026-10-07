@@ -3,9 +3,9 @@
   "productName": "RapidRAW",
   "identifier": "io.github.CyberTimon.RapidRAW",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm.cmd run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm.cmd run build",
     "frontendDist": "../dist"
   },
   "app": {
