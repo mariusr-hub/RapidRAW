@@ -2,7 +2,7 @@ import { type PointerEvent as ReactPointerEvent, useState, useEffect, useCallbac
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { SafeAuthProvider } from './context/AuthContext';
+import { useCloudStore } from './store/useCloudStore';
 import { ToastContainer, toast, Slide } from 'react-toastify';
 import {
   DndContext,
@@ -327,17 +327,20 @@ function App() {
   const { handleCopyAdjustments, handlePasteAdjustments, handleResetAdjustments, handleZoomChange } =
     useEditorActions();
 
-  const navigationRefs = {
-    transformWrapperRef,
-    preloadedDataRef,
-    cachedEditStateRef,
-    selectedImagePathRef,
-    isBackendReadyRef,
-    latestRenderedJobIdRef,
-    previewJobIdRef,
-    currentResRef,
-    prevAdjustmentsRef,
-  };
+  const navigationRefs = useMemo(
+    () => ({
+      transformWrapperRef,
+      preloadedDataRef,
+      cachedEditStateRef,
+      selectedImagePathRef,
+      isBackendReadyRef,
+      latestRenderedJobIdRef,
+      previewJobIdRef,
+      currentResRef,
+      prevAdjustmentsRef,
+    }),
+    [],
+  );
 
   const {
     handleGoHome,
@@ -367,12 +370,18 @@ function App() {
     handleClearSelection,
     handleLibraryImageSingleClick,
     handleImageClick,
-    handleSetColorLabel,
+    handleSetFlag,
     refreshAllFolderTrees,
     handleTogglePinFolder,
     handleCreateAlbumItem,
     handleRenameAlbumItem,
   } = useLibraryActions(handleImageSelect);
+
+  useEffect(() => {
+    const { setImageSelectHandler } = useUIStore.getState();
+    setImageSelectHandler(handleImageSelect);
+    return () => setImageSelectHandler(null);
+  }, [handleImageSelect]);
 
   const { displayList: sortedImageList, badges: groupBadgeInfo } = useSortedLibrary();
 
@@ -403,6 +412,7 @@ function App() {
   const {
     executeDelete,
     handleDeleteSelected,
+    handleDeleteRejected,
     handleCreateFolder,
     handleRenameFolder,
     handleSaveRename,
@@ -446,6 +456,7 @@ function App() {
     refreshAllFolderTrees,
     refreshImageList: handleLibraryRefresh,
     executeDelete,
+    handleDeleteRejected,
     handleTogglePinFolder,
   });
 
@@ -462,6 +473,7 @@ function App() {
     sortedImageList,
     handleBackToLibrary,
     handleDeleteSelected,
+    handleDeleteRejected,
     handleGoHome,
     handleImageSelect,
     handlePasteFiles,
@@ -517,6 +529,7 @@ function App() {
   useEffect(() => {
     setEditor({
       isWbPickerActive: false,
+      isRelightPickerActive: false,
       isStraightenActive: false,
       isGuidedPerspectiveActive: false,
       activeMaskId: null,
@@ -1034,7 +1047,7 @@ function App() {
           handleRenameFolder={handleRenameFolder}
           handleSaveRename={handleSaveRename}
           handleStartImport={handleStartImport}
-          handleSetColorLabel={handleSetColorLabel}
+          handleSetFlag={handleSetFlag}
           handleRate={handleRate}
           executeDelete={executeDelete}
           handleSaveCollage={handleSaveCollage}
@@ -1065,13 +1078,17 @@ function App() {
   );
 }
 
-const AppWrapper = () => (
-  <SafeAuthProvider>
+const AppWrapper = () => {
+  useEffect(() => {
+    useCloudStore.getState().initAuth();
+  }, []);
+
+  return (
     <ContextMenuProvider>
       <App />
       <GlobalTooltip />
     </ContextMenuProvider>
-  </SafeAuthProvider>
-);
+  );
+};
 
 export default AppWrapper;

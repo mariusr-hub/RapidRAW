@@ -7,7 +7,8 @@ import { useEditorActions } from './useEditorActions';
 import { Adjustments, AiPatch, MaskContainer, Coord, INITIAL_MASK_ADJUSTMENTS, INITIAL_MASK_CONTAINER } from '../utils/adjustments';
 import { Mask, SubMask, SubMaskMode } from '../components/panel/right/Masks';
 import { Invokes } from '../components/ui/AppProperties';
-import { useSafeAuth } from '../context/AuthContext';
+import { useCloudStore } from '../store/useCloudStore';
+import { useProcessStore } from '../store/useProcessStore';
 
 const getTransformAdjustments = (adj: Adjustments) => ({
   transformDistortion: adj.transformDistortion,
@@ -32,7 +33,9 @@ const getTransformAdjustments = (adj: Adjustments) => ({
 export function useAiMasking() {
   const { setAdjustments } = useEditorActions();
   const setEditor = useEditorStore((state) => state.setEditor);
-  const { getToken } = useSafeAuth();
+  const getToken = useCloudStore((s) => s.getToken);
+  const registerAiTask = useProcessStore((state) => state.registerAiTask);
+  const unregisterAiTask = useProcessStore((state) => state.unregisterAiTask);
 
   const updateSubMask = useCallback(
     (subMaskId: string, updatedData: any) => {
@@ -155,8 +158,13 @@ export function useAiMasking() {
           ),
         }));
         setEditor({ activeAiPatchContainerId: null, activeAiSubMaskId: null });
-      } catch (err) {
-        toast.error(`AI Replace Failed: ${err}`);
+        if (!useFastInpaint) {
+          useCloudStore.getState().fetchUsage();
+        }
+      } catch (err: any) {
+        if (!String(err).includes('cancelled')) {
+          toast.error(`AI Replace Failed: ${err}`);
+        }
         setAdjustments((prev: Adjustments) => ({
           ...prev,
           aiPatches: prev.aiPatches.map((p: AiPatch) => (p.id === patchId ? { ...p, isLoading: false } : p)),
@@ -196,6 +204,8 @@ export function useAiMasking() {
           path: selectedImage.path,
           rotation: adjustments.rotation,
           startPoint: [startPoint.x, startPoint.y],
+          skipRefinement: true,
+          taskId: patchId,
         });
 
         const subMaskToUpdate = adjustments.aiPatches
@@ -302,6 +312,9 @@ export function useAiMasking() {
 
     try {
       const transformAdjustments = getTransformAdjustments(adjustments);
+      const isInpaintMask = !!adjustments.aiPatches?.some((p: AiPatch) =>
+        p.subMasks.some((sm: SubMask) => sm.id === subMaskId),
+      );
       const newParameters = await invoke(Invokes.GenerateAiSubjectMask, {
         jsAdjustments: transformAdjustments,
         endPoint: [endPoint.x, endPoint.y],
@@ -311,6 +324,8 @@ export function useAiMasking() {
         path: selectedImage.path,
         rotation: adjustments.rotation,
         startPoint: [startPoint.x, startPoint.y],
+        skipRefinement: isInpaintMask,
+        taskId: subMaskId,
       });
 
       const subMask = adjustments.aiPatches

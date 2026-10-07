@@ -64,7 +64,11 @@ export default function CropPanel() {
   const [isRotationActive, setIsRotationActive] = useState(false);
   const [preferPortrait, setPreferPortrait] = useState(false);
   const [isEditingCustom, setIsEditingCustom] = useState(false);
-
+  const [isCustomMode, setIsCustomMode] = useState(false);
+  const [makers, setMakers] = useState<string[]>([]);
+  const [lenses, setLenses] = useState<string[]>([]);
+  const [myLenses, setMyLenses] = useState<any[]>([]);
+  const [detectionStatus, setDetectionStatus] = useState<'idle' | 'detecting' | 'not_found' | 'success'>('idle');
   const [localRotation, setLocalRotation] = useState<number | null>(null);
   const localRotationRef = useRef<number | null>(null);
 
@@ -222,7 +226,12 @@ export default function CropPanel() {
     }
   }
 
-  const isCustomActive = aspectRatio !== null && !activePreset;
+  const isCustomActive = aspectRatio !== null && (isCustomMode || !activePreset);
+  const selectedPreset = isCustomActive ? null : activePreset;
+
+  useEffect(() => {
+    setIsCustomMode(false);
+  }, [selectedImage?.path]);
 
   useEffect(() => {
     if (aspectRatio && aspectRatio !== 1) {
@@ -271,13 +280,13 @@ export default function CropPanel() {
   );
 
   useEffect(() => {
-    if (activePreset?.value === ORIGINAL_RATIO) {
+    if (selectedPreset?.value === ORIGINAL_RATIO) {
       const newOriginalRatio = getEffectiveOriginalRatio();
       if (newOriginalRatio !== null && aspectRatio && Math.abs(aspectRatio - newOriginalRatio) > RATIO_TOLERANCE) {
         applyAspectRatio(newOriginalRatio);
       }
     }
-  }, [orientationSteps, activePreset, aspectRatio, getEffectiveOriginalRatio, applyAspectRatio]);
+  }, [orientationSteps, selectedPreset, aspectRatio, getEffectiveOriginalRatio, applyAspectRatio]);
 
   const handleAutoHorizon = async () => {
     try {
@@ -381,13 +390,15 @@ export default function CropPanel() {
   };
 
   const handlePresetClick = (preset: CropPreset) => {
+    setIsCustomMode(false);
+
     if (preset.value === ORIGINAL_RATIO) {
       applyAspectRatio(getEffectiveOriginalRatio());
       return;
     }
 
     const targetRatio = preset.value;
-    if (activePreset === preset && targetRatio && targetRatio !== 1) {
+    if (selectedPreset === preset && targetRatio && targetRatio !== 1) {
       const newRatio = 1 / (adjustments.aspectRatio ? adjustments.aspectRatio : 1);
       setPreferPortrait(newRatio < 1);
       applyAspectRatio(newRatio);
@@ -420,6 +431,7 @@ export default function CropPanel() {
 
     setPreferPortrait(false);
     setIsEditingCustom(false);
+    setIsCustomMode(false);
     lastSyncedRatio.current = null;
     updateLocalRotation(null);
 
@@ -453,8 +465,8 @@ export default function CropPanel() {
     }));
   };
 
-  const isPresetActive = (preset: CropPreset) => preset === activePreset;
-  const isOrientationToggleDisabled = !aspectRatio || aspectRatio === 1 || activePreset?.value === ORIGINAL_RATIO;
+  const isPresetActive = (preset: CropPreset) => preset === selectedPreset;
+  const isOrientationToggleDisabled = !aspectRatio || aspectRatio === 1 || selectedPreset?.value === ORIGINAL_RATIO;
 
   const fineRotation = useMemo(() => {
     return rotation || 0;
@@ -462,8 +474,8 @@ export default function CropPanel() {
 
   const displayRotation = localRotation !== null ? localRotation : fineRotation;
 
-  const handleFineRotationChange = (e: any) => {
-    const newFineRotation = parseFloat(e.target.value);
+  const handleFineRotationChange = (e: { target: { value: number | string } }) => {
+    const newFineRotation = parseFloat(String(e.target.value));
     if (isRotationActive) {
       updateLocalRotation(newFineRotation);
     } else {
@@ -613,6 +625,7 @@ export default function CropPanel() {
                     if (preferPortrait || (imageRatio && imageRatio < 1)) {
                       newAspectRatio = 1 / BASE_RATIO;
                     }
+                    setIsCustomMode(true);
                     applyAspectRatio(newAspectRatio);
                   }}
                   data-tooltip={t('editor.crop.presets.custom.tooltip')}

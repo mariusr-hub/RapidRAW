@@ -35,6 +35,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useEditorStore } from '../../store/useEditorStore';
 import { Invokes } from '../ui/AppProperties';
+import { useSettingsStore } from '../../store/useSettingsStore';
 
 interface DenoiseModalProps {
   isOpen: boolean;
@@ -365,6 +366,7 @@ export default function DenoiseModal({
   const { t } = useTranslation();
   const selectedImage = useEditorStore((state) => state.selectedImage);
   const imageList = useLibraryStore((state) => state.imageList);
+  const isAiFree = useSettingsStore((s) => s.appSettings?.aiProvider === 'ai-free');
 
   const activeIso = useMemo(() => {
     const target = (targetPaths[0] && imageList.find((img) => img.path === targetPaths[0])) || selectedImage;
@@ -374,7 +376,6 @@ export default function DenoiseModal({
     const parsed = parseInt(isoVal, 10);
     return isNaN(parsed) || parsed <= 0 ? null : parsed;
   }, [targetPaths, imageList, selectedImage]);
-
   const [isMounted, setIsMounted] = useState(false);
   const [show, setShow] = useState(false);
 
@@ -448,18 +449,20 @@ export default function DenoiseModal({
     return 'Low noise floor / daylight · Guided Wavelet preserves razor-sharp edges with zero hallucination';
   }, [isRaw, activeIso]);
 
-  const methodOptions = useMemo<Array<{ label: string; value: 'ai' | 'bm3d' }>>(
+  const methodOptions = useMemo<Array<{ label: string; value: DenoiseMethod; disabled?: boolean }>>(
     () => [
       {
-        label: `${t('modals.denoise.methodAi')}${recommendedEngine === 'ai' ? ' ✨ (Recommended)' : ''}`,
+        label: `${t('modals.denoise.methodAi')}${recommendedEngine === 'ai' && !isAiFree ? ' ✨ (Recommended)' : ''}`,
         value: 'ai',
+        disabled: isAiFree,
       },
       {
         label: `${t('modals.denoise.methodBm3d')}${recommendedEngine === 'bm3d' ? ' ✨ (Recommended)' : ''}`,
         value: 'bm3d',
       },
+      ...(raw9Available ? [{ label: t('modals.denoise.methodRaw9'), value: 'raw9' as const }] : []),
     ],
-    [t, recommendedEngine],
+    [t, recommendedEngine, raw9Available, isAiFree],
   );
 
   // Global keydown for hold-to-compare and snapshots
@@ -599,6 +602,32 @@ export default function DenoiseModal({
     };
   }, []);
 
+  useEffect(() => {
+    if (!isOpen || targetPaths.length === 0) {
+      setRaw9Available(false);
+      return;
+    }
+    let cancelled = false;
+    invoke<boolean>(Invokes.IsRaw9Available, { paths: targetPaths })
+      .then((ok) => {
+        if (!cancelled) setRaw9Available(ok);
+      })
+      .catch(() => {
+        if (!cancelled) setRaw9Available(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, targetPathsKey]);
+
+  useEffect(() => {
+    if (method === 'raw9' && !raw9Available) {
+      const fallback: DenoiseMethod = isRaw && !isAiFree ? 'ai' : 'bm3d';
+      setMethod(fallback);
+      setIntensity(defaultIntensityFor(fallback));
+    }
+  }, [method, raw9Available, isRaw, isAiFree]);
   const currentStatusText =
     isBatch && batchProgress
       ? t('modals.denoise.batchProgressText', { current: batchProgress.current, total: batchProgress.total })
@@ -608,7 +637,8 @@ export default function DenoiseModal({
 
   useEffect(() => {
     if (isOpen) {
-      const initialEngine = isRaw || (activeIso && activeIso >= 800) ? 'ai' : 'bm3d';
+      const useAi = isRaw && !isAiFree;
+      const initialEngine = useAi || (activeIso && activeIso >= 800 && !isAiFree) ? 'ai' : 'bm3d';
       setMethod(initialEngine);
       const targetPath = targetPaths[0] || selectedImage?.path;
 
@@ -650,7 +680,8 @@ export default function DenoiseModal({
                 setDeband(profile.recommended_deband);
               }
               if (profile.recommended_engine) {
-                setMethod(profile.recommended_engine);
+                const engine = profile.recommended_engine === 'ai' && isAiFree ? 'bm3d' : profile.recommended_engine;
+                setMethod(engine);
               }
               if (profile.make || profile.model) {
                 setCameraProfile({
@@ -667,16 +698,15 @@ export default function DenoiseModal({
               const autoIntensity = Math.min(85, Math.max(15, Math.round(Math.log2(activeIso / 100) * 12 + 20)));
               setIntensity(autoIntensity);
             } else {
-              setIntensity(isRaw ? 50 : 15);
+              setIntensity(useAi ? 50 : 15);
             }
           });
       } else if (activeIso) {
         const autoIntensity = Math.min(85, Math.max(15, Math.round(Math.log2(activeIso / 100) * 12 + 20)));
         setIntensity(autoIntensity);
       } else {
-        setIntensity(isRaw ? 50 : 15);
+        setIntensity(useAi ? 50 : 15);
       }
-
       setIsMounted(true);
       const timer = setTimeout(() => setShow(true), 10);
       return () => clearTimeout(timer);
@@ -694,7 +724,7 @@ export default function DenoiseModal({
       }, 300);
       return () => clearTimeout(timer);
     }
-  }, [isOpen, isRaw, activeIso, targetPaths, selectedImage]);
+  }, [isOpen, isRaw, isAiFree, activeIso, targetPaths, selectedImage]);
 
   // Real-time Sub-Tile Loupe ROI Preview Debounce (<25ms)
   useEffect(() => {

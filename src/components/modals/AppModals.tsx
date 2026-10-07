@@ -13,7 +13,6 @@ import RenameFolderModal from './RenameFolderModal';
 import RenameFileModal from './RenameFileModal';
 import ConfirmModal from './ConfirmModal';
 import ImportSettingsModal from './ImportSettingsModal';
-
 // Heavy feature modals lazy-loaded on demand
 const PanoramaModal = lazy(() => import('./PanoramaModal'));
 const HdrModal = lazy(() => import('./HdrModal'));
@@ -32,7 +31,7 @@ const AdvancedExportModal = lazy(() => import('./AdvancedExportModal'));
 const SpeedCullerModal = lazy(() => import('./SpeedCullerModal'));
 const DrizzleModal = lazy(() => import('./DrizzleModal'));
 
-import { AppSettings, Invokes, AlbumItem, Album, AlbumGroup } from '../ui/AppProperties';
+import { AppSettings, Invokes, ImageFlag, AlbumItem, Album, AlbumGroup } from '../ui/AppProperties';
 import { CopyPasteSettings } from '../../utils/adjustments';
 
 export interface AppModalsProps {
@@ -82,7 +81,7 @@ export interface AppModalsProps {
   handleRenameFolder: (newName: string) => Promise<void>;
   handleSaveRename: (nameTemplate: string) => Promise<void>;
   handleStartImport: (settings: any) => Promise<void>;
-  handleSetColorLabel: (color: string | null, paths?: string[]) => Promise<void>;
+  handleSetFlag: (flag: ImageFlag | null, paths?: string[]) => void;
   handleRate: (rating: number, paths?: string[]) => void;
   executeDelete: (paths: string[], options: any) => Promise<void>;
   handleSaveCollage: (base64Data: string, firstPath: string) => Promise<string>;
@@ -398,7 +397,7 @@ export default function AppModals(props: AppModalsProps) {
         thumbnails={thumbnails}
         onApply={(action, paths) => {
           if (action === 'reject') {
-            props.handleSetColorLabel('red', paths);
+            props.handleSetFlag(ImageFlag.Reject, paths);
           } else if (action === 'rate_zero') {
             props.handleRate(1, paths);
           } else if (action === 'delete') {

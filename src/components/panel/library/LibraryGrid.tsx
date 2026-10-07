@@ -525,7 +525,7 @@ export default function LibraryGrid(props: any) {
     return (
       <div
         ref={libraryContainerRef}
-        className="flex-1 w-full h-full"
+        className="flex-1 w-full min-h-0 overflow-hidden"
         onClick={props.onClearSelection}
         onContextMenu={props.onEmptyAreaContextMenu}
       />
@@ -549,11 +549,11 @@ export default function LibraryGrid(props: any) {
   return (
     <div
       ref={libraryContainerRef}
-      className="flex-1 w-full h-full"
+      className="flex-1 w-full min-h-0 overflow-hidden"
       onClick={props.onClearSelection}
       onContextMenu={props.onEmptyAreaContextMenu}
     >
-      <div className="flex flex-col w-full h-full">
+      <div className="flex flex-col w-full h-full min-h-0">
         {gridData.isListView && (
           <ListHeader
             widths={listColumnWidths}

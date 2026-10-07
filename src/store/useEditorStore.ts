@@ -77,6 +77,9 @@ interface EditorState {
   isWbPickerActive: boolean;
   isTatActive: boolean;
   tatMode: 'hsl_hue' | 'hsl_sat' | 'hsl_lum' | 'curve' | 'exposure' | null;
+  isRelightPickerActive: boolean;
+  activeRelightLightId: string | null;
+  isGuidedPerspectiveActive: boolean;
   liveRotation: number | null;
   brushSettings: BrushSettings | null;
 
@@ -147,6 +150,9 @@ export const useEditorStore = create<EditorState>((set) => ({
   isWbPickerActive: false,
   isTatActive: false,
   tatMode: null,
+  isRelightPickerActive: false,
+  activeRelightLightId: null,
+  isGuidedPerspectiveActive: false,
   liveRotation: null,
 
   copiedSectionAdjustments: null,

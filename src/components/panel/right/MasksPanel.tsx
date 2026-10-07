@@ -33,6 +33,7 @@ import {
   FileEdit,
   FolderOpen,
   Folder as FolderIcon,
+  LayoutList,
   Loader2,
   Minus,
   Plus,
@@ -54,6 +55,7 @@ import EffectsPanel from '../../adjustments/Effects';
 import Waveform from '../editor/Waveform';
 import Resizer from '../../ui/Resizer';
 import { DepthRangePicker } from '../../ui/DepthRangePicker';
+import AdjustmentSectionsSubMenu from './AdjustmentSectionsSubMenu';
 
 import {
   Mask,
@@ -74,6 +76,7 @@ import {
   INITIAL_MASK_CONTAINER,
   MaskContainer,
   ADJUSTMENT_SECTIONS,
+  getVisibleAdjustmentSections,
 } from '../../../utils/adjustments';
 import { useContextMenu } from '../../../context/ContextMenuContext';
 import { OPTION_SEPARATOR, Orientation, Panel } from '../../ui/AppProperties';
@@ -250,11 +253,13 @@ function MasksListRoot({ children, onClick }: { children: React.ReactNode; onCli
 export default function MasksPanel() {
   const { t } = useTranslation();
   const { setAdjustments } = useEditorActions();
+  const isAiFree = useSettingsStore((s) => s.appSettings?.aiProvider === 'ai-free');
   const {
     handleGenerateAiDepthMask,
     handleGenerateAiForegroundMask,
     handleGenerateAiSkyMask,
     handleGeneratePortraitSubmasks,
+    handleCancelAiTask,
   } = useAiMasking();
   const { setCustomEscapeHandler, isAdjustmentsPanelVisible } = useUIStore(
     useShallow((state) => {
@@ -435,7 +440,7 @@ export default function MasksPanel() {
       } else if (activeMaskId) onSelectMask(null);
       else if (activeMaskContainerId) onSelectContainer(null);
     };
-    if (activeMaskContainerId || renamingId) setCustomEscapeHandler(() => handler);
+    if (activeMaskContainerId || renamingId) setCustomEscapeHandler(handler);
     else setCustomEscapeHandler(null);
     return () => setCustomEscapeHandler(null);
   }, [activeMaskContainerId, activeMaskId, renamingId, onSelectContainer, onSelectMask, setCustomEscapeHandler]);
@@ -612,45 +617,35 @@ export default function MasksPanel() {
     const container = targetContainerId ? adjustments.masks?.find((m) => m.id === targetContainerId) : null;
     const hasComponents = container && container.subMasks.length > 0;
 
-    const buildModeSubmenu = (label: string, icon: any, mode: SubMaskMode) => ({
-      label,
-      icon,
-      submenu: MASK_PANEL_CREATION_TYPES.map((maskType) => {
-        if (maskType.id === 'others') {
-          return {
-            label: getMaskTypeName(maskType),
-            icon: maskType.icon,
-            submenu: buildMenu(OTHERS_MASK_TYPES, mode),
-          };
-        }
-        return {
-          label: getMaskTypeName(maskType),
-          icon: maskType.icon,
-          disabled: maskType.disabled,
-          onClick: () => handleAddSubMask(targetContainerId!, maskType.type, mode),
-        };
-      }),
-    });
+    const buildFlatMenu = (mode: SubMaskMode) => [
+      ...(isAiFree ? [] : [...buildMenu(MASK_AI_TYPES, mode), { type: OPTION_SEPARATOR }]),
+      ...buildMenu(MASK_BASIC_TYPES, mode),
+      { type: OPTION_SEPARATOR },
+      ...buildMenu(MASK_RANGE_TYPES, mode),
+    ];
 
-    const options: any[] = buildMenu(
-      MASK_PANEL_CREATION_TYPES.filter((m) => m.id !== 'others'),
-      SubMaskMode.Additive,
-    );
-    const others = MASK_PANEL_CREATION_TYPES.find((m) => m.id === 'others');
-    if (others) {
-      options.push({
-        label: getMaskTypeName(others),
-        icon: others.icon,
-        submenu: buildMenu(OTHERS_MASK_TYPES, SubMaskMode.Additive),
-      });
-    }
+    let options: any[];
 
-    if (targetContainerId && hasComponents) {
-      options.push(
-        { type: OPTION_SEPARATOR },
-        buildModeSubmenu(t('editor.masks.actions.subtractFromMask'), Minus, SubMaskMode.Subtractive),
-        buildModeSubmenu(t('editor.masks.actions.intersectMaskWith'), SquaresIntersect, SubMaskMode.Intersect),
-      );
+    if (!targetContainerId) {
+      options = buildFlatMenu(SubMaskMode.Additive);
+    } else {
+      options = buildFlatMenu(SubMaskMode.Additive);
+
+      if (hasComponents) {
+        options.push(
+          { type: OPTION_SEPARATOR },
+          {
+            label: t('editor.masks.actions.subtractFromMask'),
+            icon: Minus,
+            submenu: buildFlatMenu(SubMaskMode.Subtractive),
+          },
+          {
+            label: t('editor.masks.actions.intersectMaskWith'),
+            icon: SquaresIntersect,
+            submenu: buildFlatMenu(SubMaskMode.Intersect),
+          },
+        );
+      }
     }
 
     showContextMenu(rect.left, rect.bottom + 5, options);
@@ -970,12 +965,19 @@ export default function MasksPanel() {
 
   const handlePanelContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
-    const allTypes = [...MASK_PANEL_CREATION_TYPES.filter((m) => m.id !== 'others'), ...OTHERS_MASK_TYPES];
-    const newMaskSubMenu = allTypes.map((m) => ({
-      label: getMaskTypeName(m),
-      icon: m.icon,
-      onClick: () => handleAddMaskContainer(m.type),
-    }));
+    const buildMenu = (types: MaskType[]) =>
+      types.map((m) => ({
+        label: getMaskTypeName(m),
+        icon: m.icon,
+        onClick: () => handleAddMaskContainer(m.type),
+      }));
+
+    const newMaskSubMenu = [
+      ...(isAiFree ? [] : [...buildMenu(MASK_AI_TYPES), { type: OPTION_SEPARATOR }]),
+      ...buildMenu(MASK_BASIC_TYPES),
+      { type: OPTION_SEPARATOR },
+      ...buildMenu(MASK_RANGE_TYPES),
+    ];
     showContextMenu(e.clientX, e.clientY, [
       {
         label: t('editor.masks.actions.pasteMask'),
@@ -1071,19 +1073,48 @@ export default function MasksPanel() {
                     className="z-10 shrink-0"
                     onClick={handleDeselect}
                   >
+                    {!isAiFree && (
+                      <>
+                        <Text variant={TextVariants.heading} className="mb-2">
+                          {t('editor.masks.aiTitle', 'AI Selections')}
+                        </Text>
+                        <div className="grid grid-cols-3 gap-2 mb-6" onClick={(e) => e.stopPropagation()}>
+                          {MASK_AI_TYPES.map((maskType) => (
+                            <DraggableGridItem
+                              key={maskType.type}
+                              maskType={maskType}
+                              onClick={() => handleGridClick(maskType.type)}
+                              onRightClick={(e: React.MouseEvent) => handleGridRightClick(e, maskType.type)}
+                              activeMaskContainerId={activeMaskContainerId}
+                            />
+                          ))}
+                        </div>
+                      </>
+                    )}
                     <Text variant={TextVariants.heading} className="mb-2">
-                      {t('editor.masks.createNewTitle')}
+                      {t('editor.masks.basicTitle', 'Basic Tools')}
+                    </Text>
+                    <div className="grid grid-cols-3 gap-2 mb-6" onClick={(e) => e.stopPropagation()}>
+                      {MASK_BASIC_TYPES.map((maskType) => (
+                        <DraggableGridItem
+                          key={maskType.type}
+                          maskType={maskType}
+                          onClick={() => handleGridClick(maskType.type)}
+                          onRightClick={(e: React.MouseEvent) => handleGridRightClick(e, maskType.type)}
+                          activeMaskContainerId={activeMaskContainerId}
+                        />
+                      ))}
+                    </div>
+                    <Text variant={TextVariants.heading} className="mb-2">
+                      {t('editor.masks.rangeTitle', 'Ranges & Global')}
                     </Text>
                     <div className="grid grid-cols-3 gap-2" onClick={(e) => e.stopPropagation()}>
-                      {MASK_PANEL_CREATION_TYPES.map((maskType: MaskType) => (
+                      {MASK_RANGE_TYPES.map((maskType) => (
                         <DraggableGridItem
-                          key={maskType.type || maskType.id}
+                          key={maskType.type}
                           maskType={maskType}
-                          onClick={(e: any) =>
-                            maskType.id === 'others' ? handleAddOthersMask(e) : handleGridClick(maskType.type)
-                          }
+                          onClick={() => handleGridClick(maskType.type)}
                           onRightClick={(e: React.MouseEvent) => handleGridRightClick(e, maskType.type)}
-                          isDraggable={maskType.id !== 'others'}
                           activeMaskContainerId={activeMaskContainerId}
                         />
                       ))}
@@ -2110,11 +2141,18 @@ function SettingsPanel({
         label: t('editor.masks.settings.resetSectionSettings', { section: sectionTitle }),
         onClick: handleReset,
       },
+      { type: OPTION_SEPARATOR },
+      {
+        icon: LayoutList,
+        label: t('editor.adjustments.actions.customizePanels'),
+        submenu: [{ customComponent: AdjustmentSectionsSubMenu }],
+      },
     ]);
   };
 
   const sectionVisibility =
     displayContainer.adjustments.sectionVisibility || INITIAL_MASK_ADJUSTMENTS.sectionVisibility;
+  const visibleSections = getVisibleAdjustmentSections(appSettings?.adjustmentLayout);
 
   return (
     <div
@@ -2266,7 +2304,7 @@ function SettingsPanel({
         onMouseLeave={() => setIsMaskControlHovered(false)}
         className="flex flex-col gap-2"
       >
-        {Object.keys(ADJUSTMENT_SECTIONS).map((sectionName) => {
+        {visibleSections.map((sectionName) => {
           const SectionComponent: any = {
             basic: BasicAdjustments,
             curves: CurveGraph,

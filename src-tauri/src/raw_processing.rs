@@ -1,9 +1,13 @@
 use crate::image_processing::apply_orientation;
+use crate::white_balance::WhiteBalance;
 use anyhow::{Result, anyhow};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use rawler::{
-    decoders::{Orientation, RawDecodeParams},
-    imgop::develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
+    decoders::{Decoder, Orientation, RawDecodeParams},
+    imgop::{
+        develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
+        xyz::Illuminant,
+    },
     rawimage::{RawImage, RawPhotometricInterpretation},
     rawsource::RawSource,
 };
@@ -30,6 +34,26 @@ pub fn develop_raw_image(
     Ok(apply_orientation(developed_image, orientation))
 }
 
+fn metadata_orientation(decoder: &dyn Decoder, source: &RawSource) -> Result<Orientation> {
+    let metadata = decoder.raw_metadata(source, &RawDecodeParams::default())?;
+    Ok(metadata
+        .exif
+        .orientation
+        .map(Orientation::from_u16)
+        .unwrap_or(Orientation::Normal))
+}
+
+pub fn extract_embedded_preview(file_bytes: &[u8]) -> Option<DynamicImage> {
+    let source = RawSource::new_from_slice(file_bytes);
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let preview = decoder
+        .full_image(&source, &RawDecodeParams::default())
+        .ok()??;
+    let orientation =
+        metadata_orientation(decoder.as_ref(), &source).unwrap_or(Orientation::Normal);
+    Some(apply_orientation(preview, orientation))
+}
+
 fn is_linear_raw_format(raw_image: &RawImage) -> bool {
     matches!(
         raw_image.photometric,
@@ -46,6 +70,67 @@ fn srgb_to_linear(value: f32) -> f32 {
     }
 }
 
+#[inline]
+fn smootherstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max_c = r.max(g).max(b);
+
+    if max_c <= 0.50 {
+        return (r, g, b);
+    }
+
+    let mut cur_r = r;
+    let mut cur_g = g;
+    let mut cur_b = b;
+
+    let outer_blend = smootherstep(0.50, 1.5, max_c);
+
+    let magenta = (cur_r.min(cur_b) - cur_g).max(0.0);
+    if magenta > 0.0 {
+        let target_g = cur_r.min(cur_b) * 0.80 + ((cur_r + cur_b) * 0.5) * 0.20;
+        let correction = (target_g - cur_g).max(0.0);
+        let magenta_weight = smoothstep(0.0, 0.25, magenta / max_c);
+        cur_g += correction * outer_blend * magenta_weight;
+    }
+
+    let residual = (cur_r.min(cur_b) - cur_g).max(0.0);
+    if residual > 0.0 {
+        cur_g += residual * outer_blend;
+    }
+
+    let new_max = cur_r.max(cur_g).max(cur_b);
+    let min_c = cur_r.min(cur_g).min(cur_b);
+
+    let knee = smoothstep(0.50, 1.5, new_max);
+
+    if knee > 0.0 {
+        let neutrality = (min_c / new_max.max(1e-5)).clamp(0.0, 1.0);
+
+        let core_burn = smoothstep(0.60, 3.0, new_max);
+
+        let desat = (knee * (neutrality * 0.85 + core_burn * 0.15)).clamp(0.0, 1.0);
+        let smooth_desat = desat * desat * (3.0 - 2.0 * desat);
+
+        let neutral_value = min_c + (new_max - min_c) * 1.0;
+
+        cur_r = cur_r * (1.0 - smooth_desat) + neutral_value * smooth_desat;
+        cur_g = cur_g * (1.0 - smooth_desat) + neutral_value * smooth_desat;
+        cur_b = cur_b * (1.0 - smooth_desat) + neutral_value * smooth_desat;
+    }
+
+    (cur_r, cur_g, cur_b)
+}
 fn develop_internal(
     file_bytes: &[u8],
     fast_demosaic: bool,
@@ -85,16 +170,12 @@ fn develop_internal(
         }
     }
 
-    let metadata = decoder.raw_metadata(&source, &RawDecodeParams::default())?;
-    let orientation = metadata
-        .exif
-        .orientation
-        .map(Orientation::from_u16)
-        .unwrap_or(Orientation::Normal);
-    let iso = metadata.exif.iso_speed.unwrap_or(100) as f32;
-
-    // Sensor physics conditioning: OB row drift subtraction + 3x3 Bayer hot-pixel filter
-    condition_raw_bayer_sensor(&mut raw_image, iso);
+    let orientation = metadata_orientation(decoder.as_ref(), &source)?;
+    if let Ok(metadata) = decoder.raw_metadata(&source, &RawDecodeParams::default()) {
+        let iso = metadata.exif.iso_speed.unwrap_or(100) as f32;
+        // Sensor physics conditioning: OB row drift subtraction + 3x3 Bayer hot-pixel filter
+        condition_raw_bayer_sensor(&mut raw_image, iso);
+    }
 
     let is_linear_format = is_linear_raw_format(&raw_image);
 
@@ -104,6 +185,23 @@ fn develop_internal(
         "gamma_skip_calib" => (true, false),
         _ => (false, true),
     };
+
+    let original_white_level = raw_image
+        .whitelevel
+        .0
+        .first()
+        .cloned()
+        .unwrap_or(u16::MAX as u32) as f32;
+    let original_black_level = raw_image
+        .blacklevel
+        .levels
+        .first()
+        .map(|r| r.as_f32())
+        .unwrap_or(0.0);
+
+    for level in raw_image.whitelevel.0.iter_mut() {
+        *level = u32::MAX;
+    }
 
     let mut developer = RawDevelop::default();
 
@@ -128,7 +226,10 @@ fn develop_internal(
 
     drop(raw_image);
 
-    let safe_highlight_compression = highlight_compression.max(1.01);
+    let denominator = (original_white_level - original_black_level).max(1.0);
+    let rescale_factor = (u32::MAX as f32 - original_black_level) / denominator;
+
+    let safe_highlight_compression = 1000.0;
 
     let clamp_limit = if fast_demosaic {
         1.0
@@ -136,88 +237,53 @@ fn develop_internal(
         safe_highlight_compression
     };
 
+    let (width, height) = {
+        let dim = developed_intermediate.dim();
+        (dim.w as u32, dim.h as u32)
+    };
+
     check_cancel()?;
 
     match &mut developed_intermediate {
         Intermediate::Monochrome(pixels) => {
             pixels.data.iter_mut().for_each(|p| {
-                let mut linear_val = *p;
+                let mut linear_val = *p * rescale_factor;
                 if is_linear_format && apply_ungamma {
-                    linear_val = srgb_to_linear(linear_val.clamp(0.0, 1.0));
+                    linear_val = srgb_to_linear(linear_val.max(0.0));
                 }
                 *p = linear_val.clamp(0.0, clamp_limit);
             });
         }
         Intermediate::ThreeColor(pixels) => {
             pixels.data.iter_mut().for_each(|p| {
-                let mut r = p[0].max(0.0);
-                let mut g = p[1].max(0.0);
-                let mut b = p[2].max(0.0);
+                let mut r = (p[0] * rescale_factor).max(0.0);
+                let mut g = (p[1] * rescale_factor).max(0.0);
+                let mut b = (p[2] * rescale_factor).max(0.0);
 
                 if is_linear_format && apply_ungamma {
-                    r = srgb_to_linear(r.clamp(0.0, 1.0));
-                    g = srgb_to_linear(g.clamp(0.0, 1.0));
-                    b = srgb_to_linear(b.clamp(0.0, 1.0));
+                    r = srgb_to_linear(r.max(0.0));
+                    g = srgb_to_linear(g.max(0.0));
+                    b = srgb_to_linear(b.max(0.0));
                 }
 
-                let max_c = r.max(g).max(b);
+                let (rec_r, rec_g, rec_b) = recover_clipped_pixel(r, g, b);
 
-                let (final_r, final_g, final_b) = if max_c > 0.95 {
-                    // Chromaticity-preserving highlight inpainting & recovery
-                    let min_c = r.min(g).min(b);
-                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-                    // Blend towards neutral white as brightness approaches and exceeds saturation threshold
-                    let sat_ratio = if max_c > 1e-5 { ((max_c - min_c) / max_c).clamp(0.0, 1.0) } else { 0.0 };
-                    let highlight_blend = ((max_c - 0.95) / (safe_highlight_compression - 0.95).max(0.05)).clamp(0.0, 1.0);
-                    let desat_factor = 1.0 - (highlight_blend * 0.85);
-
-                    let neutral_luma = luma.max(max_c * 0.9);
-                    let inpaint_r = neutral_luma + (r - neutral_luma) * desat_factor * sat_ratio;
-                    let inpaint_g = neutral_luma + (g - neutral_luma) * desat_factor * sat_ratio;
-                    let inpaint_b = neutral_luma + (b - neutral_luma) * desat_factor * sat_ratio;
-
-                    if max_c > 1.0 {
-                        let compression_factor =
-                            (1.0 - (max_c - 1.0) / (safe_highlight_compression - 1.0)).clamp(0.0, 1.0);
-                        let comp_r = min_c + (inpaint_r - min_c) * compression_factor;
-                        let comp_g = min_c + (inpaint_g - min_c) * compression_factor;
-                        let comp_b = min_c + (inpaint_b - min_c) * compression_factor;
-                        let comp_max = comp_r.max(comp_g).max(comp_b);
-                        if comp_max > 1e-6 {
-                            let rescale = max_c / comp_max;
-                            (comp_r * rescale, comp_g * rescale, comp_b * rescale)
-                        } else {
-                            (max_c, max_c, max_c)
-                        }
-                    } else {
-                        (inpaint_r, inpaint_g, inpaint_b)
-                    }
-                } else {
-                    (r, g, b)
-                };
-
-                p[0] = final_r.clamp(0.0, clamp_limit);
-                p[1] = final_g.clamp(0.0, clamp_limit);
-                p[2] = final_b.clamp(0.0, clamp_limit);
+                p[0] = rec_r.clamp(0.0, clamp_limit);
+                p[1] = rec_g.clamp(0.0, clamp_limit);
+                p[2] = rec_b.clamp(0.0, clamp_limit);
             });
         }
         Intermediate::FourColor(pixels) => {
             pixels.data.iter_mut().for_each(|p| {
                 p.iter_mut().for_each(|c| {
-                    let mut linear_val = *c;
+                    let mut linear_val = *c * rescale_factor;
                     if is_linear_format && apply_ungamma {
-                        linear_val = srgb_to_linear(linear_val.clamp(0.0, 1.0));
+                        linear_val = srgb_to_linear(linear_val.max(0.0));
                     }
                     *c = linear_val.clamp(0.0, clamp_limit);
                 });
             });
         }
-    }
-
-    let (width, height) = {
-        let dim = developed_intermediate.dim();
-        (dim.w as u32, dim.h as u32)
     };
 
     check_cancel()?;
@@ -438,6 +504,38 @@ pub fn extract_raw_bayer_array(
     // RGGB standard pattern: 0=R, 1=G1, 2=G2, 3=B
     let pattern = [0u8, 1u8, 1u8, 2u8];
     Ok((cfa, w, h, pattern, wb))
+}
+
+pub fn read_as_shot_white_balance(file_bytes: &[u8]) -> Option<WhiteBalance> {
+    let source = RawSource::new_from_slice(file_bytes);
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let raw_image = decoder
+        .raw_image(&source, &RawDecodeParams::default(), true)
+        .ok()?;
+    if raw_image.cpp == 1 && !matches!(raw_image.photometric, RawPhotometricInterpretation::Cfa(_))
+    {
+        return None;
+    }
+
+    let wb_coeffs =
+        crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
+    let neutral = if wb_coeffs[0].is_nan() {
+        [1.0; 4]
+    } else {
+        wb_coeffs.map(|c| 1.0 / c)
+    };
+
+    let matrices = &raw_image.color_matrix;
+    if let (Some(matrix_a), Some(matrix_d65)) =
+        (matrices.get(&Illuminant::A), matrices.get(&Illuminant::D65))
+    {
+        return WhiteBalance::from_dual_illuminant_camera_neutral(matrix_a, matrix_d65, &neutral);
+    }
+
+    let color_matrix = matrices
+        .get(&Illuminant::D65)
+        .or_else(|| matrices.values().next())?;
+    WhiteBalance::from_camera_neutral(color_matrix, &neutral)
 }
 
 pub fn get_fast_demosaic_scale_factor(

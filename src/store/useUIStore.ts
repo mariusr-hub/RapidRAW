@@ -1,5 +1,14 @@
 import { create } from 'zustand';
-import { ImageFile, Panel, UiVisibility, CullingSuggestions, PanelRegion } from '../components/ui/AppProperties';
+import {
+  ImageFile,
+  Panel,
+  UiVisibility,
+  CullingSuggestions,
+  PanelRegion,
+  WorkspaceState,
+  CollapsibleSectionsState,
+} from '../components/ui/AppProperties';
+import { useEditorStore } from './useEditorStore';
 
 export const DEFAULT_PANEL_WIDTH = 320;
 export const DEFAULT_BOTTOM_PANEL_HEIGHT = 160;
@@ -11,12 +20,9 @@ export function reconcileWorkspace() {
 
 export type SwitcherPlacement = 'bottom' | 'right' | 'left' | 'top';
 
-export interface CollapsibleSectionsState {
-  basic: boolean;
-  color: boolean;
-  curves: boolean;
-  details: boolean;
-  effects: boolean;
+export interface CropSectionsState {
+  transform: boolean;
+  lens: boolean;
 }
 
 export interface ConfirmModalState {
@@ -244,6 +250,8 @@ interface UIState {
   setPanel: (panel: Panel | null) => void;
   customEscapeHandler: (() => void) | null;
   setCustomEscapeHandler: (handler: (() => void) | null) => void;
+  imageSelectHandler: ((path: string, openInEditor?: boolean) => void) | null;
+  setImageSelectHandler: (handler: ((path: string, openInEditor?: boolean) => void) | null) => void;
   searchFocusRequest: number;
   requestSearchFocus: () => void;
 }
@@ -498,6 +506,8 @@ export const useUIStore = create<UIState>((set, get) => ({
 
   customEscapeHandler: null,
   setCustomEscapeHandler: (handler) => set({ customEscapeHandler: handler }),
+  imageSelectHandler: null,
+  setImageSelectHandler: (handler) => set({ imageSelectHandler: handler }),
   searchFocusRequest: 0,
   requestSearchFocus: () => set((state) => ({ searchFocusRequest: state.searchFocusRequest + 1 })),
 }));
