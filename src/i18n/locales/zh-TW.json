@@ -262,8 +262,8 @@
     "library": {
       "addCopiedToAlbum_one": "將複製的影像新增到相簿",
       "addCopiedToAlbum_other": "將 {{count}} 張複製的影像新增到相簿",
-"deleteRejected": "刪除已拒絕的影像",,
-      "refreshView": "重新整理檢視",,
+"deleteRejected": "刪除已拒絕的影像",
+      "refreshView": "重新整理檢視",
       "addCopiedToAlbum_many": "將 {{count}} 張複製的影像新增到相簿"
     },
     "merge": {

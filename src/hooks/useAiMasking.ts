@@ -54,6 +54,82 @@ export function useAiMasking() {
     [setAdjustments],
   );
 
+  const handleCancelAiTask = useCallback(
+    async (taskId: string) => {
+      try {
+        await invoke(Invokes.CancelAiTask, { taskId });
+      } catch (e) {
+        console.error('Failed to cancel AI task:', e);
+      } finally {
+        unregisterAiTask(taskId);
+        setAdjustments((prev: Adjustments) => ({
+          ...prev,
+          aiPatches: (prev.aiPatches || []).map((p: AiPatch) =>
+            p.id === taskId || p.subMasks.some((sm) => sm.id === taskId) ? { ...p, isLoading: false } : p,
+          ),
+        }));
+      }
+    },
+    [unregisterAiTask, setAdjustments],
+  );
+
+  const handleDirectPatch = useCallback(
+    async (subMaskId: string, sourceX: number, sourceY: number) => {
+      const { selectedImage, adjustments, patchesSentToBackend } = useEditorStore.getState();
+      if (!selectedImage?.path) return;
+
+      const patchId = adjustments.aiPatches?.find((p: AiPatch) =>
+        p.subMasks.some((sm: SubMask) => sm.id === subMaskId),
+      )?.id;
+      if (!patchId) return;
+
+      patchesSentToBackend.add(patchId);
+      setAdjustments((prev: Partial<Adjustments>) => ({
+        ...prev,
+        aiPatches: prev.aiPatches?.map((p: AiPatch) => (p.id === patchId ? { ...p, isLoading: true } : p)),
+      }));
+
+      try {
+        const patchDefinitionForBackend = adjustments.aiPatches?.find((p: AiPatch) => p.id === patchId);
+        const isLiquify = patchDefinitionForBackend?.subMasks.some((sm: SubMask) => sm.type === 'liquify');
+        const isRetouch = patchDefinitionForBackend?.subMasks.some((sm: SubMask) => sm.type === 'retouch');
+        const command = isLiquify
+          ? 'generate_liquify_patch'
+          : isRetouch
+            ? 'generate_retouch_patch'
+            : 'generate_manual_cleanup_patch';
+
+        const newPatchDataJson: any = await invoke(command, {
+          currentAdjustments: adjustments,
+          patchDefinition: patchDefinitionForBackend,
+          sourcePoint: [sourceX, sourceY],
+        });
+
+        const newPatchData = JSON.parse(newPatchDataJson);
+        patchesSentToBackend.delete(patchId);
+
+        setAdjustments((prev: Partial<Adjustments>) => ({
+          ...prev,
+          aiPatches: prev.aiPatches?.map((p: AiPatch) =>
+            p.id === patchId ? { ...p, patchData: newPatchData, isLoading: false } : p,
+          ),
+        }));
+      } catch (err: any) {
+        patchesSentToBackend.delete(patchId);
+
+        if (!String(err).includes('cancelled')) {
+          toast.error(`Patch Generation Failed: ${err.message || String(err)}`);
+        }
+
+        setAdjustments((prev: Partial<Adjustments>) => ({
+          ...prev,
+          aiPatches: prev.aiPatches?.map((p: AiPatch) => (p.id === patchId ? { ...p, isLoading: false } : p)),
+        }));
+      }
+    },
+    [setAdjustments],
+  );
+
   const handleManualCleanup = useCallback(
     async (subMaskId: string, sourceX: number, sourceY: number) => {
       const { selectedImage, adjustments, patchesSentToBackend } = useEditorStore.getState();
@@ -668,5 +744,7 @@ export function useAiMasking() {
     handleGenerateAiForegroundMask,
     handleGenerateAiSkyMask,
     handleGeneratePortraitSubmasks,
+    handleDirectPatch,
+    handleCancelAiTask,
   };
 }

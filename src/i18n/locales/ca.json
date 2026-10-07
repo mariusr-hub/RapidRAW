@@ -262,8 +262,8 @@
     "library": {
       "addCopiedToAlbum_one": "Afegir imatge copiada a l'àlbum",
       "addCopiedToAlbum_other": "Afegir {{count}} imatges copiades a l'àlbum",
-"deleteRejected": "Eliminar les imatges rebutjades",,
-      "refreshView": "Actualitzar vista",,
+"deleteRejected": "Eliminar les imatges rebutjades",
+      "refreshView": "Actualitzar vista",
       "addCopiedToAlbum_many": "Afegir {{count}} imatges copiades a l'àlbum"
     },
     "merge": {

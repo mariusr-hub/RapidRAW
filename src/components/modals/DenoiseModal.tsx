@@ -37,12 +37,27 @@ import { useEditorStore } from '../../store/useEditorStore';
 import { Invokes } from '../ui/AppProperties';
 import { useSettingsStore } from '../../store/useSettingsStore';
 
+export type DenoiseMethod = 'ai' | 'bm3d' | 'raw9';
+
+const defaultIntensityFor = (m: DenoiseMethod): number => {
+  switch (m) {
+    case 'raw9':
+      return 40;
+    case 'ai':
+      return 35;
+    case 'bm3d':
+      return 25;
+    default:
+      return 35;
+  }
+};
+
 interface DenoiseModalProps {
   isOpen: boolean;
   onClose(): void;
   onDenoise(
     intensity: number,
-    method: 'ai' | 'bm3d',
+    method: DenoiseMethod,
     healDust?: boolean,
     visualizeDefects?: boolean,
     protectStars?: boolean,
@@ -54,7 +69,7 @@ interface DenoiseModalProps {
   ): void;
   onBatchDenoise(
     intensity: number,
-    method: 'ai' | 'bm3d',
+    method: DenoiseMethod,
     paths: string[],
     healDust?: boolean,
     protectStars?: boolean,
@@ -86,7 +101,7 @@ interface SnapshotState {
   deband: boolean;
   protectStars: boolean;
   healDust: boolean;
-  method: 'ai' | 'bm3d';
+  method: DenoiseMethod;
 }
 
 const ImageCompare = ({
@@ -386,7 +401,9 @@ export default function DenoiseModal({
   const [shadowBoost, setShadowBoost] = useState<number>(0);
   const [filmGrain, setFilmGrain] = useState<number>(0);
   const [deband, setDeband] = useState<boolean>(false);
-  const [method, setMethod] = useState<'ai' | 'bm3d'>('ai');
+  const [method, setMethod] = useState<DenoiseMethod>('ai');
+  const [raw9Available, setRaw9Available] = useState<boolean>(false);
+  const targetPathsKey = targetPaths.join(',');
   const [healDust, setHealDust] = useState(true);
   const [protectStars, setProtectStars] = useState(true);
   const [dustSpotsHealed, setDustSpotsHealed] = useState<number | null>(null);

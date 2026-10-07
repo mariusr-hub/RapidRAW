@@ -23,6 +23,8 @@ mod ai_commands;
 mod ai_connector;
 mod ai_processing;
 mod android_integration;
+mod apple_raw;
+pub mod guided_perspective;
 pub mod agency_uploader;
 pub mod app_settings;
 mod app_state;
@@ -1021,10 +1023,10 @@ async fn preview_geometry_transform(
         } else {
             let context = get_or_init_gpu_context(&state, &app_handle)?;
 
-            let original_image = {
+            let (original_image, as_shot_white_balance) = {
                 let guard = state.original_image.lock().unwrap();
                 let loaded = guard.as_ref().ok_or("No image loaded")?;
-                loaded.image.clone()
+                (loaded.image.clone(), loaded.as_shot_white_balance)
             };
 
             let settings = load_settings(app_handle.clone()).unwrap_or_default();
@@ -1071,7 +1073,7 @@ async fn preview_geometry_transform(
 
             let tm_override = resolve_tonemapper_override_from_handle(&app_handle, is_raw);
             let all_adjustments =
-                get_all_adjustments_from_json(&temp_adjustments, is_raw, tm_override);
+                get_all_adjustments_from_json(&temp_adjustments, is_raw, as_shot_white_balance, tm_override);
             let lut_path = temp_adjustments["lutPath"].as_str();
             let lut = lut_path.and_then(|p| lut_processing::get_or_load_lut(&state, p).ok());
             let mask_bitmaps = Vec::new();

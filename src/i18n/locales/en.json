@@ -47,7 +47,8 @@
       },
       "shadows": "Shadows",
       "toneMapper": "Tone Mapper",
-      "whites": "Whites"
+      "whites": "Whites",
+      "brightness": "Brightness"
     },
     "color": {
       "ariaSelectColor": "Select {{name}} color",
@@ -267,7 +268,8 @@
       "tagging": "Tagging",
       "undo": "Undo",
       "ratingLabel_many": "{{count}} Stars",
-      "unflagged": "Unflagged"
+      "unflagged": "Unflagged",
+      "autoLensCorrection": "Auto Lens Correction"
     },
     "folders": {
       "changeIcon": "Change Icon",
@@ -353,7 +355,9 @@
       "pasteAdjustments_many": "Paste Adjustments to {{count}} Images",
       "removeFromAlbum_many": "Remove {{count}} Images from Album",
       "renameImage_many": "Rename {{count}} Images",
-      "resetAdjustments_many": "Reset Adjustments on {{count}} Images"
+      "resetAdjustments_many": "Reset Adjustments on {{count}} Images",
+      "autoLensCorrection_one": "Auto Lens Correction",
+      "autoLensCorrection_other": "Auto Lens Correction"
     },
     "toasts": {
       "couldNotShowExplorer": "Could not show file in explorer: {{err}}",
@@ -458,7 +462,9 @@
       "noImageSelected": "No image selected.",
       "params": {
         "feather": "Feather",
-        "grow": "Grow"
+        "grow": "Grow",
+        "intensity": "Intensity",
+        "pressure": "Pressure"
       },
       "patches": {
         "aiEdit": "AI Edit {{count}}",
@@ -477,7 +483,11 @@
         "aiEdit_many": "AI Edit {{count}}",
         "clone_many": "Clone {{count}}",
         "heal_many": "Heal {{count}}",
-        "quickErase_many": "Quick Erase {{count}}"
+        "quickErase_many": "Quick Erase {{count}}",
+        "liquify": "Liquify {{count}}",
+        "liquify_one": "Liquify {{count}}",
+        "liquify_other": "Liquify {{count}}",
+        "retouch": "Retouch {{count}}"
       },
       "resetInpaintingTooltip": "Reset Inpainting",
       "settings": {
@@ -497,8 +507,19 @@
         "placeholder": "e.g., a field of flowers",
         "quickEraseDesc": "Fill selection to remove the object.",
         "selectionPropertiesTitle": "Selection Properties",
-        "useBasicInpaint": "Use basic inpainting"
-      }
+        "useBasicInpaint": "Use basic inpainting",
+        "cancelGeneration": "Cancel Generation"
+      },
+      "liquify": {
+        "mode": "Liquify Mode",
+        "modes": {
+          "expand": "Expand",
+          "pinch": "Pinch",
+          "push": "Push",
+          "twirl": "Twirl"
+        }
+      },
+      "touchUpTitle": "Touch Up"
     },
     "crop": {
       "aspectRatioHeading": "Aspect Ratio",
@@ -506,7 +527,10 @@
         "hPlaceholder": "H",
         "hTooltip": "Height",
         "wPlaceholder": "W",
-        "wTooltip": "Width"
+        "wTooltip": "Width",
+        "removeTooltip": "Remove saved aspect ratio",
+        "saveTooltip": "Save aspect ratio as preset",
+        "savedTooltip": "Saved aspect ratio {{ratio}}"
       },
       "geometryHeading": "Geometry",
       "labels": {
@@ -546,6 +570,10 @@
         "triangle": {
           "desc": "Golden Triangle",
           "name": "Triangle"
+        },
+        "center": {
+          "desc": "Center Lines",
+          "name": "Center"
         }
       },
       "presets": {
@@ -706,7 +734,10 @@
         "createNew": "Create New {{name}} Mask",
         "selectNewSourcePoint": "{{modifier}} + Click to select a new source point",
         "showMore": "Show More Mask Types"
-      }
+      },
+      "aiTitle": "AI Selections",
+      "basicTitle": "Basic Tools",
+      "rangeTitle": "Ranges & Global"
     },
     "metadata": {
       "author": {
@@ -816,7 +847,8 @@
         "info": "Info",
         "inpaint": "Inpaint",
         "masks": "Masks",
-        "presets": "Presets"
+        "presets": "Presets",
+        "tethering": "Tethering"
       }
     },
     "toolbar": {
@@ -834,6 +866,16 @@
         "undo": "Undo (Ctrl+Z) or History (Right-click)"
       },
       "vc": "VC"
+    },
+    "guided": {
+      "cancel": "Cancel",
+      "drawingActive": "Drawing Active",
+      "hint": "Draw along edges in your photo that should be vertical or horizontal.",
+      "linesStatus": "Active Guide Lines",
+      "toast": {
+        "angleRejected": "Line angle is too far from horizontal or vertical",
+        "maxLines": "Maximum 2 vertical and 2 horizontal lines allowed"
+      }
     }
   },
   "export": {
@@ -859,7 +901,10 @@
     },
     "file": {
       "quality": "Quality",
-      "qualityLossless": "Quality (Lossless)"
+      "qualityLossless": "Quality (Lossless)",
+      "tiffBitDepth": "TIFF bit depth",
+      "tiffBitDepth16": "16-bit",
+      "tiffBitDepth8": "8-bit"
     },
     "labels": {
       "image": "Image",
@@ -888,7 +933,8 @@
       "fileSettings": "File Settings",
       "imageSizing": "Image Sizing",
       "metadata": "Metadata",
-      "watermark": "Watermark"
+      "watermark": "Watermark",
+      "destination": "Destination"
     },
     "status": {
       "cancelExport": "Cancel Export",
@@ -930,6 +976,34 @@
       "scale": "Scale",
       "spacing": "Spacing",
       "watermarkImage": "Watermark Image"
+    },
+    "border": {
+      "addBorder": "Add Border",
+      "bases": {
+        "eachEdge": "Each Respective Edge",
+        "longEdge": "Longest Edge",
+        "shortEdge": "Shortest Edge"
+      },
+      "basis": "Thickness Basis",
+      "color": "Border Color",
+      "invalidPercent": "Enter a number between 0 and 100 for both.",
+      "leftRight": "Left & Right",
+      "percent": "%",
+      "topBottom": "Top & Bottom"
+    },
+    "destination": {
+      "customFolder": "Custom folder",
+      "originalFolder": "Original image folder",
+      "subfolder": "Subfolder",
+      "subfolderPlaceholder": "e.g. final, WebP"
+    },
+    "pad": {
+      "aspectRatio": "Aspect Ratio",
+      "backgroundColor": "Background Color",
+      "invalidRatio": "Enter a positive number for both width and height.",
+      "padToAspectRatio": "Pad to Aspect Ratio",
+      "ratioHeight": "Aspect ratio height",
+      "ratioWidth": "Aspect ratio width"
     }
   },
   "library": {
@@ -1030,7 +1104,10 @@
         "clearSearch": "Clear search",
         "collapse": "Collapse",
         "expand": "Expand",
-        "sortFolders": "Sort Folders"
+        "sortFolders": "Sort Folders",
+        "moreOptions": "Options",
+        "navBack": "Go Back",
+        "navForward": "Go Forward"
       }
     },
     "grid": {
@@ -1166,7 +1243,8 @@
     },
     "thumbnailFit": {
       "fillSquare": "Fill Square",
-      "originalRatio": "Original Ratio"
+      "originalRatio": "Original Ratio",
+      "justified": "Masonry"
     },
     "thumbnailSize": {
       "tiny": "Tiny",
@@ -1199,7 +1277,9 @@
       "quickEraser": "Quick Eraser",
       "radial": "Radial",
       "sky": "Sky",
-      "subject": "Subject"
+      "subject": "Subject",
+      "liquify": "Liquify",
+      "retouch": "Retouch"
     }
   },
   "menus": {
@@ -1275,7 +1355,8 @@
         "tone": "Tone",
         "transformRotation": "Transform & Rotation",
         "vignette": "Vignette",
-        "whiteBalance": "White Balance"
+        "whiteBalance": "White Balance",
+        "guidedPerspective": "Guided Perspective"
       },
       "includedAdjustments": "Included Adjustments",
       "modeMerge": "Merge",
@@ -1359,7 +1440,8 @@
       "speedNotice": "This may take a few minutes depending on image size and selected method.",
       "strengthLabel": "Strength",
       "titleBatch": "Denoise Images",
-      "titleSingle": "Denoise Image"
+      "titleSingle": "Denoise Image",
+      "methodRaw9": "Apple RAW 9 (Neural Engine)"
     },
     "focusStack": {
       "cancel": "Cancel",
@@ -1534,7 +1616,10 @@
       "xAxis": "X Axis",
       "yAxis": "Y Axis",
       "zoomInTooltip": "Zoom In",
-      "zoomOutTooltip": "Zoom Out"
+      "zoomOutTooltip": "Zoom Out",
+      "geometry": "Geometry",
+      "guided": "Guided Perspective",
+      "manual": "Manual Transform"
     }
   },
   "settings": {
@@ -1557,7 +1642,10 @@
       "speed": "Speed",
       "title": "Mouse Controls",
       "zoom": "Zoom Speed Multiplier",
-      "zoomDesc": "Adjust how fast the canvas zooms in and out when using the scroll wheel or pinch gesture."
+      "zoomDesc": "Adjust how fast the canvas zooms in and out when using the scroll wheel or pinch gesture.",
+      "zoomClick": "Zoom photo to 100%",
+      "zoomClickDesc": "Zoom photo in editor to 100% on mouse click",
+      "zoomClickInfo": "Click the photo to instantly zoom to 100% (1:1 pixels) to assess sharpness and noise. When disabled, clicking zooms in gradually."
     },
     "data": {
       "clearSidecars": "Clear All Sidecar Files",
@@ -1583,7 +1671,10 @@
         "confirmClearCache": "Clear Cache",
         "confirmDeleteAllEdits": "Delete All Edits",
         "confirmTitle": "Confirm Deletion",
-        "sidecarMessage": "Are you sure you want to delete all sidecar files?\n\nThis will permanently remove all your edits for all images inside all active root folders and their subfolders."
+        "sidecarMessage": "Are you sure you want to delete all sidecar files?\n\nThis will permanently remove all your edits for all images inside all active root folders and their subfolders.",
+        "confirmResetLayout": "Reset Layout",
+        "confirmResetLayoutTitle": "Reset Workspace Layout",
+        "resetLayoutMessage": "Are you sure you want to reset the workspace layout? All docked panels, widths, and switcher positions will be restored to their defaults."
       },
       "noFolders": "No folders selected",
       "statuses": {
@@ -1605,9 +1696,14 @@
         "sidecarSuccess_other": "{{count}} sidecar files deleted successfully.",
         "aiSuccess_many": "{{count}} files updated. AI tags removed.",
         "allSuccess_many": "{{count}} files updated. All non-color tags removed.",
-        "sidecarSuccess_many": "{{count}} sidecar files deleted successfully."
+        "sidecarSuccess_many": "{{count}} sidecar files deleted successfully.",
+        "layoutResetSuccess": "Workspace layout reset to default.",
+        "resettingLayout": "Resetting workspace..."
       },
-      "title": "Data Management"
+      "title": "Data Management",
+      "resetLayoutButton": "Reset Layout",
+      "resetLayoutDesc": "Restore panel docks, side splitters, heights, and panel switchers to the default layout.",
+      "resetLayoutTitle": "Reset Workspace Layout"
     },
     "general": {
       "createXmp": "Create Missing XMP Files",
@@ -1636,7 +1732,10 @@
       "toolFocusMode": "Tool Focus Mode",
       "toolFocusModeDesc": "Automatically collapses the other tools in a panel when you expand one.",
       "xmpSync": "XMP Metadata Sync",
-      "xmpSyncDesc": "Sync ratings, color labels and tags to standard XMP sidecar files for compatibility with other photo editors."
+      "xmpSyncDesc": "Sync ratings, color labels and tags to standard XMP sidecar files for compatibility with other photo editors.",
+      "enableNeutralGreyCanvas": "Enable Neutral Grey Background",
+      "neutralGreyCanvas": "Neutral Grey Canvas",
+      "neutralGreyCanvasDesc": "Use a neutral grey canvas for more accurate color and exposure grading without changing the app theme."
     },
     "keybinds": {
       "actions": {
@@ -1845,7 +1944,10 @@
           "oklab": "Oklab (Perceptual)"
         },
         "tonemapperOverride": "Global Tonemapper Override",
-        "tonemapperOverrideDesc": "Force a specific tonemapper globally for all images, hiding the tonemapper switch from the adjustments panel."
+        "tonemapperOverrideDesc": "Force a specific tonemapper globally for all images, hiding the tonemapper switch from the adjustments panel.",
+        "appleRaw9": "Apple RAW 9 Engine",
+        "appleRaw9Desc": "Develop RAW files with Apple's Core Image RAW 9 decoder, which demosaics and denoises in one step on the Neural Engine. Requires macOS 27 or later and a supported camera; unsupported files automatically use the built-in decoder. Slower than the default decoder. Thumbnails are not affected.",
+        "enableAppleRaw9": "Use Apple RAW 9 for RAW files"
       },
       "previewRes": "Preview Resolution",
       "previewResDesc": "Determines the maximum resolution of the preview. Lower values significantly improve performance.",
@@ -1872,7 +1974,11 @@
       "wgpuDescRecommended": "Bypasses browser encoding for instantly responsive live previews. Highly recommended for performance.",
       "wgpuLabel": "Enable Direct WGPU Render",
       "workerThreads": "Thumbnail Worker Threads",
-      "workerThreadsDesc": "Number of parallel threads used to generate thumbnails. Higher values speed up library loading but use more CPU & RAM."
+      "workerThreadsDesc": "Number of parallel threads used to generate thumbnails. Higher values speed up library loading but use more CPU & RAM.",
+      "mediumThumbnailRes": "Editor Thumbnail Resolution",
+      "mediumThumbnailResDesc": "Resolution of the preview shown while full images load in the editor.",
+      "smallThumbnailRes": "Grid Thumbnail Resolution",
+      "smallThumbnailResDesc": "Resolution of thumbnails shown in the library grid."
     },
     "tagging": {
       "addCustomPlaceholder": "Add custom AI tags (comma separated)...",
@@ -1915,7 +2021,9 @@
         "sam2": "For providing the foundation model used for the AI subject detection capabilities.",
         "u2net": "For providing the robust architecture used for the AI sky and foreground detection capabilities.",
         "you": "For using and supporting RapidRAW. Your interest keeps this project alive and evolving.",
-        "youLabel": "You"
+        "youLabel": "You",
+        "libgphoto2": "For the comprehensive camera communication library powering RapidRAW's tethering and remote capture subsystem.",
+        "spektrafilm": "For the spectrally-based film emulation LUTs by Andrea Volpato, used to power RapidRAW's built-in film emulations. Licensed CC BY-SA 4.0."
       },
       "title": "Special Thanks"
     },
@@ -2022,5 +2130,58 @@
         "vectorscope": "Vectorscope"
       }
     }
+  },
+  "tethering": {
+    "aperture": "Aperture",
+    "aperturePlaceholder": "e.g. 2.8",
+    "autoApplyPreset": "Auto Apply Preset",
+    "autoOpenCaptured": "Auto-open captured image",
+    "cameraConnected": "Camera Connected",
+    "capturing": "Capturing...",
+    "changePreset": "Change",
+    "clearPreset": "Clear Preset",
+    "connectCamera": "Connect Camera",
+    "expComp": "Exp. Comp",
+    "expCompPlaceholder": "e.g. 0.0",
+    "expMode": "Exp. Mode",
+    "exposureSettings": "Exposure Settings",
+    "flipHorizontal": "Flip Horizontal",
+    "generalSettings": "General Settings",
+    "ghostOverlayAlt": "Ghost Overlay",
+    "iso": "ISO",
+    "isoPlaceholder": "e.g. 400",
+    "liveViewAlt": "Live View",
+    "metering": "Metering Mode",
+    "noCameraDetected": "No camera detected",
+    "noCamerasFound": "No cameras found. Ensure it is connected and in PC Remote mode.",
+    "overlayLastShot": "Overlay Last Shot",
+    "overlayOff": "Off",
+    "rotate90": "Rotate 90°",
+    "scanTooltip": "Scan for Cameras",
+    "selectCamera": "Select Camera",
+    "selectCameraPlaceholder": "Select a camera",
+    "shutter": "Shutter",
+    "shutterPlaceholder": "e.g. 1/200",
+    "startLiveView": "Start Live View",
+    "status": "Status",
+    "stopLiveView": "Stop Live View",
+    "title": "Tethering",
+    "toasts": {
+      "afFailed": "Autofocus trigger failed",
+      "cameraDisconnected": "Camera disconnected",
+      "captureFailed": "Capture failed: {{err}}",
+      "communicationFailed": "Failed to communicate with camera",
+      "connectionFailed": "Connection failed: {{err}}",
+      "detectionFailed": "Detection failed: {{err}}",
+      "noCamerasFound": "No cameras found. Ensure it is in PC Remote mode.",
+      "presetApplyFailed": "Failed to apply preset to captured image",
+      "selectFolderFirst": "Please select a standard folder in your Library first.",
+      "setFailed": "Failed to set {{key}}: {{err}}"
+    },
+    "triggerAutofocus": "Trigger Autofocus",
+    "triggerCapture": "Capture",
+    "wbTemp": "WB Temp (K)",
+    "wbTempPlaceholder": "e.g. 5600",
+    "whiteBalance": "White Balance"
   }
 }

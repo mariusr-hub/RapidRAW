@@ -62,6 +62,9 @@ import {
   MaskType,
   SubMask,
   MASK_PANEL_CREATION_TYPES,
+  MASK_AI_TYPES,
+  MASK_BASIC_TYPES,
+  MASK_RANGE_TYPES,
   OTHERS_MASK_TYPES,
   MASK_ICON_MAP,
   SubMaskMode,
@@ -1722,7 +1725,7 @@ function SubMaskRow({
     setNodeRef(node);
     setDroppableRef(node);
   };
-  const MaskIcon = MASK_ICON_MAP[subMask.type] || Circle;
+  const MaskIcon = (MASK_ICON_MAP as Record<string, any>)[subMask.type] || Circle;
   const { showContextMenu } = useContextMenu();
   const [isHovered, setIsHovered] = useState(false);
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);

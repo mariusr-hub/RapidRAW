@@ -35,7 +35,7 @@ const BASE_RATIO = 1.618;
 const ORIGINAL_RATIO = 0;
 const RATIO_TOLERANCE = 0.01;
 
-export type OverlayMode = 'none' | 'thirds' | 'goldenTriangle' | 'goldenSpiral' | 'phiGrid' | 'armature' | 'diagonal';
+export type OverlayMode = 'none' | 'thirds' | 'goldenTriangle' | 'goldenSpiral' | 'phiGrid' | 'armature' | 'diagonal' | 'center';
 
 interface CropPreset {
   name: string;

@@ -351,8 +351,6 @@ function App() {
     handleHistoryForward,
     handleSelectAlbum,
     handleOpenFolder,
-    handleNavBack,
-    handleNavForward,
     handleContinueSession,
   } = useAppNavigation({
     clearThumbnailQueue,
@@ -720,14 +718,14 @@ function App() {
               isResizing={isResizing}
               onContextMenu={handleFolderTreeContextMenu}
               onAlbumContextMenu={handleAlbumTreeContextMenu}
-              onSelectAlbum={(id, name, images, skipHistory) => handleSelectAlbum(id, name, images, false, skipHistory)}
-              onFolderSelect={(path, skipHistory) =>
-                handleSelectSubfolder(path, false, undefined, true, false, skipHistory)
-              }
+              onSelectAlbum={(id, name, images) => {
+                void handleSelectAlbum(id, name, images, false);
+              }}
+              onFolderSelect={(path) => {
+                void handleSelectSubfolder(path, false, undefined, true, false);
+              }}
               onToggleFolder={handleToggleFolder}
               onOpenFolder={handleOpenFolder}
-              onNavBack={handleNavBack}
-              onNavForward={handleNavForward}
               style={{ width: '100%', height: '100%' }}
               isInstantTransition={isInstantTransition}
             />
@@ -772,8 +770,6 @@ function App() {
       handleSelectSubfolder,
       handleToggleFolder,
       handleOpenFolder,
-      handleNavBack,
-      handleNavForward,
       setUI,
       isInstantTransition,
       exportState,
@@ -932,13 +928,14 @@ function App() {
                       <EditorView
                         transformWrapperRef={transformWrapperRef}
                         isResizing={isResizing}
-                        isCompactPortrait={isCompactPortrait}
+                        layoutMode={layoutMode}
                         isAndroid={isAndroid}
                         compactEditorPanelHeight={compactEditorPanelHeight}
                         compactEditorPanelCollapsedHeight={compactEditorPanelCollapsedHeight}
                         thumbnailAspectRatio={thumbnailAspectRatio}
                         sortedImageList={sortedImageList}
                         createResizeHandler={createResizeHandler}
+                        createResizeResetHandler={createResizeResetHandler}
                         handleBackToLibrary={handleBackToLibrary}
                         handleEditorContextMenu={handleEditorContextMenu}
                         handleThumbnailContextMenu={handleThumbnailContextMenu}
@@ -964,6 +961,7 @@ function App() {
                 >
                   <ErrorBoundary fallbackTitle="Library View Error">
                     <LibraryView
+                      layoutMode={layoutMode}
                       sortedImageList={sortedImageList}
                       groupBadgeInfo={groupBadgeInfo}
                       thumbnailSize={thumbnailSize}

@@ -262,8 +262,8 @@
     "library": {
       "addCopiedToAlbum_one": "Kopiertes Bild zum Album hinzufügen",
       "addCopiedToAlbum_other": "{{count}} kopierte Bilder zum Album hinzufügen",
-"deleteRejected": "Abgelehnte Bilder löschen",,
-      "refreshView": "Ansicht aktualisieren",,
+"deleteRejected": "Abgelehnte Bilder löschen",
+      "refreshView": "Ansicht aktualisieren",
       "addCopiedToAlbum_many": "{{count}} kopierte Bilder zum Album hinzufügen"
     },
     "merge": {

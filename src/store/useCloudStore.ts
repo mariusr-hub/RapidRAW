@@ -55,7 +55,7 @@ export const useCloudStore = create<CloudStoreState>((set, get) => ({
         routerPush: () => {},
         routerReplace: () => {},
       });
-      clerk.addListener(({ user }) => {
+      clerk.addListener(({ user }: any) => {
         set({ user: user ?? null });
         if (!user) set({ cloudUsage: null });
       });

@@ -308,6 +308,51 @@ export function useEditorActions() {
     useEditorStore.getState().setEditor({ zoom: transformZoom });
   }, []);
 
+  const handleAutoLensCorrection = useCallback(
+    (paths?: string[]) => {
+      const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
+      const { selectedImage, resetHistory } = useEditorStore.getState();
+
+      const pathsToUpdate =
+        paths && paths.length > 0
+          ? paths
+          : multiSelectedPaths.length > 0
+            ? multiSelectedPaths
+            : selectedImage
+              ? [selectedImage.path]
+              : [];
+
+      if (pathsToUpdate.length === 0) return;
+
+      pathsToUpdate.forEach((p) => globalImageCache.delete(p));
+
+      invoke('apply_auto_lens_correction_to_paths', { paths: pathsToUpdate })
+        .then(async () => {
+          if (selectedImage && pathsToUpdate.includes(selectedImage.path)) {
+            const meta: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
+            if (meta.adjustments && !meta.adjustments.is_null) {
+              const normalized = normalizeLoadedAdjustments(meta.adjustments);
+              setEditor({ adjustments: normalized });
+              resetHistory(normalized);
+            }
+          }
+          if (libraryActivePath && pathsToUpdate.includes(libraryActivePath)) {
+            const meta: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
+            if (meta.adjustments && !meta.adjustments.is_null) {
+              setLibrary({ libraryActiveAdjustments: normalizeLoadedAdjustments(meta.adjustments) });
+            }
+          }
+        })
+        .catch((err) => toast.error(`Failed to apply auto lens correction: ${err}`));
+    },
+    [setEditor],
+  );
+
+  const toggleShowOriginal = useCallback(() => {
+    const s = useEditorStore.getState();
+    s.setEditor({ showOriginal: !s.showOriginal });
+  }, []);
+
   return {
     setAdjustments,
     handleRotate,
@@ -315,8 +360,10 @@ export function useEditorActions() {
     handleLutSelect,
     setLutPreviewOverride,
     handleResetAdjustments,
+    handleAutoLensCorrection,
     handleCopyAdjustments,
     handlePasteAdjustments,
     handleZoomChange,
+    toggleShowOriginal,
   };
 }

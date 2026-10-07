@@ -14,8 +14,119 @@ export const DEFAULT_PANEL_WIDTH = 320;
 export const DEFAULT_BOTTOM_PANEL_HEIGHT = 160;
 export const DEFAULT_PANEL_SECTION_HEIGHT = 240;
 
-export function reconcileWorkspace() {
-  // Utility stub for workspace reconciliation
+const ALL_PANELS: Panel[] = [
+  Panel.Metadata,
+  Panel.FolderTree,
+  Panel.Export,
+  Panel.Tethering,
+  Panel.Adjustments,
+  Panel.Crop,
+  Panel.Masks,
+  Panel.Ai,
+  Panel.Presets,
+];
+
+const DEFAULT_PANEL_DEFAULT_REGIONS: Record<Panel, PanelRegion> = {
+  [Panel.Metadata]: 'leftTop',
+  [Panel.FolderTree]: 'leftTop',
+  [Panel.Export]: 'leftTop',
+  [Panel.Tethering]: 'leftTop',
+  [Panel.Adjustments]: 'rightTop',
+  [Panel.Crop]: 'rightTop',
+  [Panel.Masks]: 'rightTop',
+  [Panel.Ai]: 'rightTop',
+  [Panel.Presets]: 'rightTop',
+};
+
+export function reconcileWorkspace(
+  savedWorkspace: WorkspaceState | undefined,
+  isTetheringSupported: boolean,
+): WorkspaceState {
+  const allowedPanels = new Set(ALL_PANELS.filter((p) => p !== Panel.Tethering || isTetheringSupported));
+
+  const defaultWorkspace: WorkspaceState = {
+    leftPanelWidth: DEFAULT_PANEL_WIDTH,
+    rightPanelWidth: DEFAULT_PANEL_WIDTH,
+    leftTopHeight: DEFAULT_PANEL_SECTION_HEIGHT,
+    rightTopHeight: DEFAULT_PANEL_SECTION_HEIGHT,
+    panelLayout: {
+      leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Export, ...(isTetheringSupported ? [Panel.Tethering] : [])],
+      leftBottom: [],
+      rightTop: [Panel.Adjustments, Panel.Crop, Panel.Masks, Panel.Ai, Panel.Presets],
+      rightBottom: [],
+    },
+    activePanels: {
+      leftTop: Panel.FolderTree,
+      leftBottom: null,
+      rightTop: Panel.Adjustments,
+      rightBottom: null,
+    },
+    panelSwitcherPlacement: {
+      leftTop: 'bottom',
+      leftBottom: 'bottom',
+      rightTop: 'right',
+      rightBottom: 'right',
+    },
+  };
+
+  if (!savedWorkspace || !savedWorkspace.panelLayout) {
+    return defaultWorkspace;
+  }
+
+  const seenPanels = new Set<Panel>();
+  const sanitizedLayout: Record<PanelRegion, Panel[]> = {
+    leftTop: [],
+    leftBottom: [],
+    rightTop: [],
+    rightBottom: [],
+  };
+
+  (['leftTop', 'leftBottom', 'rightTop', 'rightBottom'] as PanelRegion[]).forEach((region) => {
+    const list = savedWorkspace.panelLayout[region] || [];
+    list.forEach((panel) => {
+      if (allowedPanels.has(panel) && !seenPanels.has(panel)) {
+        sanitizedLayout[region].push(panel);
+        seenPanels.add(panel);
+      }
+    });
+  });
+
+  allowedPanels.forEach((panel) => {
+    if (!seenPanels.has(panel)) {
+      const targetRegion = DEFAULT_PANEL_DEFAULT_REGIONS[panel] || 'leftTop';
+      sanitizedLayout[targetRegion].push(panel);
+      seenPanels.add(panel);
+    }
+  });
+
+  const sanitizedActive: Record<PanelRegion, Panel | null> = {
+    leftTop: null,
+    leftBottom: null,
+    rightTop: null,
+    rightBottom: null,
+  };
+
+  (['leftTop', 'leftBottom', 'rightTop', 'rightBottom'] as PanelRegion[]).forEach((region) => {
+    const currentActive = savedWorkspace.activePanels?.[region];
+    if (currentActive && sanitizedLayout[region].includes(currentActive)) {
+      sanitizedActive[region] = currentActive;
+    } else {
+      sanitizedActive[region] = sanitizedLayout[region].length > 0 ? sanitizedLayout[region][0] : null;
+    }
+  });
+
+  return {
+    leftPanelWidth: savedWorkspace.leftPanelWidth || defaultWorkspace.leftPanelWidth,
+    rightPanelWidth: savedWorkspace.rightPanelWidth || defaultWorkspace.rightPanelWidth,
+    leftTopHeight: savedWorkspace.leftTopHeight || defaultWorkspace.leftTopHeight,
+    rightTopHeight: savedWorkspace.rightTopHeight || defaultWorkspace.rightTopHeight,
+    panelLayout: sanitizedLayout,
+    activePanels: sanitizedActive,
+    panelSwitcherPlacement: {
+      ...defaultWorkspace.panelSwitcherPlacement,
+      ...(savedWorkspace.panelSwitcherPlacement || {}),
+    },
+  };
 }
 
 export type SwitcherPlacement = 'bottom' | 'right' | 'left' | 'top';
@@ -254,6 +365,7 @@ interface UIState {
   setImageSelectHandler: (handler: ((path: string, openInEditor?: boolean) => void) | null) => void;
   searchFocusRequest: number;
   requestSearchFocus: () => void;
+  resetWorkspaceLayout: (isTetheringSupported?: boolean) => WorkspaceState;
 }
 
 export const useUIStore = create<UIState>((set, get) => ({
@@ -502,6 +614,23 @@ export const useUIStore = create<UIState>((set, get) => ({
       }
     }
     if (targetRegion) state.setActivePanel(targetRegion, panelId);
+  },
+
+  resetWorkspaceLayout: (isTetheringSupported = false) => {
+    const defaultWorkspace = reconcileWorkspace(undefined, isTetheringSupported);
+    set({
+      leftPanelWidth: defaultWorkspace.leftPanelWidth,
+      rightPanelWidth: defaultWorkspace.rightPanelWidth,
+      leftTopHeight: defaultWorkspace.leftTopHeight,
+      rightTopHeight: defaultWorkspace.rightTopHeight,
+      panelLayout: defaultWorkspace.panelLayout,
+      activePanels: defaultWorkspace.activePanels,
+      panelSwitcherPlacement: defaultWorkspace.panelSwitcherPlacement,
+      uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: true },
+      activePanel: defaultWorkspace.activePanels.rightTop || null,
+      renderedPanel: defaultWorkspace.activePanels.rightTop || null,
+    });
+    return defaultWorkspace;
   },
 
   customEscapeHandler: null,

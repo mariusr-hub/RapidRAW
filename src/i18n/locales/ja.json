@@ -262,8 +262,8 @@
     "library": {
       "addCopiedToAlbum_one": "コピーした画像をアルバムに追加",
       "addCopiedToAlbum_other": "コピーした {{count}} 枚の画像をアルバムに追加",
-"deleteRejected": "除外した画像を削除",,
-      "refreshView": "表示を更新",,
+"deleteRejected": "除外した画像を削除",
+      "refreshView": "表示を更新",
       "addCopiedToAlbum_many": "コピーした {{count}} 枚の画像をアルバムに追加"
     },
     "merge": {

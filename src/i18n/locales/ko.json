@@ -262,8 +262,8 @@
     "library": {
       "addCopiedToAlbum_one": "복사한 이미지를 앨범에 추가",
       "addCopiedToAlbum_other": "복사한 이미지 {{count}}개를 앨범에 추가",
-"deleteRejected": "거부된 이미지 삭제",,
-      "refreshView": "보기 새로고침",,
+"deleteRejected": "거부된 이미지 삭제",
+      "refreshView": "보기 새로고침",
       "addCopiedToAlbum_many": "복사한 이미지 {{count}}개를 앨범에 추가"
     },
     "merge": {

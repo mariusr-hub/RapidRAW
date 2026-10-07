@@ -332,7 +332,6 @@ export interface Adjustments {
   lutName?: string | null;
   lutPath?: string | null;
   lutSize?: number;
-  lutIsSceneReferred?: boolean;
   masks: Array<MaskContainer>;
   orientationSteps: number;
   rotation: number;
@@ -700,7 +699,6 @@ export const INITIAL_ADJUSTMENTS: Adjustments = {
   lutName: null,
   lutPath: null,
   lutSize: 0,
-  lutIsSceneReferred: false,
   masks: [],
   orientationSteps: 0,
   rotation: 0,

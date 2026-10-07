@@ -516,7 +516,7 @@ export default function AIPanel() {
     if (config && config.parameters) {
       config.parameters.forEach((param: any) => {
         if (param.defaultValue !== undefined) {
-          subMask.parameters[param.key] = param.defaultValue / (param.multiplier || 1);
+          (subMask.parameters as any)[param.key] = param.defaultValue / (param.multiplier || 1);
         }
       });
     }
@@ -526,8 +526,8 @@ export default function AIPanel() {
     }
 
     if (type === Mask.Linear || type === Mask.Radial) {
-      if (!subMask.parameters) subMask.parameters = {};
-      subMask.parameters.isInitialDraw = true;
+      if (!subMask.parameters) subMask.parameters = {} as any;
+      (subMask.parameters as any).isInitialDraw = true;
       subMask.parameters.startX = -10000;
       subMask.parameters.startY = -10000;
       subMask.parameters.endX = -10000;
@@ -1586,7 +1586,7 @@ function ContainerRow({
               >
                 {isStandalone ? (
                   (() => {
-                    const StandaloneIcon = MASK_ICON_MAP[firstSubMask.type] || Circle;
+                    const StandaloneIcon = (MASK_ICON_MAP as Record<string, any>)[firstSubMask.type] || Circle;
                     return <StandaloneIcon size={18} />;
                   })()
                 ) : isExpanded ? (
@@ -1758,7 +1758,7 @@ function SubMaskRow({
     setNodeRef(node);
     setDroppableRef(node);
   };
-  const MaskIcon = MASK_ICON_MAP[subMask.type] || Circle;
+  const MaskIcon = (MASK_ICON_MAP as Record<string, any>)[subMask.type] || Circle;
   const { showContextMenu } = useContextMenu();
   const [isHovered, setIsHovered] = useState(false);
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);

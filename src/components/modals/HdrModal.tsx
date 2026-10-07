@@ -109,7 +109,7 @@ export default function HdrModal({
   const [healthReport, setHealthReport] = useState<BracketHealthReport | null>(null);
 
   const mouseDownTarget = useRef<EventTarget | null>(null);
-  const updateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const updateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasUserAdjustedRef = useRef<boolean>(false);
 
   useEffect(() => {

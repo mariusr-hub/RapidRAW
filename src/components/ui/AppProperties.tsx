@@ -73,6 +73,13 @@ export enum Invokes {
   HandleImportPresetsFromFiles = 'handle_import_presets_from_files',
   HandleImportLegacyPresetsFromFile = 'handle_import_legacy_presets_from_file',
   ImportFiles = 'import_files',
+  IsTetheringSupported = 'is_tethering_supported',
+  TetherListCameras = 'tether_list_cameras',
+  TetherGetSettings = 'tether_get_settings',
+  TetherConnect = 'tether_connect',
+  TetherSetSetting = 'tether_set_setting',
+  TetherCapture = 'tether_capture',
+  TetherGetPreview = 'tether_get_preview',
   InvokeGenerativeReplaseWithMaskDef = 'invoke_generative_replace_with_mask_def',
   ListImagesInDir = 'list_images_in_dir',
   ListImagesRecursive = 'list_images_recursive',
@@ -120,6 +127,7 @@ export enum Invokes {
   AddToAlbum = 'add_to_album',
   GetAlbumImages = 'get_album_images',
   ExtractEmbeddedRawPreview = 'extract_embedded_raw_preview',
+  IsRaw9Available = 'is_raw9_available',
 }
 
 export enum ExifOverlay {
@@ -137,6 +145,7 @@ export enum Panel {
   Metadata = 'metadata',
   Presets = 'presets',
   FolderTree = 'folderTree',
+  Tethering = 'tethering',
 }
 
 export type PanelRegion = 'leftTop' | 'leftBottom' | 'rightTop' | 'rightBottom';
@@ -174,6 +183,7 @@ export enum ThumbnailAspectRatio {
   Cover = 'cover',
   Contain = 'contain',
   Masonry = 'masonry',
+  Justified = 'justified',
 }
 
 export interface WorkspaceState {
@@ -188,6 +198,12 @@ export interface WorkspaceState {
 
 export type GroupPreference = 'jpeg' | 'raw';
 export type GroupingMode = 'off' | GroupPreference;
+
+export interface CustomAspectRatio {
+  id: string;
+  label: string;
+  value: number;
+}
 
 export interface AppSettings {
   aiConnectorAddress?: string;
@@ -426,6 +442,7 @@ export interface UiVisibility {
   filmstrip: boolean;
   leftPanel: boolean;
   rightPanel: boolean;
+  quickFilter?: boolean;
 }
 
 export interface CollapsibleSectionsState {

@@ -4286,8 +4286,8 @@ pub fn sync_metadata_to_xmp(source_path: &Path, metadata: &ImageMetadata, create
         } else {
             metadata.rating.to_string()
         };
-        let re_rating_attr = regex!(r#"xmp:Rating\s*=\s*"[^"]*""#);
-        let re_rating_tag = regex!(r#"<xmp:Rating\s*>[^<]*</xmp:Rating>"#);
+        let re_rating_attr = regex::Regex::new(r#"xmp:Rating\s*=\s*"[^"]*""#).unwrap();
+        let re_rating_tag = regex::Regex::new(r#"<xmp:Rating\s*>[^<]*</xmp:Rating>"#).unwrap();
 
         if re_rating_attr.is_match(&content) {
             content = re_rating_attr

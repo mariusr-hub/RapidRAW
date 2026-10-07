@@ -2,6 +2,7 @@ import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useUIStore } from '../store/useUIStore';
 import { Invokes } from '../components/ui/AppProperties';
+import type { DenoiseMethod } from '../components/modals/DenoiseModal';
 
 export function useProductivityActions(refreshImageList: () => Promise<void> = async () => {}) {
   const setUI = useUIStore((state) => state.setUI);
@@ -152,7 +153,7 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
   const handleApplyDenoise = useCallback(
     async (
       intensity: number,
-      method: 'ai' | 'bm3d',
+      method: DenoiseMethod,
       healDust: boolean = true,
       visualizeDefects: boolean = false,
       protectStars: boolean = true,
@@ -200,7 +201,7 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
   const handleBatchDenoise = useCallback(
     async (
       intensity: number,
-      method: 'ai' | 'bm3d',
+      method: DenoiseMethod,
       paths: string[],
       healDust: boolean = true,
       protectStars: boolean = true,

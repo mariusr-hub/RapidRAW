@@ -1,3 +1,4 @@
+import { useEditorStore } from '../../../store/useEditorStore';
 import { useState, useEffect, useRef, useCallback, memo, useMemo } from 'react';
 import ReactCrop from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
@@ -2293,7 +2294,7 @@ const ImageCanvas = memo(
       }
       setWbBox(null);
       resetWbSample();
-    }, [isWbPickerActive, selectedImage.path, resetWbSample]);
+    }, [isWbPickerActive, selectedImage?.path, resetWbSample]);
 
     const handleStart = useCallback(
       (e: any) => {
@@ -2330,8 +2331,6 @@ const ImageCanvas = memo(
           wbDragRef.current = { start: pos, end: pos, isBox: false };
           drawingStageRef.current = stage;
           isDrawing.current = true;
-          return;
-        }
           return;
         }
 
@@ -3265,33 +3264,6 @@ const ImageCanvas = memo(
         retainedPatchRef.current = null;
       }
     }, [baseIsReady, interactivePatch]);
-
-    const uncroppedImageRenderSize = useMemo<Partial<RenderSize> | null>(() => {
-      if (!selectedImage?.width || !selectedImage?.height || !imageRenderSize?.width || !imageRenderSize?.height) {
-        return null;
-      }
-
-      const viewportWidth = imageRenderSize.width + 2 * imageRenderSize.offsetX;
-      const viewportHeight = imageRenderSize.height + 2 * imageRenderSize.offsetY;
-
-      let uncroppedEffectiveWidth = selectedImage?.width || 0;
-      let uncroppedEffectiveHeight = selectedImage?.height || 0;
-      const orientationSteps = adjustments.orientationSteps || 0;
-      if (orientationSteps === 1 || orientationSteps === 3) {
-        [uncroppedEffectiveWidth, uncroppedEffectiveHeight] = [uncroppedEffectiveHeight, uncroppedEffectiveWidth];
-      }
-
-      if (uncroppedEffectiveWidth <= 0 || uncroppedEffectiveHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0) {
-        return null;
-      }
-
-      const scale = Math.min(viewportWidth / uncroppedEffectiveWidth, viewportHeight / uncroppedEffectiveHeight);
-
-      const renderWidth = uncroppedEffectiveWidth * scale;
-      const renderHeight = uncroppedEffectiveHeight * scale;
-
-      return { width: renderWidth, height: renderHeight };
-    }, [selectedImage?.width, selectedImage?.height, imageRenderSize, adjustments.orientationSteps]);
 
     const cropImageTransforms = useMemo(() => {
       const rotation = liveRotation !== null && liveRotation !== undefined ? liveRotation : adjustments.rotation || 0;
