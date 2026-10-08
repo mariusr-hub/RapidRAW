@@ -149,8 +149,8 @@ opt-level = 3
 # Current settings: thin-lto + 4 codegen-units keeps peak per-unit memory
 # under 1 GB while producing nearly identical binary performance.
 [profile.release]
-codegen-units = 4
-lto = "thin"
+codegen-units = 8
+lto = "off"
 strip = true
 opt-level = 3
 
