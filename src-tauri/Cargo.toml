@@ -19,15 +19,18 @@ path = "src/main.rs"
 name = "render_all"
 path = "src/bin/render_all.rs"
 test = false
+required-features = ["cli-tools"]
 
 [[bin]]
 name = "find_clusters"
 path = "src/bin/find_clusters.rs"
 test = false
+required-features = ["cli-tools"]
 
 [features]
 default = []
 tethering = ["dep:gphoto2"]
+cli-tools = []
 
 [dependencies]
 # Kept at "2.11" (not "2.12") so the Android CI job can pin the tauri stack back to
