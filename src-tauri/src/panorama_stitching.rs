@@ -82,17 +82,22 @@ pub fn load_single_full_res_panel(
     let file_bytes = fs::read(filename)
         .map_err(|e| format!("Failed to read image {}: {}", filename, e))?;
 
+    let mut load_settings = settings.clone();
+    if is_raw_file(filename) {
+        load_settings.raw_preprocessing_sharpening = Some(0.0);
+    }
+
     let mut dynamic_image = crate::image_loader::load_base_image_from_bytes(
         &file_bytes,
         filename,
         false,
-        settings,
+        &load_settings,
         None,
     )
     .map_err(|e| format!("Failed to load image {}: {}", filename, e))?;
 
     if is_raw_file(filename) {
-        let _gain = develop_and_normalize_raw_for_panorama(&mut dynamic_image, fixed_exposure_gain);
+        let _gain = prepare_linear_raw_for_panorama(&mut dynamic_image, fixed_exposure_gain);
     }
 
     Ok(dynamic_image.to_rgb32f())
@@ -133,6 +138,7 @@ pub async fn stitch_panorama(
         .collect();
 
     let panorama_result_handle = state.panorama_result.clone();
+    let panorama_linear_radiance_handle = state.panorama_linear_radiance.clone();
     let panorama_metadata_handle = state.panorama_metadata.clone();
     let selected_proj = projection.unwrap_or(stitching::PanoramaProjection::Cylindrical);
     let warp_strength = boundary_warp.unwrap_or(0.5);
@@ -142,19 +148,37 @@ pub async fn stitch_panorama(
     let app_handle_clone = app_handle.clone();
     let settings = crate::app_settings::load_settings(app_handle.clone()).unwrap_or_default();
     let task = tokio::task::spawn_blocking(move || {
-        let hugin_res = crate::hugin_engine::run_hugin_panorama(
-            &source_paths,
+        let native_res = stitch_images_native_with_radiance(
+            source_paths.clone(),
             selected_proj,
-            &settings,
+            warp_strength,
             is_half_size,
-            None,
             Some(&app_handle_clone),
             Some(&cancel_token_clone),
         );
 
-        match hugin_res {
-            Ok(pano_f32) => {
-                let panorama_image = DynamicImage::ImageRgb32F(pano_f32);
+        let stitch_res = match native_res {
+            Ok(pair) => Ok(pair),
+            Err(native_err) => {
+                println!(
+                    "  [Panorama] Native linear-first pipeline returned '{}', trying Hugin fallback...",
+                    native_err
+                );
+                crate::hugin_engine::run_hugin_panorama(
+                    &source_paths,
+                    selected_proj,
+                    &settings,
+                    is_half_size,
+                    None,
+                    Some(&app_handle_clone),
+                    Some(&cancel_token_clone),
+                )
+                .map(|pano_f32| (DynamicImage::ImageRgb32F(pano_f32.clone()), pano_f32))
+            }
+        };
+
+        match stitch_res {
+            Ok((panorama_image, linear_radiance)) => {
                 let _ = app_handle.emit("panorama-progress", "Generating high-resolution preview... 98%");
 
                 let (w, h) = panorama_image.dimensions();
@@ -179,6 +203,7 @@ pub async fn stitch_panorama(
                 let final_base64 = format!("data:image/png;base64,{}", base64_str);
 
                 *panorama_result_handle.lock().unwrap() = Some(panorama_image);
+                *panorama_linear_radiance_handle.lock().unwrap() = Some(linear_radiance);
                 *panorama_metadata_handle.lock().unwrap() = Some((selected_proj, warp_strength));
 
                 let _ = app_handle.emit(
@@ -317,7 +342,15 @@ pub fn stitch_images(
     boundary_warp: f32,
     app_handle: AppHandle,
 ) -> Result<DynamicImage, String> {
-    stitch_images_impl(image_paths, projection, boundary_warp, Some(&app_handle), None)
+    stitch_images_impl(
+        image_paths,
+        projection,
+        boundary_warp,
+        false,
+        Some(&app_handle),
+        None,
+    )
+    .map(|(disp, _lin)| disp)
 }
 
 pub fn stitch_images_headless(
@@ -325,16 +358,36 @@ pub fn stitch_images_headless(
     projection: PanoramaProjection,
     boundary_warp: f32,
 ) -> Result<DynamicImage, String> {
-    stitch_images_impl(image_paths, projection, boundary_warp, None, None)
+    stitch_images_impl(image_paths, projection, boundary_warp, false, None, None)
+        .map(|(disp, _lin)| disp)
+}
+
+pub fn stitch_images_native_with_radiance(
+    image_paths: Vec<String>,
+    projection: PanoramaProjection,
+    boundary_warp: f32,
+    half_size: bool,
+    app_handle: Option<&AppHandle>,
+    cancel_token: Option<&Arc<AtomicBool>>,
+) -> Result<(DynamicImage, Rgb32FImage), String> {
+    stitch_images_impl(
+        image_paths,
+        projection,
+        boundary_warp,
+        half_size,
+        app_handle,
+        cancel_token,
+    )
 }
 
 fn stitch_images_impl(
     image_paths: Vec<String>,
     projection: PanoramaProjection,
     boundary_warp: f32,
+    half_size: bool,
     app_handle: Option<&AppHandle>,
     cancel_token: Option<&Arc<AtomicBool>>,
-) -> Result<DynamicImage, String> {
+) -> Result<(DynamicImage, Rgb32FImage), String> {
     if image_paths.len() < 2 {
         return Err("At least two images are required for a panorama.".to_string());
     }
@@ -353,13 +406,37 @@ fn stitch_images_impl(
 
     let start_time = Instant::now();
     if let Some(h) = app_handle {
-        let _ = h.emit("panorama-progress", "Loading images & extracting multi-scale ORB features... 10%");
+        let _ = h.emit(
+            "panorama-progress",
+            "Loading images & extracting multi-scale ORB features... 10%",
+        );
     }
-    println!("Loading and extracting multi-scale ORB features (memory-capped sequential pipeline)...");
+    println!("Loading and extracting multi-scale ORB features (linear-first pipeline)...");
     let brief_pairs = processing::generate_brief_pairs();
 
+    let all_raw = image_paths.iter().all(|p| is_raw_file(p));
+    let mut physical_scales = Vec::with_capacity(image_paths.len());
+    for filename in &image_paths {
+        let file_bytes = fs::read(filename).unwrap_or_default();
+        let exp_sec =
+            crate::exif_processing::read_exposure_time_secs(filename, &file_bytes).unwrap_or(0.01);
+        let iso = crate::exif_processing::read_iso(filename, &file_bytes)
+            .map(|g| g as f32)
+            .unwrap_or(100.0);
+        let f_num = crate::exif_processing::read_f_number(filename, &file_bytes).unwrap_or(5.6);
+        let scale = crate::hdr_deghosting::compute_physical_exposure_scale(
+            std::time::Duration::from_secs_f32(exp_sec),
+            iso,
+            f_num,
+        )
+        .max(1e-7);
+        physical_scales.push(scale);
+    }
+    let mut sorted_scales = physical_scales.clone();
+    sorted_scales.sort_by(|a, b| a.total_cmp(b));
+    let median_phys_scale = sorted_scales[sorted_scales.len() / 2];
+
     let mut image_data = Vec::with_capacity(image_paths.len());
-    let mut anchor_gain: Option<f32> = None;
 
     for (i, filename) in image_paths.iter().enumerate() {
         if let Some(token) = cancel_token {
@@ -383,40 +460,58 @@ fn stitch_images_impl(
         let file_bytes = fs::read(filename)
             .map_err(|e| format!("Failed to read image {}: {}", filename, e))?;
 
+        let mut load_settings = settings.clone();
+        if is_raw_file(filename) {
+            load_settings.raw_preprocessing_sharpening = Some(0.0);
+        }
+
         let mut dynamic_image = crate::image_loader::load_base_image_from_bytes(
             &file_bytes,
             filename,
-            false,
-            &settings,
+            half_size,
+            &load_settings,
             None,
         )
         .map_err(|e| format!("Failed to load image {}: {}", filename, e))?;
 
+        let target_gain = (median_phys_scale / physical_scales[i]).clamp(0.125, 8.0);
         let exposure_gain = if is_raw_file(filename) {
-            let g = develop_and_normalize_raw_for_panorama(&mut dynamic_image, anchor_gain);
-            if anchor_gain.is_none() {
-                anchor_gain = Some(g);
-            }
-            g
+            prepare_linear_raw_for_panorama(&mut dynamic_image, Some(target_gain))
         } else {
             1.0
         };
 
         let (full_w, full_h) = dynamic_image.dimensions();
-        let (new_w, new_h, scale_factor) = processing::calculate_downscale_dimensions(full_w, full_h);
+        let (new_w, new_h, scale_factor) =
+            processing::calculate_downscale_dimensions(full_w, full_h);
 
-        let proxy_dyn = dynamic_image.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+        let proxy_dyn =
+            dynamic_image.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
         let proxy_image = proxy_dyn.to_rgb32f();
 
-        let color_small_u8 = proxy_dyn.to_rgb8();
-        let gray_small = image::imageops::colorops::grayscale(&color_small_u8);
-        drop(dynamic_image);
+        let gray_small = if is_raw_file(filename) {
+            crate::hdr_panorama::hdr_to_feature_grayscale(&proxy_image)
+        } else {
+            let color_small_u8 = proxy_dyn.to_rgb8();
+            image::imageops::colorops::grayscale(&color_small_u8)
+        };
         drop(proxy_dyn);
+
+        let full_image = if image_paths.len() <= 8 || half_size {
+            Some(dynamic_image.to_rgb32f())
+        } else {
+            None
+        };
+        drop(dynamic_image);
 
         let low_detail_mask = processing::generate_low_detail_mask(&gray_small);
 
         let features = processing::find_features(&gray_small, &brief_pairs);
-        println!("    Found {} multi-scale ORB features in '{}'", features.len(), filename);
+        println!(
+            "    Found {} multi-scale ORB features in '{}'",
+            features.len(),
+            filename
+        );
 
         image_data.push(ImageInfo {
             id: i,
@@ -424,7 +519,7 @@ fn stitch_images_impl(
             full_width: full_w,
             full_height: full_h,
             proxy_image,
-            full_image: None,
+            full_image,
             low_detail_mask,
             scale_factor,
             features,
@@ -656,12 +751,28 @@ fn stitch_images_impl(
         Some(&settings),
     )?;
 
+    let tone_mapped = if all_raw {
+        if let Some(h) = app_handle {
+            let _ = h.emit(
+                "panorama-progress",
+                "Global Virtual-Exposure Laplacian Pyramid tone-mapping... 93%",
+            );
+        }
+        println!("Applying global Virtual-Exposure Laplacian Pyramid tone-mapping to stitched RAW panorama...");
+        crate::hdr_handheld::tone_map_virtual_exposure_pyramid(
+            &panorama,
+            &crate::hdr_handheld::HdrMergeOptions::default(),
+        )
+    } else {
+        panorama.clone()
+    };
+
     println!("Stitching completed in {:.2?}\n", start_time.elapsed());
     if let Some(h) = app_handle {
         let _ = h.emit("panorama-progress", "Finalizing panorama composition... 96%");
     }
 
-    Ok(DynamicImage::ImageRgb32F(panorama))
+    Ok((DynamicImage::ImageRgb32F(tone_mapped), panorama))
 }
 
 struct Dsu {
@@ -838,6 +949,50 @@ pub(crate) fn build_stitching_order(
     }
 
     (ordered_indices, global_homographies)
+}
+
+/// Prepares RAW sensor data in 32-bit linear radiance space for panoramic stitching:
+/// 1. Transverse Chromatic Aberration (TCA) auto-correction
+/// 2. Single-frame linear highlight reconstruction (`recover_single_frame_highlight`)
+/// 3. Physical EXIF exposure normalization gain (`fixed_exposure_gain`)
+pub fn prepare_linear_raw_for_panorama(
+    image: &mut DynamicImage,
+    fixed_exposure_gain: Option<f32>,
+) -> f32 {
+    let mut f32_image = image.to_rgb32f();
+    let (w, h) = f32_image.dimensions();
+    if w == 0 || h == 0 {
+        return 1.0;
+    }
+
+    let (tca_r, tca_b) =
+        crate::lens_correction::auto_detect_transverse_chromatic_aberration(&f32_image);
+    if (tca_r - 1.0).abs() > 1e-4 || (tca_b - 1.0).abs() > 1e-4 {
+        crate::lens_correction::apply_radial_chromatic_aberration_correction(
+            &mut f32_image,
+            tca_r,
+            tca_b,
+        );
+    }
+
+    let exposure_gain = fixed_exposure_gain.unwrap_or(1.0);
+
+    f32_image
+        .as_mut()
+        .par_chunks_exact_mut(3)
+        .for_each(|pixel| {
+            let (nr, ng, nb) = crate::hdr_handheld::recover_single_frame_highlight(
+                pixel[0].max(0.0),
+                pixel[1].max(0.0),
+                pixel[2].max(0.0),
+            );
+            pixel[0] = nr * exposure_gain;
+            pixel[1] = ng * exposure_gain;
+            pixel[2] = nb * exposure_gain;
+        });
+
+    *image = DynamicImage::ImageRgb32F(f32_image);
+    exposure_gain
 }
 
 /// Develops and normalizes RAW sensor data for panoramic stitching:

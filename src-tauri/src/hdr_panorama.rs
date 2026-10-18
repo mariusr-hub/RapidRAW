@@ -250,6 +250,142 @@ pub fn cluster_hdr_brackets(paths: &[String]) -> Vec<ExposureBracketGroup> {
     cluster_hdr_brackets_robust(paths).0
 }
 
+/// Executes the native Reference-Locked Linear-First HDR Panorama pipeline:
+/// 1. Clusters input paths into exposure bracket groups per camera angle.
+/// 2. Merges each bracket group into a ghost-free 32-bit LinearHdrPanel via `merge_handheld_hdr_linear_panel`.
+/// 3. Normalizes all linear panels to a common physical exposure reference (compensating for inter-panel
+///    aperture/shutter/ISO shifts such as f/8 -> f/11 in handheld sweeps).
+/// 4. Stitches the linear radiance panels using joint intrinsic/extrinsic Bundle Adjustment,
+///    SO(3)-invariant horizon leveling, APAP mesh warps, 2D Dinic Graph-Cut seams, seam-ribbon
+///    de-parallax, and 6-level multi-band Laplacian pyramid blending.
+/// 5. Applies the global Virtual-Exposure Laplacian Pyramid tone-mapping ONCE to the stitched linear
+///    radiance canvas, guaranteeing zero inter-panel tone curve cliffs or sky blotches.
+pub fn stitch_hdr_panorama_native(
+    paths: &[String],
+    projection: PanoramaProjection,
+    boundary_warp: f32,
+    half_size: bool,
+    settings: &crate::app_settings::AppSettings,
+    app_handle: Option<&AppHandle>,
+    cancel_token: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(Rgb32FImage, Rgb32FImage), String> {
+    let (bracket_groups, _outliers) = cluster_hdr_brackets_robust(paths);
+    let num_positions = bracket_groups.len();
+    if num_positions < 2 {
+        return Err(
+            "Could not detect at least 2 distinct panorama angles in the selection.".to_string(),
+        );
+    }
+
+    let mut linear_panels = Vec::with_capacity(num_positions);
+    for (pos_idx, group) in bracket_groups.iter().enumerate() {
+        if let Some(tok) = cancel_token {
+            if tok.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("HDR Panorama cancelled by user.".to_string());
+            }
+        }
+        if let Some(handle) = app_handle {
+            let progress = 5.0 + (pos_idx as f32 / num_positions as f32) * 40.0;
+            let _ = handle.emit(
+                "panorama-progress",
+                format!(
+                    "Merging linear HDR bracket {} of {}... ({:.0}%)",
+                    pos_idx + 1,
+                    num_positions,
+                    progress
+                ),
+            );
+        }
+        println!(
+            "  [HDR Pano] Merging linear HDR panel {}/{} ({} frames)...",
+            pos_idx + 1,
+            num_positions,
+            group.paths.len()
+        );
+        let panel = crate::hdr_handheld::merge_handheld_hdr_linear_panel(
+            &group.paths,
+            half_size,
+            false,
+            None,
+            settings,
+            app_handle,
+            cancel_token,
+        )?;
+        linear_panels.push(panel);
+    }
+
+    // Physical inter-panel exposure normalization in 32-bit linear radiance space
+    let mut exps: Vec<f32> = linear_panels
+        .iter()
+        .map(|p| p.nominal_exposure.max(1e-7))
+        .collect();
+    exps.sort_by(|a, b| a.total_cmp(b));
+    let ref_exp = exps[exps.len() / 2];
+
+    for (idx, panel) in linear_panels.iter_mut().enumerate() {
+        let scale = (ref_exp / panel.nominal_exposure.max(1e-7)).clamp(0.125, 8.0);
+        if (scale - 1.0).abs() > 0.01 {
+            println!(
+                "  [HDR Pano] Normalizing linear panel {} exposure by {:.3}x (E_panel={:.6}, E_ref={:.6})",
+                idx + 1,
+                scale,
+                panel.nominal_exposure,
+                ref_exp
+            );
+            panel
+                .linear_radiance
+                .as_mut()
+                .par_iter_mut()
+                .for_each(|v| *v *= scale);
+        }
+    }
+
+    let panel_optics: Vec<(f64, Option<f64>)> = linear_panels
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (real_p, _) = parse_virtual_path(&bracket_groups[i].paths[0]);
+            let f_mm =
+                crate::exif_processing::extract_focal_length_from_file(&real_p).unwrap_or(28.0);
+            (f_mm, Some(p.f_number as f64))
+        })
+        .collect();
+
+    let panels: Vec<Rgb32FImage> = linear_panels
+        .into_iter()
+        .map(|p| p.linear_radiance)
+        .collect();
+
+    if let Some(handle) = app_handle {
+        let _ = handle.emit(
+            "panorama-progress",
+            "Stitching linear HDR panels with Bundle Adjustment & Graph-Cut... 50%",
+        );
+    }
+
+    let stitched_linear = stitch_hdr_panels_with_optics(
+        &panels,
+        projection,
+        boundary_warp,
+        Some(&panel_optics),
+        app_handle,
+    )?;
+
+    if let Some(handle) = app_handle {
+        let _ = handle.emit(
+            "panorama-progress",
+            "Global Virtual-Exposure Laplacian Pyramid tone-mapping... 92%",
+        );
+    }
+    println!("  [HDR Pano] Applying global Virtual-Exposure Laplacian Pyramid tone-mapping...");
+    let tone_mapped = crate::hdr_handheld::tone_map_virtual_exposure_pyramid(
+        &stitched_linear,
+        &crate::hdr_handheld::HdrMergeOptions::default(),
+    );
+
+    Ok((tone_mapped, stitched_linear))
+}
+
 #[tauri::command]
 pub async fn stitch_hdr_panorama(
     paths: Vec<String>,
@@ -265,8 +401,11 @@ pub async fn stitch_hdr_panorama(
         return Err("At least 3 photos are required for an HDR Panorama.".to_string());
     }
 
+    state
+        .panorama_cancellation_token
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let selected_projection = projection.unwrap_or(PanoramaProjection::Cylindrical);
-    let _warp_strength = boundary_warp.unwrap_or(0.5);
+    let warp_strength = boundary_warp.unwrap_or(0.5);
     let panorama_result_handle = state.panorama_result.clone();
     let panorama_linear_radiance_handle = state.panorama_linear_radiance.clone();
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
@@ -275,18 +414,36 @@ pub async fn stitch_hdr_panorama(
 
     let cancel_token = state.panorama_cancellation_token.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let final_hdr_pano = crate::hugin_engine::run_hugin_hdr_panorama(
+        let (tone_mapped_pano, stitched_linear_pano) = match stitch_hdr_panorama_native(
             &paths,
             selected_projection,
-            &settings,
+            warp_strength,
             is_half_size,
+            &settings,
             Some(&handle_for_task),
             Some(&cancel_token),
-        )?;
+        ) {
+            Ok(pair) => pair,
+            Err(native_err) => {
+                println!(
+                    "  [HDR Pano] Native linear-first pipeline returned '{}', trying Hugin fallback...",
+                    native_err
+                );
+                let hugin_pano = crate::hugin_engine::run_hugin_hdr_panorama(
+                    &paths,
+                    selected_projection,
+                    &settings,
+                    is_half_size,
+                    Some(&handle_for_task),
+                    Some(&cancel_token),
+                )?;
+                (hugin_pano.clone(), hugin_pano)
+            }
+        };
 
-        // 4. Create high-resolution preview directly from the tone-fused output without double tone-mapping
+        // Create high-resolution preview directly from the tone-mapped output
         let _ = handle_for_task.emit("panorama-progress", "Creating HDR Panorama preview... 98%");
-        let master_dyn = DynamicImage::ImageRgb32F(final_hdr_pano.clone());
+        let master_dyn = DynamicImage::ImageRgb32F(tone_mapped_pano);
         let master_rgb8 = master_dyn.to_rgb8();
         let (w, h) = (master_rgb8.width(), master_rgb8.height());
 
@@ -296,7 +453,8 @@ pub async fn stitch_hdr_panorama(
             (((1200.0 * w as f32 / h as f32).round() as u32).max(1), 1200)
         };
 
-        let preview_u8 = image::imageops::resize(&master_rgb8, new_w, new_h, image::imageops::FilterType::Triangle);
+        let preview_u8 =
+            image::imageops::resize(&master_rgb8, new_w, new_h, image::imageops::FilterType::Triangle);
 
         let mut buf = std::io::Cursor::new(Vec::new());
         if let Err(e) = preview_u8.write_to(&mut buf, ImageFormat::Png) {
@@ -308,7 +466,7 @@ pub async fn stitch_hdr_panorama(
         let final_base64 = format!("data:image/png;base64,{}", base64_str);
 
         *panorama_result_handle.lock().unwrap() = Some(master_dyn);
-        *panorama_linear_radiance_handle.lock().unwrap() = Some(final_hdr_pano);
+        *panorama_linear_radiance_handle.lock().unwrap() = Some(stitched_linear_pano);
 
         let _ = handle_for_task.emit(
             "panorama-complete",
@@ -390,6 +548,26 @@ pub fn stitch_hdr_panels(
     projection: PanoramaProjection,
     boundary_warp: f32,
     optical_params: Option<(f64, Option<f64>)>,
+    app_handle: Option<&AppHandle>,
+) -> Result<Rgb32FImage, String> {
+    let repeated: Option<Vec<(f64, Option<f64>)>> =
+        optical_params.map(|opt| vec![opt; panels.len()]);
+    stitch_hdr_panels_with_optics(
+        panels,
+        projection,
+        boundary_warp,
+        repeated.as_deref(),
+        app_handle,
+    )
+}
+
+/// Stitches pre-merged 32-bit float HDR image panels using per-panel EXIF optical parameters,
+/// multi-scale ORB matching, Wahba/Kabsch SO(3) rotation initialization, and bundle adjustment.
+pub fn stitch_hdr_panels_with_optics(
+    panels: &[Rgb32FImage],
+    projection: PanoramaProjection,
+    boundary_warp: f32,
+    panel_optics: Option<&[(f64, Option<f64>)]>,
     app_handle: Option<&AppHandle>,
 ) -> Result<Rgb32FImage, String> {
     if panels.is_empty() {
@@ -559,33 +737,53 @@ pub fn stitch_hdr_panels(
         return Err("Could not align enough overlapping HDR panels. Ensure at least 30% overlap between adjacent shots.".to_string());
     }
 
-    let (ordered_indices, global_homographies) = crate::panorama_stitching::build_stitching_order(&image_infos, &pairwise_matches);
+    let (mut ordered_indices, global_homographies) = crate::panorama_stitching::build_stitching_order(&image_infos, &pairwise_matches);
 
     if ordered_indices.len() < 2 {
         return Err("Could not align enough overlapping HDR panels. Ensure at least 30% overlap between adjacent shots.".to_string());
     }
 
+    // If panels have differing focal lengths (e.g. 100mm wide base + 126mm/188mm zoomed-in shots),
+    // place the widest-FOV panel (smallest f_mm) first as anchor Pose 0 so the wide base defines the canvas.
+    if let Some(optics) = panel_optics {
+        let min_f = ordered_indices
+            .iter()
+            .filter_map(|&id| optics.get(id).map(|o| o.0))
+            .fold(f64::INFINITY, f64::min);
+        let max_f = ordered_indices
+            .iter()
+            .filter_map(|&id| optics.get(id).map(|o| o.0))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if max_f > min_f * 1.05 {
+            ordered_indices.sort_by(|&a, &b| {
+                let fa = optics.get(a).map(|o| o.0).unwrap_or(28.0);
+                let fb = optics.get(b).map(|o| o.0).unwrap_or(28.0);
+                fa.total_cmp(&fb)
+            });
+        }
+    }
+
     let stitched_infos: Vec<&ImageInfo> = ordered_indices.iter().map(|&i| &image_infos[i]).collect();
 
-    // 1. Initialize camera poses with optical physics & vignetting compensation
-    let (first_w, first_h) = (stitched_infos[0].full_width, stitched_infos[0].full_height);
-    let (avg_f, vig_params) = if let Some((f_mm, fn_opt)) = optical_params {
-        let f_px = CameraPose::focal_length_from_exif(f_mm, None, first_w);
-        println!("  - HDR Pano physical focal length: {:.1} mm -> {:.1} px", f_mm, f_px);
-        (f_px, Some((f_mm, fn_opt)))
-    } else {
-        (first_w.max(first_h) as f64 * 1.25, None)
-    };
+    // 1. Initialize camera poses with per-panel optical physics & vignetting compensation
     let mut camera_poses = Vec::with_capacity(stitched_infos.len());
 
     for (k, &img_info) in stitched_infos.iter().enumerate() {
         let (w, h) = (img_info.full_width, img_info.full_height);
-        let mut pose = CameraPose::new(k, w, h, Some(avg_f));
-        if let Some((f_mm, fn_opt)) = vig_params {
+        let opt_k = panel_optics.and_then(|s| s.get(img_info.id).copied());
+        let f_px = if let Some((f_mm, _)) = opt_k {
+            let px = CameraPose::focal_length_from_exif(f_mm, None, w);
+            println!("  - HDR Pano panel {} (id {}): physical focal {:.1} mm -> {:.1} px", k + 1, img_info.id + 1, f_mm, px);
+            px
+        } else {
+            w.max(h) as f64 * 1.25
+        };
+        let mut pose = CameraPose::new(k, w, h, Some(f_px));
+        if let Some((f_mm, fn_opt)) = opt_k {
             pose = pose.with_vignetting_from_optical_params(f_mm, fn_opt);
         }
         if let Some(h_global) = global_homographies.get(&img_info.id) {
-            let (yaw, pitch, roll) = crate::panorama_utils::camera_model::homography_to_relative_rotation(h_global, avg_f, w, h);
+            let (yaw, pitch, roll) = crate::panorama_utils::camera_model::homography_to_relative_rotation(h_global, f_px, w, h);
             pose.yaw = yaw;
             pose.pitch = pitch;
             pose.roll = roll;

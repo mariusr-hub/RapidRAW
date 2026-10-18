@@ -1541,13 +1541,13 @@ mod tests {
         };
         inject_builtin_lenses(&mut db);
 
-        let match_res = find_best_lens_match(&db, "Canon", "EF 70-200mm f/4L USM");
+        let match_res = find_best_lens_match(&db, "Canon", "EF 70-200mm f/4L USM", "Canon EOS 77D");
         assert!(match_res.is_some(), "Canon 70-200mm f/4 should be found in injected custom DB");
         let (maker, model) = match_res.unwrap();
         assert_eq!(maker, "Canon");
         assert!(model.contains("70-200mm"));
 
-        let match_sigma = find_best_lens_match(&db, "Sigma", "17-50mm f/2.8 EX DC OS HSM");
+        let match_sigma = find_best_lens_match(&db, "Sigma", "17-50mm f/2.8 EX DC OS HSM", "Canon EOS 77D");
         assert!(match_sigma.is_some(), "Sigma 17-50mm should be found");
     }
 

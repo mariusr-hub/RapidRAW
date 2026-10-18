@@ -46,6 +46,7 @@ mod fog;
 pub mod formats;
 mod gpu_processing;
 pub mod hdr_deghosting;
+pub mod hdr_handheld;
 pub mod hdr_presets;
 pub mod hugin_engine;
 pub mod image_loader;
@@ -1528,18 +1529,18 @@ async fn merge_hdr(
     let hdr_result_handle = state.hdr_result.clone();
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
     let cancel_token = state.panorama_cancellation_token.clone();
-    let half_size = _options.as_ref().and_then(|o| o.half_size).unwrap_or(false);
+    let merge_opts = _options.unwrap_or_default();
 
-    let master_fused = crate::hugin_engine::run_hugin_hdr(
+    let fusion_res = crate::hdr_handheld::merge_handheld_hdr_pipeline(
         &paths,
+        &merge_opts,
         &settings,
-        half_size,
         Some(&app_handle),
         Some(&cancel_token),
     )?;
 
-    *state.hdr_linear_radiance.lock().unwrap() = Some(master_fused.clone());
-    let hdr_merged = DynamicImage::ImageRgb32F(master_fused);
+    *state.hdr_linear_radiance.lock().unwrap() = Some(fusion_res.linear_radiance);
+    let hdr_merged = DynamicImage::ImageRgb32F(fusion_res.tone_mapped_preview);
 
     let _ = app_handle.emit("hdr-progress", "Creating preview... 98%");
     let mut buf = Cursor::new(Vec::new());
@@ -1607,7 +1608,7 @@ async fn update_hdr_tone_mapping(
             .clone()
     };
 
-    let tm = hdr_fusion::tone_map_radiance_image(&linear_radiance, &options, Some(&app_handle));
+    let tm = crate::hdr_handheld::tone_map_virtual_exposure_pyramid(&linear_radiance, &options);
     let hdr_merged = DynamicImage::ImageRgb32F(tm);
 
     let mut buf = Cursor::new(Vec::new());

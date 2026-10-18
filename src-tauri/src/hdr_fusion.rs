@@ -1570,6 +1570,7 @@ mod tests {
             detail_boost: Some(1.2),
             user_deghost_strokes: None,
             frame_isos: None,
+            half_size: None,
         };
 
         let result = fuse_exposures_mertens::<tauri::Wry>(&frames, &exposure_scales, &options, None, None);

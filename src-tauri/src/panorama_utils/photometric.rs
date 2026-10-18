@@ -51,59 +51,60 @@ pub fn solve_global_photometric_gains(
     }
 
     let mut gains = vec![[1.0f32; 3]; num_images];
+    // Regularization weight in log-gain space anchoring log(g_i) toward 0.0 (g_i = 1.0)
+    let lambda = 0.35f64;
 
     for channel in 0..3 {
-        // Dynamically scale Tikhonov regularization by average overlap energy.
-        // This ensures the prior (g_i = 1.0) balances correctly against the data term,
-        // preventing asymmetric gain drift or collapse on outer panels.
-        let total_energy: f64 = overlap_integrals
-            .iter()
-            .map(|o| {
-                let s = (o.sample_count as f64).max(1.0);
-                (o.sum_i_squared[channel] + o.sum_j_squared[channel]) / (2.0 * s)
-            })
-            .sum();
-        let avg_energy = (total_energy / overlap_integrals.len().max(1) as f64).max(1e-4);
-        let lambda = 2.0 * avg_energy;
-
         let mut mat_m = DMatrix::<f64>::zeros(num_images, num_images);
         let mut vec_b = DVector::<f64>::zeros(num_images);
 
-        // Symmetric prior: all images pull uniformly toward 1.0
         for i in 0..num_images {
             mat_m[(i, i)] += lambda;
-            vec_b[i] += lambda;
         }
 
         for overlap in overlap_integrals {
             let i = overlap.img_idx_1;
             let j = overlap.img_idx_2;
+            if i >= num_images || j >= num_images || i == j {
+                continue;
+            }
             let samples = (overlap.sample_count as f64).max(1.0);
-            let sum_ii = overlap.sum_i_squared[channel] / samples;
-            let sum_jj = overlap.sum_j_squared[channel] / samples;
-            let sum_ij = overlap.sum_ij[channel] / samples;
+            let rms_i = (overlap.sum_i_squared[channel] / samples).max(0.0).sqrt();
+            let rms_j = (overlap.sum_j_squared[channel] / samples).max(0.0).sqrt();
+            if rms_i < 1e-4 || rms_j < 1e-4 {
+                continue;
+            }
 
-            mat_m[(i, i)] += sum_ii;
-            mat_m[(j, j)] += sum_jj;
-            mat_m[(i, j)] -= sum_ij;
-            mat_m[(j, i)] -= sum_ij;
+            // Unbiased log-ratio target: log(g_i) - log(g_j) = log(rms_j / rms_i)
+            // Unlike pixel-wise sum(g_i*I_i - g_j*I_j)^2, this has zero variance/degree shrinkage bias
+            // when I_i and I_j have equal brightness but non-zero parallax or cloud movement.
+            let log_ratio = (rms_j / rms_i).clamp(0.55, 1.82).ln();
+            let w_ij = (samples / 400.0).clamp(0.25, 3.5);
+
+            mat_m[(i, i)] += w_ij;
+            mat_m[(j, j)] += w_ij;
+            mat_m[(i, j)] -= w_ij;
+            mat_m[(j, i)] -= w_ij;
+
+            vec_b[i] += w_ij * log_ratio;
+            vec_b[j] -= w_ij * log_ratio;
         }
 
-        // Solve M * g = b using Cholesky (LLT) decomposition
         let cholesky = mat_m.clone().cholesky();
-        let solved_g = match cholesky {
+        let solved_log_g = match cholesky {
             Some(chol) => chol.solve(&vec_b),
-            None => {
-                // Fallback to SVD if near-singular
-                mat_m.svd(true, true).solve(&vec_b, 1e-6).unwrap_or_else(|_| DVector::from_element(num_images, 1.0))
-            }
+            None => mat_m
+                .svd(true, true)
+                .solve(&vec_b, 1e-6)
+                .unwrap_or_else(|_| DVector::from_element(num_images, 0.0)),
         };
 
-        // Tight physical bound: photographic gain adjustments between consecutive panels
-        // must never exceed +/- 8% (0.92 .. 1.08). This permanently eliminates dark sky blotches,
-        // vertical seam stripes, and brightness cliffs across all panoramas.
+        // Zero-center mean log-gain so overall panorama brightness never drifts
+        let mean_log_g: f64 = solved_log_g.iter().copied().sum::<f64>() / num_images as f64;
+
         for i in 0..num_images {
-            gains[i][channel] = (solved_g[i] as f32).clamp(0.92, 1.08);
+            let g = (solved_log_g[i] - mean_log_g).exp() as f32;
+            gains[i][channel] = g.clamp(0.82, 1.22);
         }
     }
 
@@ -269,8 +270,14 @@ pub fn upsample_mask(src: &[f32], sw: u32, sh: u32, target_w: u32, target_h: u32
     dst
 }
 
+#[inline]
+fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Performs Burt & Adelson Multi-Band (Laplacian Pyramid) Spline Blending between two aligned images
-/// given a soft or hard weight mask.
+/// given a 2D Graph-Cut weight mask.
 ///
 /// Returns the seamlessly blended full-resolution Rgb32FImage.
 pub fn multiband_laplacian_blend(
@@ -280,7 +287,7 @@ pub fn multiband_laplacian_blend(
     num_levels: usize,
 ) -> Rgb32FImage {
     let (w, h) = img_a.dimensions();
-    let num_levels = num_levels.clamp(2, 6);
+    let num_levels = num_levels.clamp(2, 7);
 
     // 1. Build Gaussian Pyramids for img_a and img_b
     let mut g_pyr_a = vec![img_a.clone()];
@@ -306,12 +313,20 @@ pub fn multiband_laplacian_blend(
         let mut diff_a = g_pyr_a[k].clone();
         let mut diff_b = g_pyr_b[k].clone();
 
-        diff_a.as_mut().par_iter_mut().zip(up_a.as_raw().par_iter()).for_each(|(d, u)| {
-            *d -= *u;
-        });
-        diff_b.as_mut().par_iter_mut().zip(up_b.as_raw().par_iter()).for_each(|(d, u)| {
-            *d -= *u;
-        });
+        diff_a
+            .as_mut()
+            .par_iter_mut()
+            .zip(up_a.as_raw().par_iter())
+            .for_each(|(d, u)| {
+                *d -= *u;
+            });
+        diff_b
+            .as_mut()
+            .par_iter_mut()
+            .zip(up_b.as_raw().par_iter())
+            .for_each(|(d, u)| {
+                *d -= *u;
+            });
 
         l_pyr_a.push(diff_a);
         l_pyr_b.push(diff_b);
@@ -320,25 +335,41 @@ pub fn multiband_laplacian_blend(
     l_pyr_a.push(g_pyr_a.last().unwrap().clone());
     l_pyr_b.push(g_pyr_b.last().unwrap().clone());
 
-    // 3. Build Gaussian Pyramid for Weight Mask
+    // 3. Build Gaussian Pyramid for the 2D Graph-Cut Weight Mask
     let mut w_pyr = Vec::new();
     let mut cur_w = weight_a.to_vec();
     let mut cur_dim = (w, h);
     w_pyr.push((cur_w.clone(), cur_dim.0, cur_dim.1));
 
     for _ in 1..num_levels {
-        let (down_w, nw, nh) = downsample_mask(&cur_w, cur_dim.0, cur_dim.1);
+        let (mut down_w, nw, nh) = downsample_mask(&cur_w, cur_dim.0, cur_dim.1);
+        // Apply 1 pass of 3x3 smoothing at each pyramid level so coarse illumination bands
+        // have a wide, butter-smooth transition zone centered on the optimal Graph-Cut seam.
+        if nw >= 4 && nh >= 4 {
+            let prev = down_w.clone();
+            let nw_u = nw as usize;
+            let nh_u = nh as usize;
+            for y in 1..(nh_u - 1) {
+                for x in 1..(nw_u - 1) {
+                    let idx = y * nw_u + x;
+                    let sum = prev[idx] * 4.0
+                        + (prev[idx - 1] + prev[idx + 1] + prev[idx - nw_u] + prev[idx + nw_u])
+                            * 1.5
+                        + (prev[idx - nw_u - 1]
+                            + prev[idx - nw_u + 1]
+                            + prev[idx + nw_u - 1]
+                            + prev[idx + nw_u + 1])
+                            * 0.5;
+                    down_w[idx] = sum / 12.0;
+                }
+            }
+        }
         w_pyr.push((down_w.clone(), nw, nh));
         cur_w = down_w;
         cur_dim = (nw, nh);
     }
 
-    // 4. Blend each Laplacian band using the corresponding Gaussian weight level.
-    // To completely eliminate ghosting/double edges caused by slight parallax or motion
-    // (e.g., railway tracks, tree branches, foreground edges), the highest-frequency Laplacian bands
-    // (levels 0 and 1) use a sharp binary transition across the medial boundary (w >= 0.5 -> 1.0, else 0.0).
-    // Low-frequency residual bands (levels 2+) retain the full smooth Gaussian weight gradient
-    // so exposure, sky gradients, and vignetting blend seamlessly with zero visible seam line.
+    // 4. Blend each Laplacian band using the corresponding Gaussian weight level
     let mut blended_l_pyr = Vec::new();
     for k in 0..num_levels {
         let (kw, kh) = l_pyr_a[k].dimensions();
@@ -347,27 +378,31 @@ pub fn multiband_laplacian_blend(
 
         let band_a = l_pyr_a[k].as_raw();
         let band_b = l_pyr_b[k].as_raw();
-        let is_high_freq = k < 2;
 
-        blended_band.as_mut().par_chunks_mut(kw as usize * 3).enumerate().for_each(|(y, row)| {
-            for x in 0..kw as usize {
-                let pixel_idx = y * kw as usize + x;
-                let raw_w = weights[pixel_idx].clamp(0.0, 1.0);
-                let w_val = if is_high_freq {
-                    if raw_w >= 0.5 { 1.0 } else { 0.0 }
-                } else {
-                    raw_w
-                };
-                let w_b = 1.0 - w_val;
+        blended_band
+            .as_mut()
+            .par_chunks_mut(kw as usize * 3)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..kw as usize {
+                    let pixel_idx = y * kw as usize + x;
+                    let raw_w = weights[pixel_idx].clamp(0.0, 1.0);
+                    // Finest band (k == 0) uses a tight anti-aliased transition right along the Graph-Cut seam
+                    let w_val = if k == 0 {
+                        smoothstep_f32(0.32, 0.68, raw_w)
+                    } else {
+                        raw_w
+                    };
+                    let w_b = 1.0 - w_val;
 
-                let raw_idx = pixel_idx * 3;
-                let out_idx = x * 3;
+                    let raw_idx = pixel_idx * 3;
+                    let out_idx = x * 3;
 
-                row[out_idx] = band_a[raw_idx] * w_val + band_b[raw_idx] * w_b;
-                row[out_idx + 1] = band_a[raw_idx + 1] * w_val + band_b[raw_idx + 1] * w_b;
-                row[out_idx + 2] = band_a[raw_idx + 2] * w_val + band_b[raw_idx + 2] * w_b;
-            }
-        });
+                    row[out_idx] = band_a[raw_idx] * w_val + band_b[raw_idx] * w_b;
+                    row[out_idx + 1] = band_a[raw_idx + 1] * w_val + band_b[raw_idx + 1] * w_b;
+                    row[out_idx + 2] = band_a[raw_idx + 2] * w_val + band_b[raw_idx + 2] * w_b;
+                }
+            });
 
         blended_l_pyr.push(blended_band);
     }
@@ -380,18 +415,498 @@ pub fn multiband_laplacian_blend(
         let up = upsample_f32_image(&current_reconstructed, target_w, target_h);
 
         let mut recombined = blended_l_pyr[k].clone();
-        recombined.as_mut().par_iter_mut().zip(up.as_raw().par_iter()).for_each(|(d, u)| {
-            *d += *u;
-        });
+        recombined
+            .as_mut()
+            .par_iter_mut()
+            .zip(up.as_raw().par_iter())
+            .for_each(|(d, u)| {
+                *d += *u;
+            });
         current_reconstructed = recombined;
     }
 
     current_reconstructed
 }
 
+/// Harmonizes residual low-frequency 2D exposure/vignetting/color differences across the overlap ROI.
+///
+/// Uses the boundary-pinned algebraic factorization:
+///   `I_A_tilde = I_A * R(x,y)^(1 - alpha)`
+///   `I_B_tilde = I_B * R(x,y)^(-alpha)`
+/// where `alpha = d_A / (d_A + d_B) in [0, 1]` and `R(x,y) = smooth(I_B / I_A)`.
+/// - At `only_A` border (`alpha = 1`): `I_A_tilde = I_A` (0.00% step with outer canvas A).
+/// - At `only_B` border (`alpha = 0`): `I_B_tilde = I_B` (0.00% step with outer panel B).
+/// - Throughout the overlap: `I_A_tilde / I_B_tilde = (I_A / I_B) * R(x,y) = 1.0` (100% sky/surface continuity).
+fn harmonize_overlap_roi_photometry(
+    roi_a: &mut Rgb32FImage,
+    roi_b: &mut Rgb32FImage,
+    in_a_mask: &[bool],
+    in_b_mask: &[bool],
+    dist_a: &[f32],
+    dist_b: &[f32],
+) {
+    let (rw, rh) = (roi_a.width() as usize, roi_a.height() as usize);
+    if rw < 16 || rh < 16 {
+        return;
+    }
+
+    let gw = 12usize;
+    let gh = 12usize;
+    let mut grid_ratio = vec![[1.0f32; 3]; gw * gh];
+
+    for gy in 0..gh {
+        let y0 = (gy * rh) / gh;
+        let y1 = (((gy + 1) * rh) / gh).max(y0 + 1).min(rh);
+        for gx in 0..gw {
+            let x0 = (gx * rw) / gw;
+            let x1 = (((gx + 1) * rw) / gw).max(x0 + 1).min(rw);
+
+            let mut sum_a = [0.0f64; 3];
+            let mut sum_b = [0.0f64; 3];
+            let mut sum_w = 0.0f64;
+
+            for y in (y0..y1).step_by(2) {
+                for x in (x0..x1).step_by(2) {
+                    let idx = y * rw + x;
+                    if in_a_mask[idx] && in_b_mask[idx] {
+                        let pa = roi_a.get_pixel(x as u32, y as u32);
+                        let pb = roi_b.get_pixel(x as u32, y as u32);
+                        let la = 0.2126 * pa[0] + 0.7152 * pa[1] + 0.0722 * pa[2];
+                        let lb = 0.2126 * pb[0] + 0.7152 * pb[1] + 0.0722 * pb[2];
+                        if la > 0.005 && lb > 0.005 {
+                            let rel_diff = (la - lb).abs() / la.max(lb);
+                            // Reject moving objects or extreme occlusion outliers
+                            if rel_diff < 0.42 {
+                                let w = (1.0 - (rel_diff / 0.42).powi(2)) as f64;
+                                for c in 0..3 {
+                                    sum_a[c] += pa[c] as f64 * w;
+                                    sum_b[c] += pb[c] as f64 * w;
+                                }
+                                sum_w += w;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if sum_w > 6.0 {
+                let mut cell_r = [1.0f32; 3];
+                for c in 0..3 {
+                    if sum_a[c] > 1e-4 && sum_b[c] > 1e-4 {
+                        cell_r[c] = ((sum_b[c] / sum_a[c]) as f32).clamp(0.75, 1.33);
+                    }
+                }
+                grid_ratio[gy * gw + gx] = cell_r;
+            }
+        }
+    }
+
+    // Smooth the 12x12 ratio grid with 4 iterations of 3x3 box filtering
+    for _ in 0..4 {
+        let prev = grid_ratio.clone();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let mut acc = [0.0f32; 3];
+                let mut cnt = 0.0f32;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let ny = (gy as i32 + dy).clamp(0, gh as i32 - 1) as usize;
+                        let nx = (gx as i32 + dx).clamp(0, gw as i32 - 1) as usize;
+                        let w = if dx == 0 && dy == 0 { 2.0 } else { 1.0 };
+                        let p = prev[ny * gw + nx];
+                        acc[0] += p[0] * w;
+                        acc[1] += p[1] * w;
+                        acc[2] += p[2] * w;
+                        cnt += w;
+                    }
+                }
+                grid_ratio[gy * gw + gx] = [acc[0] / cnt, acc[1] / cnt, acc[2] / cnt];
+            }
+        }
+    }
+
+    // Apply boundary-pinned exposure harmonization across the overlap
+    let sx_scale = (gw - 1) as f32 / rw.max(1) as f32;
+    let sy_scale = (gh - 1) as f32 / rh.max(1) as f32;
+
+    roi_a
+        .as_mut()
+        .par_chunks_mut(rw * 3)
+        .zip(roi_b.as_mut().par_chunks_mut(rw * 3))
+        .enumerate()
+        .for_each(|(y, (row_a, row_b))| {
+            let gy_f = (y as f32 * sy_scale).clamp(0.0, (gh - 1) as f32);
+            let gy0 = gy_f.floor() as usize;
+            let gy1 = (gy0 + 1).min(gh - 1);
+            let fy = gy_f - gy0 as f32;
+            let row_off = y * rw;
+
+            for x in 0..rw {
+                let idx = row_off + x;
+                if !in_a_mask[idx] || !in_b_mask[idx] {
+                    continue;
+                }
+                let gx_f = (x as f32 * sx_scale).clamp(0.0, (gw - 1) as f32);
+                let gx0 = gx_f.floor() as usize;
+                let gx1 = (gx0 + 1).min(gw - 1);
+                let fx = gx_f - gx0 as f32;
+
+                let da = dist_a[idx];
+                let db = dist_b[idx];
+                let alpha = (da / (da + db + 1e-4)).clamp(0.0, 1.0);
+
+                let p00 = grid_ratio[gy0 * gw + gx0];
+                let p10 = grid_ratio[gy0 * gw + gx1];
+                let p01 = grid_ratio[gy1 * gw + gx0];
+                let p11 = grid_ratio[gy1 * gw + gx1];
+
+                let c_idx = x * 3;
+                for c in 0..3 {
+                    let top = p00[c] * (1.0 - fx) + p10[c] * fx;
+                    let bot = p01[c] * (1.0 - fx) + p11[c] * fx;
+                    let r_val = (top * (1.0 - fy) + bot * fy).clamp(0.75, 1.33);
+
+                    let gain_a = r_val.powf(1.0 - alpha);
+                    let gain_b = r_val.powf(-alpha);
+
+                    row_a[c_idx + c] *= gain_a;
+                    row_b[c_idx + c] *= gain_b;
+                }
+            }
+        });
+}
+
+/// Seam-Ribbon Local Optical-Flow De-Parallax Warping:
+/// Estimates local translation offsets along the 2D Graph-Cut seam contour to align foreground
+/// linear structures (railway tracks, handrails, wires, horizons) affected by handheld camera translation,
+/// and applies a smooth symmetric warp `(-0.5 * d, +0.5 * d)` that decays to zero away from the seam.
+fn align_seam_ribbon_deparallax(
+    roi_a: &mut Rgb32FImage,
+    roi_b: &mut Rgb32FImage,
+    in_a_mask: &[bool],
+    in_b_mask: &[bool],
+    dist_a: &[f32],
+    dist_b: &[f32],
+    roi_weight: &[f32],
+) {
+    let (rw, rh) = (roi_a.width() as usize, roi_a.height() as usize);
+    if rw < 48 || rh < 48 {
+        return;
+    }
+
+    // 1. Build 2x downsampled perceptual luminance and gradient images for fast block matching
+    let hw = rw / 2;
+    let hh = rh / 2;
+    let mut lum_a = vec![0.0f32; hw * hh];
+    let mut lum_b = vec![0.0f32; hw * hh];
+    let mut half_seam = vec![false; hw * hh];
+
+    for hy in 0..hh {
+        let sy = hy * 2;
+        for hx in 0..hw {
+            let sx = hx * 2;
+            let hidx = hy * hw + hx;
+            let pa = roi_a.get_pixel(sx as u32, sy as u32);
+            let pb = roi_b.get_pixel(sx as u32, sy as u32);
+            let ya = (0.2126 * pa[0] + 0.7152 * pa[1] + 0.0722 * pa[2]).max(0.0);
+            let yb = (0.2126 * pb[0] + 0.7152 * pb[1] + 0.0722 * pb[2]).max(0.0);
+            lum_a[hidx] = (ya / (ya + 0.18)).sqrt();
+            lum_b[hidx] = (yb / (yb + 0.18)).sqrt();
+
+            let fidx = sy * rw + sx;
+            if in_a_mask[fidx] && in_b_mask[fidx] {
+                let w0 = roi_weight[fidx];
+                let wx = if sx + 2 < rw { roi_weight[fidx + 2] } else { w0 };
+                let wy = if sy + 2 < rh { roi_weight[(sy + 2) * rw + sx] } else { w0 };
+                if (w0 >= 0.5) != (wx >= 0.5) || (w0 >= 0.5) != (wy >= 0.5) {
+                    half_seam[hidx] = true;
+                }
+            }
+        }
+    }
+
+    let mut grad_a = vec![0.0f32; hw * hh];
+    let mut grad_b = vec![0.0f32; hw * hh];
+    for hy in 1..(hh - 1) {
+        for hx in 1..(hw - 1) {
+            let idx = hy * hw + hx;
+            let gxa = lum_a[idx + 1] - lum_a[idx - 1];
+            let gya = lum_a[idx + hw] - lum_a[idx - hw];
+            grad_a[idx] = (gxa * gxa + gya * gya).sqrt();
+
+            let gxb = lum_b[idx + 1] - lum_b[idx - 1];
+            let gyb = lum_b[idx + hw] - lum_b[idx - hw];
+            grad_b[idx] = (gxb * gxb + gyb * gyb).sqrt();
+        }
+    }
+
+    // 2. Define deformation grid with 48px full-res spacing (24px in half-res)
+    // A wider control-point spacing prevents high-frequency waviness along diagonal linear structures.
+    let cell = 48usize;
+    let gw = rw.div_ceil(cell) + 1;
+    let gh = rh.div_ceil(cell) + 1;
+    let g_len = gw * gh;
+
+    let mut seam_dist = vec![1e4f32; g_len];
+    let mut border_dist = vec![0.0f32; g_len];
+
+    for gy in 0..gh {
+        let fy = (gy * cell).min(rh - 1);
+        let hy = (fy / 2).min(hh - 1);
+        for gx in 0..gw {
+            let fx = (gx * cell).min(rw - 1);
+            let hx = (fx / 2).min(hw - 1);
+            let gidx = gy * gw + gx;
+            let fidx = fy * rw + fx;
+            border_dist[gidx] = dist_a[fidx].min(dist_b[fidx]);
+
+            // Check 9x9 neighborhood in half-res for seam crossing
+            let mut near_seam = false;
+            for dy in -4i32..=4 {
+                for dx in -4i32..=4 {
+                    let ny = (hy as i32 + dy).clamp(0, hh as i32 - 1) as usize;
+                    let nx = (hx as i32 + dx).clamp(0, hw as i32 - 1) as usize;
+                    if half_seam[ny * hw + nx] {
+                        near_seam = true;
+                        break;
+                    }
+                }
+            }
+            if near_seam {
+                seam_dist[gidx] = 0.0;
+            }
+        }
+    }
+
+    // Chamfer distance propagation on the coarse grid
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let idx = gy * gw + gx;
+            if gx > 0 {
+                seam_dist[idx] = seam_dist[idx].min(seam_dist[idx - 1] + 1.0);
+            }
+            if gy > 0 {
+                seam_dist[idx] = seam_dist[idx].min(seam_dist[(gy - 1) * gw + gx] + 1.0);
+            }
+        }
+    }
+    for gy in (0..gh).rev() {
+        for gx in (0..gw).rev() {
+            let idx = gy * gw + gx;
+            if gx + 1 < gw {
+                seam_dist[idx] = seam_dist[idx].min(seam_dist[idx + 1] + 1.0);
+            }
+            if gy + 1 < gh {
+                seam_dist[idx] = seam_dist[idx].min(seam_dist[(gy + 1) * gw + gx] + 1.0);
+            }
+        }
+    }
+
+    // 3. Estimate local parallax shift (dx, dy) at grid nodes near the seam contour
+    let mut grid_dx = vec![0.0f32; g_len];
+    let mut grid_dy = vec![0.0f32; g_len];
+
+    let patch_r = 8i32; // 17x17 half-res patch = 34x34 full-res patch
+    let search_r = 2i32; // +/- 2 half-res px = +/- 4 full-res px
+
+    for gy in 0..gh {
+        let fy = (gy * cell).min(rh - 1);
+        let hy = (fy / 2) as i32;
+        for gx in 0..gw {
+            let gidx = gy * gw + gx;
+            if seam_dist[gidx] > 2.0 || border_dist[gidx] < 28.0 {
+                continue;
+            }
+            let fx = (gx * cell).min(rw - 1);
+            let hx = (fx / 2) as i32;
+
+            if hx - patch_r - search_r < 1
+                || hx + patch_r + search_r >= hw as i32 - 1
+                || hy - patch_r - search_r < 1
+                || hy + patch_r + search_r >= hh as i32 - 1
+            {
+                continue;
+            }
+
+            // Require structural gradient energy (skip flat sky)
+            let mut grad_sum = 0.0f32;
+            for py in -patch_r..=patch_r {
+                for px in -patch_r..=patch_r {
+                    grad_sum += grad_a[((hy + py) as usize) * hw + (hx + px) as usize];
+                }
+            }
+            let mean_grad = grad_sum / ((2 * patch_r + 1).pow(2) as f32);
+            if mean_grad < 0.028 {
+                continue;
+            }
+
+            let eval_cost = |dx: i32, dy: i32| -> f32 {
+                let mut err = 0.0f32;
+                for py in -patch_r..=patch_r {
+                    let ay = (hy + py) as usize;
+                    let by = (hy + py + dy) as usize;
+                    for px in -patch_r..=patch_r {
+                        let ax = (hx + px) as usize;
+                        let bx = (hx + px + dx) as usize;
+                        let a_idx = ay * hw + ax;
+                        let b_idx = by * hw + bx;
+                        let dl = (lum_a[a_idx] - lum_b[b_idx]).abs();
+                        let dg = (grad_a[a_idx] - grad_b[b_idx]).abs();
+                        err += dl + 1.2 * dg;
+                    }
+                }
+                let reg = 0.12 * ((dx * dx + dy * dy) as f32);
+                err + reg
+            };
+
+            let cost_zero = eval_cost(0, 0);
+            let mut best_cost = cost_zero;
+            let mut best_dx = 0i32;
+            let mut best_dy = 0i32;
+
+            for dy in -search_r..=search_r {
+                for dx in -search_r..=search_r {
+                    let c = eval_cost(dx, dy);
+                    if c < best_cost {
+                        best_cost = c;
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
+                }
+            }
+
+            if best_cost < cost_zero * 0.78 && (best_dx != 0 || best_dy != 0) {
+                // Parabolic sub-pixel refinement
+                let mut sub_dx = best_dx as f32;
+                let mut sub_dy = best_dy as f32;
+                if best_dx.abs() < search_r {
+                    let cm = eval_cost(best_dx - 1, best_dy);
+                    let cp = eval_cost(best_dx + 1, best_dy);
+                    let denom = 2.0 * (cm + cp - 2.0 * best_cost);
+                    if denom.abs() > 1e-4 {
+                        sub_dx += ((cm - cp) / denom).clamp(-0.5, 0.5);
+                    }
+                }
+                if best_dy.abs() < search_r {
+                    let cm = eval_cost(best_dx, best_dy - 1);
+                    let cp = eval_cost(best_dx, best_dy + 1);
+                    let denom = 2.0 * (cm + cp - 2.0 * best_cost);
+                    if denom.abs() > 1e-4 {
+                        sub_dy += ((cm - cp) / denom).clamp(-0.5, 0.5);
+                    }
+                }
+
+                grid_dx[gidx] = (sub_dx * 2.0).clamp(-2.5, 2.5);
+                grid_dy[gidx] = (sub_dy * 2.0).clamp(-2.5, 2.5);
+            }
+        }
+    }
+
+    // 4. Diffuse and smooth the displacement field across the seam ribbon (6 passes)
+    for _ in 0..6 {
+        let prev_x = grid_dx.clone();
+        let prev_y = grid_dy.clone();
+        for gy in 1..(gh.saturating_sub(1)) {
+            for gx in 1..(gw.saturating_sub(1)) {
+                let idx = gy * gw + gx;
+                grid_dx[idx] = 0.4 * prev_x[idx]
+                    + 0.15
+                        * (prev_x[idx - 1]
+                            + prev_x[idx + 1]
+                            + prev_x[idx - gw]
+                            + prev_x[idx + gw]);
+                grid_dy[idx] = 0.4 * prev_y[idx]
+                    + 0.15
+                        * (prev_y[idx - 1]
+                            + prev_y[idx + 1]
+                            + prev_y[idx - gw]
+                            + prev_y[idx + gw]);
+            }
+        }
+    }
+
+    // Apply distance-to-seam and distance-to-border decay envelope
+    let mut has_active_warp = false;
+    for idx in 0..g_len {
+        let sd = seam_dist[idx];
+        let bd = border_dist[idx];
+        let w_seam = (-sd * sd / (2.0 * 2.5 * 2.5)).exp();
+        let w_bord = smoothstep_f32(12.0, 36.0, bd);
+        let env = w_seam * w_bord;
+        grid_dx[idx] *= env;
+        grid_dy[idx] *= env;
+        if grid_dx[idx].abs() > 0.15 || grid_dy[idx].abs() > 0.15 {
+            has_active_warp = true;
+        }
+    }
+
+    if !has_active_warp {
+        return;
+    }
+
+    // 5. Symmetrically warp roi_a by (-0.5 * dx, -0.5 * dy) and roi_b by (+0.5 * dx, +0.5 * dy)
+    let src_a = roi_a.clone();
+    let src_b = roi_b.clone();
+    let inv_cell = 1.0 / cell as f32;
+
+    roi_a
+        .as_mut()
+        .par_chunks_mut(rw * 3)
+        .zip(roi_b.as_mut().par_chunks_mut(rw * 3))
+        .enumerate()
+        .for_each(|(y, (row_a, row_b))| {
+            let gy_f = (y as f32 * inv_cell).clamp(0.0, (gh - 1) as f32);
+            let gy0 = gy_f.floor() as usize;
+            let gy1 = (gy0 + 1).min(gh - 1);
+            let fy = gy_f - gy0 as f32;
+            let row_off = y * rw;
+
+            for x in 0..rw {
+                let idx = row_off + x;
+                if !in_a_mask[idx] || !in_b_mask[idx] {
+                    continue;
+                }
+                let gx_f = (x as f32 * inv_cell).clamp(0.0, (gw - 1) as f32);
+                let gx0 = gx_f.floor() as usize;
+                let gx1 = (gx0 + 1).min(gw - 1);
+                let fx = gx_f - gx0 as f32;
+
+                let i00 = gy0 * gw + gx0;
+                let i10 = gy0 * gw + gx1;
+                let i01 = gy1 * gw + gx0;
+                let i11 = gy1 * gw + gx1;
+
+                let dx = (grid_dx[i00] * (1.0 - fx) + grid_dx[i10] * fx) * (1.0 - fy)
+                    + (grid_dx[i01] * (1.0 - fx) + grid_dx[i11] * fx) * fy;
+                let dy = (grid_dy[i00] * (1.0 - fx) + grid_dy[i10] * fx) * (1.0 - fy)
+                    + (grid_dy[i01] * (1.0 - fx) + grid_dy[i11] * fx) * fy;
+
+                if dx.abs() < 0.05 && dy.abs() < 0.05 {
+                    continue;
+                }
+
+                let ax = (x as f64 - 0.5 * dx as f64).clamp(0.0, (rw - 1) as f64);
+                let ay = (y as f64 - 0.5 * dy as f64).clamp(0.0, (rh - 1) as f64);
+                let bx = (x as f64 + 0.5 * dx as f64).clamp(0.0, (rw - 1) as f64);
+                let by = (y as f64 + 0.5 * dy as f64).clamp(0.0, (rh - 1) as f64);
+
+                let px_a = crate::panorama_utils::stitching::get_interpolated_pixel(&src_a, ax, ay);
+                let px_b = crate::panorama_utils::stitching::get_interpolated_pixel(&src_b, bx, by);
+
+                let c_idx = x * 3;
+                row_a[c_idx] = px_a[0];
+                row_a[c_idx + 1] = px_a[1];
+                row_a[c_idx + 2] = px_a[2];
+
+                row_b[c_idx] = px_b[0];
+                row_b[c_idx + 1] = px_b[1];
+                row_b[c_idx + 2] = px_b[2];
+            }
+        });
+}
+
 /// Seamlessly blends img_b into canvas_a strictly within the overlapping Region of Interest (ROI).
 /// Non-overlapping regions from img_b are directly copied into canvas_a.
-/// This reduces peak RAM from > 6 GB down to < 200 MB and provides a 5x speedup.
 pub fn multiband_laplacian_blend_roi(
     canvas_a: &mut Rgb32FImage,
     mask_a: &mut GrayImage,
@@ -424,7 +939,6 @@ pub fn multiband_laplacian_blend_roi(
     }
 
     if !has_overlap || min_x >= max_x || min_y >= max_y {
-        // No overlap: direct copy of new non-empty pixels from B
         canvas_a
             .par_chunks_mut(w as usize * 3)
             .zip(mask_a.par_chunks_mut(w as usize))
@@ -441,8 +955,8 @@ pub fn multiband_laplacian_blend_roi(
         return;
     }
 
-    // Expand ROI slightly by 32px margin for smooth spatial frequency decay
-    let pad = 32u32;
+    // Expand ROI by 64px margin for multi-scale spatial frequency decay
+    let pad = 64u32;
     let roi_min_x = min_x.saturating_sub(pad);
     let roi_max_x = (max_x + pad).min(w - 1);
     let roi_min_y = min_y.saturating_sub(pad);
@@ -450,11 +964,18 @@ pub fn multiband_laplacian_blend_roi(
 
     let roi_w = roi_max_x - roi_min_x + 1;
     let roi_h = roi_max_y - roi_min_y + 1;
+    let rw_u = roi_w as usize;
+    let rh_u = roi_h as usize;
+    let num_roi = rw_u * rh_u;
 
-    // Crop sub-images for ROI
+    // Crop sub-images and compute 2D Chamfer distance transforms to exclusive boundaries
     let mut roi_a = Rgb32FImage::new(roi_w, roi_h);
     let mut roi_b = Rgb32FImage::new(roi_w, roi_h);
-    let mut roi_weight = vec![0.0f32; (roi_w * roi_h) as usize];
+    let mut roi_weight = vec![0.0f32; num_roi];
+    let mut in_a_mask = vec![false; num_roi];
+    let mut in_b_mask = vec![false; num_roi];
+    let mut dist_a = vec![1e5f32; num_roi];
+    let mut dist_b = vec![1e5f32; num_roi];
 
     for ry in 0..roi_h {
         let cy = roi_min_y + ry;
@@ -462,8 +983,16 @@ pub fn multiband_laplacian_blend_roi(
             let cx = roi_min_x + rx;
             let in_a = mask_a.get_pixel(cx, cy)[0] > 0;
             let in_b = mask_b.get_pixel(cx, cy)[0] > 0;
+            let r_idx = ry as usize * rw_u + rx as usize;
+            in_a_mask[r_idx] = in_a;
+            in_b_mask[r_idx] = in_b;
+            if !in_a {
+                dist_a[r_idx] = 0.0;
+            }
+            if !in_b {
+                dist_b[r_idx] = 0.0;
+            }
 
-            // Border extrapolation: avoid black [0,0,0] padding bleeding into Laplacian low frequencies
             let px_a = if in_a {
                 *canvas_a.get_pixel(cx, cy)
             } else {
@@ -478,23 +1007,203 @@ pub fn multiband_laplacian_blend_roi(
             roi_a.put_pixel(rx, ry, px_a);
             roi_b.put_pixel(rx, ry, px_b);
             let full_idx = (cy * w + cx) as usize;
-            roi_weight[(ry * roi_w + rx) as usize] = seam_weight_mask[full_idx];
+            roi_weight[r_idx] = seam_weight_mask[full_idx];
         }
     }
 
-    // Run Laplacian Pyramid blend strictly on the small ROI patch
-    let blended_roi = multiband_laplacian_blend(&roi_a, &roi_b, &roi_weight, num_levels);
+    // Forward & backward distance transform pass on ROI
+    for ry in 0..rh_u {
+        for rx in 0..rw_u {
+            let idx = ry * rw_u + rx;
+            if rx > 0 {
+                dist_a[idx] = dist_a[idx].min(dist_a[idx - 1] + 1.0);
+                dist_b[idx] = dist_b[idx].min(dist_b[idx - 1] + 1.0);
+            }
+            if ry > 0 {
+                let up = (ry - 1) * rw_u + rx;
+                dist_a[idx] = dist_a[idx].min(dist_a[up] + 1.0);
+                dist_b[idx] = dist_b[idx].min(dist_b[up] + 1.0);
+            }
+        }
+    }
+    for ry in (0..rh_u).rev() {
+        for rx in (0..rw_u).rev() {
+            let idx = ry * rw_u + rx;
+            if rx + 1 < rw_u {
+                dist_a[idx] = dist_a[idx].min(dist_a[idx + 1] + 1.0);
+                dist_b[idx] = dist_b[idx].min(dist_b[idx + 1] + 1.0);
+            }
+            if ry + 1 < rh_u {
+                let dn = (ry + 1) * rw_u + rx;
+                dist_a[idx] = dist_a[idx].min(dist_a[dn] + 1.0);
+                dist_b[idx] = dist_b[idx].min(dist_b[dn] + 1.0);
+            }
+        }
+    }
 
-    // Paste blended ROI and copy remaining new non-overlapping pixels
+    // 2. Harmonize residual low-frequency 2D exposure/vignetting across the overlap
+    harmonize_overlap_roi_photometry(
+        &mut roi_a,
+        &mut roi_b,
+        &in_a_mask,
+        &in_b_mask,
+        &dist_a,
+        &dist_b,
+    );
+
+    // 3. After harmonizing overlap pixels, extrapolate outer `!in_a` of `roi_a` and `!in_b` of `roi_b`
+    // from their harmonized neighbors, and enforce a smooth boundary-pinning envelope on `roi_weight`
+    // so the 6-level Laplacian pyramid never bleeds across panel borders or unmapped black corners.
+    let mut valid_union = vec![false; num_roi];
+    for ry in 0..roi_h {
+        for rx in 0..roi_w {
+            let r_idx = ry as usize * rw_u + rx as usize;
+            let ia = in_a_mask[r_idx];
+            let ib = in_b_mask[r_idx];
+            if ia && ib {
+                valid_union[r_idx] = true;
+                let da = dist_a[r_idx];
+                let db = dist_b[r_idx];
+                if db < 44.0 && da > db {
+                    let w_floor = 1.0 - smoothstep_f32(6.0, 44.0, db);
+                    roi_weight[r_idx] = roi_weight[r_idx].max(w_floor);
+                }
+                if da < 44.0 && db > da {
+                    let w_ceil = smoothstep_f32(6.0, 44.0, da);
+                    roi_weight[r_idx] = roi_weight[r_idx].min(w_ceil);
+                }
+            } else if !ia && ib {
+                valid_union[r_idx] = true;
+                let pb = *roi_b.get_pixel(rx, ry);
+                roi_a.put_pixel(rx, ry, pb);
+                roi_weight[r_idx] = 0.0;
+            } else if ia && !ib {
+                valid_union[r_idx] = true;
+                let pa = *roi_a.get_pixel(rx, ry);
+                roi_b.put_pixel(rx, ry, pa);
+                roi_weight[r_idx] = 1.0;
+            }
+        }
+    }
+
+    // Extrapolate any `!in_a && !in_b` exterior ROI pixels from nearest valid neighbors (row + col pass)
+    // instead of leaving `(0,0,0)` black which would bleed into coarse pyramid levels.
+    for ry in 0..rh_u {
+        let mut last_valid_x: Option<usize> = None;
+        for rx in 0..rw_u {
+            let idx = ry * rw_u + rx;
+            if valid_union[idx] {
+                last_valid_x = Some(rx);
+            } else if let Some(vx) = last_valid_x {
+                let pa = *roi_a.get_pixel(vx as u32, ry as u32);
+                let pb = *roi_b.get_pixel(vx as u32, ry as u32);
+                roi_a.put_pixel(rx as u32, ry as u32, pa);
+                roi_b.put_pixel(rx as u32, ry as u32, pb);
+                roi_weight[idx] = roi_weight[ry * rw_u + vx];
+                valid_union[idx] = true;
+            }
+        }
+        last_valid_x = None;
+        for rx in (0..rw_u).rev() {
+            let idx = ry * rw_u + rx;
+            if valid_union[idx] {
+                last_valid_x = Some(rx);
+            } else if let Some(vx) = last_valid_x {
+                let pa = *roi_a.get_pixel(vx as u32, ry as u32);
+                let pb = *roi_b.get_pixel(vx as u32, ry as u32);
+                roi_a.put_pixel(rx as u32, ry as u32, pa);
+                roi_b.put_pixel(rx as u32, ry as u32, pb);
+                roi_weight[idx] = roi_weight[ry * rw_u + vx];
+                valid_union[idx] = true;
+            }
+        }
+    }
+    for rx in 0..rw_u {
+        let mut last_valid_y: Option<usize> = None;
+        for ry in 0..rh_u {
+            let idx = ry * rw_u + rx;
+            if valid_union[idx] {
+                last_valid_y = Some(ry);
+            } else if let Some(vy) = last_valid_y {
+                let pa = *roi_a.get_pixel(rx as u32, vy as u32);
+                let pb = *roi_b.get_pixel(rx as u32, vy as u32);
+                roi_a.put_pixel(rx as u32, ry as u32, pa);
+                roi_b.put_pixel(rx as u32, ry as u32, pb);
+                roi_weight[idx] = roi_weight[vy * rw_u + rx];
+                valid_union[idx] = true;
+            }
+        }
+        last_valid_y = None;
+        for ry in (0..rh_u).rev() {
+            let idx = ry * rw_u + rx;
+            if valid_union[idx] {
+                last_valid_y = Some(ry);
+            } else if let Some(vy) = last_valid_y {
+                let pa = *roi_a.get_pixel(rx as u32, vy as u32);
+                let pb = *roi_b.get_pixel(rx as u32, vy as u32);
+                roi_a.put_pixel(rx as u32, ry as u32, pa);
+                roi_b.put_pixel(rx as u32, ry as u32, pb);
+                roi_weight[idx] = roi_weight[vy * rw_u + rx];
+                valid_union[idx] = true;
+            }
+        }
+    }
+
+    // 4. Seam-Ribbon Local Optical-Flow De-Parallax Warping
+    align_seam_ribbon_deparallax(
+        &mut roi_a,
+        &mut roi_b,
+        &in_a_mask,
+        &in_b_mask,
+        &dist_a,
+        &dist_b,
+        &roi_weight,
+    );
+
+    // 5. Run Multi-Band Laplacian Pyramid blend on the harmonized & de-parallaxed ROI patch
+    let active_levels = num_levels.clamp(4, 5);
+    let blended_roi = multiband_laplacian_blend(&roi_a, &roi_b, &roi_weight, active_levels);
+
+    // 6. Paste blended ROI with wide C1 smoothstep feathering at `mask_a` / `mask_b` borders
     for ry in 0..roi_h {
         let cy = roi_min_y + ry;
         for rx in 0..roi_w {
             let cx = roi_min_x + rx;
-            let in_a = mask_a.get_pixel(cx, cy)[0] > 0;
-            let in_b = mask_b.get_pixel(cx, cy)[0] > 0;
+            let r_idx = ry as usize * rw_u + rx as usize;
+            let in_a = in_a_mask[r_idx];
+            let in_b = in_b_mask[r_idx];
 
             if in_a && in_b {
-                canvas_a.put_pixel(cx, cy, *blended_roi.get_pixel(rx, ry));
+                let p_blend = *blended_roi.get_pixel(rx, ry);
+                let da = dist_a[r_idx];
+                let db = dist_b[r_idx];
+                if db < 36.0 && da > db {
+                    let t = smoothstep_f32(2.0, 36.0, db);
+                    let pa = *canvas_a.get_pixel(cx, cy);
+                    canvas_a.put_pixel(
+                        cx,
+                        cy,
+                        image::Rgb([
+                            pa[0] * (1.0 - t) + p_blend[0] * t,
+                            pa[1] * (1.0 - t) + p_blend[1] * t,
+                            pa[2] * (1.0 - t) + p_blend[2] * t,
+                        ]),
+                    );
+                } else if da < 36.0 && db > da {
+                    let t = smoothstep_f32(2.0, 36.0, da);
+                    let pb = *img_b.get_pixel(cx, cy);
+                    canvas_a.put_pixel(
+                        cx,
+                        cy,
+                        image::Rgb([
+                            pb[0] * (1.0 - t) + p_blend[0] * t,
+                            pb[1] * (1.0 - t) + p_blend[1] * t,
+                            pb[2] * (1.0 - t) + p_blend[2] * t,
+                        ]),
+                    );
+                } else {
+                    canvas_a.put_pixel(cx, cy, p_blend);
+                }
             } else if !in_a && in_b {
                 canvas_a.put_pixel(cx, cy, *img_b.get_pixel(cx, cy));
                 mask_a.put_pixel(cx, cy, Luma([255]));
@@ -505,7 +1214,6 @@ pub fn multiband_laplacian_blend_roi(
     // Copy non-overlapping pixels of B outside the ROI
     for cy in 0..h {
         if cy >= roi_min_y && cy <= roi_max_y {
-            // Check only outside X range
             for cx in 0..roi_min_x {
                 if mask_b.get_pixel(cx, cy)[0] > 0 && mask_a.get_pixel(cx, cy)[0] == 0 {
                     canvas_a.put_pixel(cx, cy, *img_b.get_pixel(cx, cy));

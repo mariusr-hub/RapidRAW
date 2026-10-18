@@ -49,7 +49,14 @@ pub fn ray_traced_multiband_stitcher(
     }
     println!("Calculating 3D angular bounds for {} images with {:?} projection...", images.len(), projection);
 
-    let avg_f: f64 = (poses.iter().map(|p| p.f).sum::<f64>() / poses.len() as f64).max(100.0);
+    let min_f: f64 = poses.iter().map(|p| p.f).fold(f64::INFINITY, f64::min).max(100.0);
+    let max_f: f64 = poses.iter().map(|p| p.f).fold(f64::NEG_INFINITY, f64::max).max(100.0);
+    let is_multi_focal = max_f > min_f * 1.08;
+    let avg_f: f64 = if is_multi_focal {
+        min_f
+    } else {
+        (poses.iter().map(|p| p.f).sum::<f64>() / poses.len() as f64).max(100.0)
+    };
     let r_mats: Vec<Matrix3<f64>> = poses.iter().map(|p| p.rotation_matrix()).collect();
     let r_invs: Vec<Matrix3<f64>> = r_mats.iter().map(|r| r.transpose()).collect();
 
@@ -61,6 +68,11 @@ pub fn ray_traced_multiband_stitcher(
 
     for (k, &img_info) in images.iter().enumerate() {
         let pose = &poses[k];
+        // For multi-focal sets (e.g. 100mm base + 126mm/188mm zoomed-in insets), define the outer
+        // canvas FOV from the wide-angle base panel(s) so narrow zoomed insets don't create step notches.
+        if is_multi_focal && pose.f > min_f * 1.08 && k > 0 {
+            continue;
+        }
         let (w, h) = (img_info.full_width, img_info.full_height);
         let corners = [
             (0.0, 0.0),
@@ -74,11 +86,7 @@ pub fn ray_traced_multiband_stitcher(
         ];
 
         for &(u, v) in &corners {
-            let ray_cam = Vector3::new(
-                (u - pose.cx) / pose.f,
-                (v - pose.cy) / pose.f,
-                1.0,
-            ).normalize();
+            let ray_cam = pose.unproject_point(u, v);
 
             let world_ray = r_mats[k] * ray_cam;
             let theta = world_ray.x.atan2(world_ray.z);
@@ -140,8 +148,8 @@ pub fn ray_traced_multiband_stitcher(
         min_theta, max_theta, (max_theta - min_theta).to_degrees(),
         min_phi, max_phi, (max_phi - min_phi).to_degrees());
     for (i, p) in poses.iter().enumerate() {
-        println!("    Pose {}: yaw={:.3} deg, pitch={:.3} deg, roll={:.3} deg, f={:.1}",
-            i, p.yaw.to_degrees(), p.pitch.to_degrees(), p.roll.to_degrees(), p.f);
+        println!("    Pose {}: yaw={:.3} deg, pitch={:.3} deg, roll={:.3} deg, f={:.1}, dist_b={:.4}",
+            i, p.yaw.to_degrees(), p.pitch.to_degrees(), p.roll.to_degrees(), p.f, p.dist_b);
     }
 
     let canvas_cx = out_width as f64 / 2.0;
@@ -182,12 +190,19 @@ pub fn ray_traced_multiband_stitcher(
             .for_each(|(y, (row_slice, mask_row))| {
                 for x in 0..proxy_w {
                     let theta = (x as f64 - proxy_cx) / proxy_f + mid_theta;
-                    let phi = (y as f64 - proxy_cy) / proxy_f + mid_phi;
+                    let h_cyl = (y as f64 - proxy_cy) / proxy_f;
+                    let phi = h_cyl + mid_phi;
 
                     let world_ray = match active_projection {
                         PanoramaProjection::Cylindrical => {
-                            let denom = (1.0 + phi * phi).sqrt();
-                            Vector3::new(theta.sin() / denom, phi / denom, theta.cos() / denom)
+                            let sin_t = theta.sin();
+                            let cos_t = theta.cos();
+                            let cos_pitch = mid_phi.cos();
+                            let sin_pitch = mid_phi.sin();
+                            let ray_x = sin_t;
+                            let ray_y = h_cyl * cos_pitch + cos_t * sin_pitch;
+                            let ray_z = -h_cyl * sin_pitch + cos_t * cos_pitch;
+                            Vector3::new(ray_x, ray_y, ray_z).normalize()
                         }
                         PanoramaProjection::Spherical => {
                             let cos_p = phi.cos();
@@ -253,14 +268,22 @@ pub fn ray_traced_multiband_stitcher(
                         let pi = img_i.get_pixel(x, y);
                         let pj = img_j.get_pixel(x, y);
 
-                        for c in 0..3 {
-                            let vi = pi[c] as f64;
-                            let vj = pj[c] as f64;
-                            sum_i_sq[c] += vi * vi;
-                            sum_j_sq[c] += vj * vj;
-                            sum_ij[c] += vi * vj;
+                        let li = 0.2126 * pi[0] + 0.7152 * pi[1] + 0.0722 * pi[2];
+                        let lj = 0.2126 * pj[0] + 0.7152 * pj[1] + 0.0722 * pj[2];
+                        // Exclude deep black noise, clipped highlights, and moving object outliers
+                        if li > 0.005 && lj > 0.005 {
+                            let ratio = li.max(lj) / li.min(lj);
+                            if ratio < 2.2 {
+                                for c in 0..3 {
+                                    let vi = pi[c] as f64;
+                                    let vj = pj[c] as f64;
+                                    sum_i_sq[c] += vi * vi;
+                                    sum_j_sq[c] += vj * vj;
+                                    sum_ij[c] += vi * vj;
+                                }
+                                samples += 1;
+                            }
                         }
-                        samples += 1;
                     }
                 }
             }
@@ -412,7 +435,7 @@ pub fn ray_traced_multiband_stitcher(
                 &panel_img,
                 &panel_mask,
                 &seam_weight_mask,
-                4,
+                6,
             );
         }
 
@@ -463,9 +486,9 @@ pub fn progressive_seam_stitcher(
     ray_traced_multiband_stitcher(images, &poses, &[], PanoramaProjection::Cylindrical, 0.5, app_handle, None, None).unwrap_or_else(|_| Rgb32FImage::new(0, 0))
 }
 
-/// 2D Content-Preserving Laplacian Mesh Boundary Rectangulation (Boundary Warp)
-/// Stretches irregular wavy outer panorama boundaries outward to fill a full rectangular canvas
-/// while preserving straight interior horizon lines and architectural geometries.
+/// 2D Content-Preserving Polygon-Constrained Laplacian Mesh Boundary Rectangulation (Boundary Warp)
+/// Stretches irregular wavy outer panorama boundaries outward to fill a rectangular canvas
+/// while pinning vertices strictly inside the valid polygon contour and preserving straight interior lines.
 pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: f32) -> (Rgb32FImage, GrayImage) {
     let (w, h) = pano.dimensions();
     if w < 10 || h < 10 || strength <= 0.001 {
@@ -480,6 +503,8 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
     let s = strength.clamp(0.0, 1.0) as f64;
     let grid_cols = 32usize;
     let grid_rows = 32usize;
+    let center_x = 0.5 * (min_x + max_x) as f64;
+    let center_y = 0.5 * (min_y + max_y) as f64;
 
     // 1. Detect 4-way boundary profiles (top, bottom, left, right)
     let mut top_bounds = vec![0.0f64; w as usize];
@@ -497,7 +522,6 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
         top_bounds[x as usize] = (top as f64).min((h - 1) as f64);
         bottom_bounds[x as usize] = (bot as f64).max(top as f64);
     }
-    // Extend boundary profile to outer canvas edges
     for x in 0..min_x {
         top_bounds[x as usize] = top_bounds[min_x as usize];
         bottom_bounds[x as usize] = bottom_bounds[min_x as usize];
@@ -522,7 +546,6 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
         left_bounds[y as usize] = (left as f64).min((w - 1) as f64);
         right_bounds[y as usize] = (right as f64).max(left as f64);
     }
-    // Extend boundary profile to outer canvas edges
     for y in 0..min_y {
         left_bounds[y as usize] = left_bounds[min_y as usize];
         right_bounds[y as usize] = right_bounds[min_y as usize];
@@ -532,12 +555,31 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
         right_bounds[y as usize] = right_bounds[max_y as usize];
     }
 
-    // 2. Initialize 2D Mesh Vertices (Source and Target)
+    // Smooth boundary profiles with a 1D box filter so step notches between tilted panels
+    // do not induce localized kinks in the mesh.
+    let smooth_1d = |arr: &mut [f64], radius: usize| {
+        if arr.len() <= radius * 2 {
+            return;
+        }
+        let orig = arr.to_vec();
+        let n = orig.len();
+        for i in 0..n {
+            let start = i.saturating_sub(radius);
+            let end = (i + radius).min(n - 1);
+            let sum: f64 = orig[start..=end].iter().sum();
+            arr[i] = sum / ((end - start + 1) as f64);
+        }
+    };
+    let smooth_rx = ((w as usize) / 24).clamp(4, 64);
+    let smooth_ry = ((h as usize) / 24).clamp(4, 64);
+    smooth_1d(&mut top_bounds, smooth_rx);
+    smooth_1d(&mut bottom_bounds, smooth_rx);
+    smooth_1d(&mut left_bounds, smooth_ry);
+    smooth_1d(&mut right_bounds, smooth_ry);
+
+    // 2. Initialize 2D Mesh Vertices (Source and Target) with Polygon Ray-Pinning
     let mut src_mesh_x = vec![vec![0.0f64; grid_cols + 1]; grid_rows + 1];
     let mut src_mesh_y = vec![vec![0.0f64; grid_cols + 1]; grid_rows + 1];
-
-    let mut dst_mesh_x = vec![vec![0.0f64; grid_cols + 1]; grid_rows + 1];
-    let mut dst_mesh_y = vec![vec![0.0f64; grid_cols + 1]; grid_rows + 1];
 
     for r in 0..=grid_rows {
         let v_frac = r as f64 / grid_rows as f64;
@@ -547,7 +589,6 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
             let u_frac = c as f64 / grid_cols as f64;
             let rect_x = u_frac * (w - 1) as f64;
 
-            // Sample curved boundaries
             let col_idx = (rect_x.round() as usize).min(w as usize - 1);
             let row_idx = (rect_y.round() as usize).min(h as usize - 1);
 
@@ -556,31 +597,57 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
             let l_bound = left_bounds[row_idx];
             let r_bound = right_bounds[row_idx];
 
-            let curved_x = l_bound + u_frac * (r_bound - l_bound).max(1.0);
-            let curved_y = t_bound + v_frac * (b_bound - t_bound).max(1.0);
+            let mut curved_x = l_bound + u_frac * (r_bound - l_bound).max(1.0);
+            let mut curved_y = t_bound + v_frac * (b_bound - t_bound).max(1.0);
 
-            // Harmonic boundary attenuation: deformation acts strongly on outer borders
-            // and decays toward zero in the interior to preserve straight horizon and architecture lines
-            let edge_dist = (u_frac.min(1.0 - u_frac) * 2.0).min(v_frac.min(1.0 - v_frac) * 2.0).clamp(0.0, 1.0);
+            // If (curved_x, curved_y) falls in an unmapped concave corner (`mask == 0`),
+            // march inward along the ray toward (center_x, center_y) until strictly inside valid mask.
+            let check_valid = |px: f64, py: f64| -> bool {
+                let ix = px.round() as i32;
+                let iy = py.round() as i32;
+                if ix >= 1 && ix < w as i32 - 1 && iy >= 1 && iy < h as i32 - 1 {
+                    mask.get_pixel(ix as u32, iy as u32)[0] > 0
+                } else {
+                    false
+                }
+            };
+
+            if !check_valid(curved_x, curved_y) {
+                for step_i in 1..=64 {
+                    let t = step_i as f64 / 64.0;
+                    let tx = curved_x + t * (center_x - curved_x);
+                    let ty = curved_y + t * (center_y - curved_y);
+                    if check_valid(tx, ty) {
+                        // Step slightly further inward for bicubic safety margin
+                        let t_safe = (t + 0.02).min(1.0);
+                        curved_x = curved_x + t_safe * (center_x - curved_x);
+                        curved_y = curved_y + t_safe * (center_y - curved_y);
+                        break;
+                    }
+                }
+            }
+
+            let edge_dist = (u_frac.min(1.0 - u_frac) * 2.0)
+                .min(v_frac.min(1.0 - v_frac) * 2.0)
+                .clamp(0.0, 1.0);
             let boundary_weight = (1.0 - edge_dist).powi(2) * s;
 
-            let max_disp_x = (w as f64 * 0.06).max(12.0);
-            let max_disp_y = (h as f64 * 0.06).max(12.0);
+            // Constrain maximum boundary warp displacement so mild cylindrical bow is straightened
+            // without taffy-stretching deep concave step notches (which are handled by inner rectangle crop).
+            let max_disp_x = (w as f64 * 0.022).clamp(4.0, 28.0);
+            let max_disp_y = (h as f64 * 0.022).clamp(4.0, 24.0);
 
             let disp_x = (curved_x - rect_x).clamp(-max_disp_x, max_disp_x);
             let disp_y = (curved_y - rect_y).clamp(-max_disp_y, max_disp_y);
-
-            dst_mesh_x[r][c] = rect_x;
-            dst_mesh_y[r][c] = rect_y;
 
             src_mesh_x[r][c] = rect_x + boundary_weight * disp_x;
             src_mesh_y[r][c] = rect_y + boundary_weight * disp_y;
         }
     }
 
-    // 2.1. Laplacian Mesh Stiffness & Collinear Line Smoothing (4 iterations) to ensure C1 continuity
-    // and preserve straight horizons and vertical architectural walls across boundary warps
-    for _ in 0..4 {
+    // 2.1. Interior Laplacian Mesh Stiffness & Collinear Line Smoothing (6 iterations)
+    // Boundary ring vertices (r == 0, r == grid_rows, c == 0, c == grid_cols) remain pinned
+    for _ in 0..6 {
         let mut smooth_x = src_mesh_x.clone();
         let mut smooth_y = src_mesh_y.clone();
         for r in 1..grid_rows {
@@ -591,15 +658,15 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
                 let line_horiz_y = 0.5 * (src_mesh_y[r][c - 1] + src_mesh_y[r][c + 1]);
                 let line_vert_x = 0.5 * (src_mesh_x[r - 1][c] + src_mesh_x[r + 1][c]);
 
-                smooth_x[r][c] = 0.5 * src_mesh_x[r][c] + 0.3 * lap_x + 0.2 * line_vert_x;
-                smooth_y[r][c] = 0.5 * src_mesh_y[r][c] + 0.3 * lap_y + 0.2 * line_horiz_y;
+                smooth_x[r][c] = 0.45 * src_mesh_x[r][c] + 0.35 * lap_x + 0.20 * line_vert_x;
+                smooth_y[r][c] = 0.45 * src_mesh_y[r][c] + 0.35 * lap_y + 0.20 * line_horiz_y;
             }
         }
         src_mesh_x = smooth_x;
         src_mesh_y = smooth_y;
     }
 
-    // 3. Render final warped image and mask with bicubic/nearest sampling across grid cells
+    // 3. Render final warped image and conservative mask
     let mut warped = Rgb32FImage::new(w, h);
     let mut warped_mask = GrayImage::new(w, h);
 
@@ -621,7 +688,6 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
                 let c1 = c0 + 1;
                 let fx = c_float - c0 as f64;
 
-                // Bilinear mapping from output canvas (x, y) back into original warped source space (sx, sy)
                 let sx00 = src_mesh_x[r0][c0];
                 let sx10 = src_mesh_x[r0][c1];
                 let sx01 = src_mesh_x[r1][c0];
@@ -635,17 +701,36 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
                 let interp_sx = (sx00 * (1.0 - fx) + sx10 * fx) * (1.0 - fy) + (sx01 * (1.0 - fx) + sx11 * fx) * fy;
                 let interp_sy = (sy00 * (1.0 - fx) + sy10 * fx) * (1.0 - fy) + (sy01 * (1.0 - fx) + sy11 * fx) * fy;
 
-                let px = get_catmull_rom_bicubic_pixel(pano, interp_sx, interp_sy);
-                let idx = x * 3;
-                row[idx] = px[0];
-                row[idx + 1] = px[1];
-                row[idx + 2] = px[2];
+                let sx0 = interp_sx.floor() as i32;
+                let sy0 = interp_sy.floor() as i32;
+                let sx1 = sx0 + 1;
+                let sy1 = sy0 + 1;
 
-                let sx_round = interp_sx.round() as i32;
-                let sy_round = interp_sy.round() as i32;
-                if sx_round >= 0 && sx_round < w as i32 && sy_round >= 0 && sy_round < h as i32 {
-                    mask_row[x] = mask.get_pixel(sx_round as u32, sy_round as u32)[0];
+                // Conservative 2x2 neighborhood validity check: prevents bicubic border smearing
+                let all_4_valid = sx0 >= 0
+                    && sy0 >= 0
+                    && sx1 < w as i32
+                    && sy1 < h as i32
+                    && mask.get_pixel(sx0 as u32, sy0 as u32)[0] > 0
+                    && mask.get_pixel(sx1 as u32, sy0 as u32)[0] > 0
+                    && mask.get_pixel(sx0 as u32, sy1 as u32)[0] > 0
+                    && mask.get_pixel(sx1 as u32, sy1 as u32)[0] > 0;
+
+                if all_4_valid {
+                    let px = get_catmull_rom_bicubic_pixel(pano, interp_sx, interp_sy);
+                    let idx = x * 3;
+                    row[idx] = px[0];
+                    row[idx + 1] = px[1];
+                    row[idx + 2] = px[2];
+                    mask_row[x] = 255;
                 } else {
+                    let sx_c = interp_sx.round().clamp(0.0, (w - 1) as f64) as u32;
+                    let sy_c = interp_sy.round().clamp(0.0, (h - 1) as f64) as u32;
+                    let px = pano.get_pixel(sx_c, sy_c);
+                    let idx = x * 3;
+                    row[idx] = px[0];
+                    row[idx + 1] = px[1];
+                    row[idx + 2] = px[2];
                     mask_row[x] = 0;
                 }
             }
@@ -720,9 +805,8 @@ pub fn crop_gray_to_valid_mask(gray: &GrayImage, mask: &GrayImage) -> GrayImage 
     }
 }
 
-/// Finds the largest inscribed rectangular region (x, y, w, h) containing 100% valid non-zero mask pixels.
-/// Uses a downscaled proxy grid on high-resolution panoramas to prevent CPU lockups (< 2ms vs 30s),
-/// then refines boundary edges on the full mask for 0.00% void precision.
+/// Finds the largest inscribed rectangular region (x, y, w, h) containing 100.0% valid non-zero mask pixels.
+/// Uses strict 100% min-pooling on a downscaled proxy grid followed by full-resolution boundary refinement.
 pub fn find_maximum_inner_rectangle(mask: &GrayImage) -> Option<(u32, u32, u32, u32)> {
     let (w, h) = mask.dimensions();
     if w == 0 || h == 0 {
@@ -742,7 +826,7 @@ pub fn find_maximum_inner_rectangle(mask: &GrayImage) -> Option<(u32, u32, u32, 
         let raw_mask = mask.as_raw();
         let stride = w as usize;
 
-        // Conservative min-pooling: proxy pixel is 255 if and only if EVERY pixel in the S x S block is non-zero
+        // Strict 100% min-pooling: proxy pixel is 255 if and only if EVERY pixel in the S x S block is non-zero
         for py in 0..ph {
             let y_start = (py * scale) as usize;
             let y_end = ((py + 1) * scale).min(h) as usize;
@@ -750,32 +834,57 @@ pub fn find_maximum_inner_rectangle(mask: &GrayImage) -> Option<(u32, u32, u32, 
                 let x_start = (px * scale) as usize;
                 let x_end = ((px + 1) * scale).min(w) as usize;
 
-                let mut valid_count = 0usize;
-                let mut total_count = 0usize;
-                for y in y_start..y_end {
+                let mut all_valid = true;
+                let mut has_pixels = false;
+                'block: for y in y_start..y_end {
                     let row_offset = y * stride;
                     for x in x_start..x_end {
-                        total_count += 1;
-                        if raw_mask[row_offset + x] > 0 {
-                            valid_count += 1;
+                        has_pixels = true;
+                        if raw_mask[row_offset + x] == 0 {
+                            all_valid = false;
+                            break 'block;
                         }
                     }
                 }
 
-                if total_count > 0 && (valid_count as f32 / total_count as f32) >= 0.96 {
+                if has_pixels && all_valid {
                     pmask.put_pixel(px, py, image::Luma([255]));
                 }
             }
         }
 
         if let Some((prx, pry, prw, prh)) = find_maximum_inner_rectangle_exact(&pmask) {
-            let full_x = prx * scale;
-            let full_y = pry * scale;
-            let full_w = (prw * scale).min(w - full_x);
-            let full_h = (prh * scale).min(h - full_y);
+            let mut x0 = prx * scale;
+            let mut y0 = pry * scale;
+            let mut x1 = ((prx + prw) * scale).min(w) - 1;
+            let mut y1 = ((pry + prh) * scale).min(h) - 1;
 
+            // Expand outward 1px at a time on full-resolution mask while edge is 100% valid
+            while x0 > 0 && (y0..=y1).all(|y| mask.get_pixel(x0 - 1, y)[0] > 0) {
+                x0 -= 1;
+            }
+            while x1 + 1 < w && (y0..=y1).all(|y| mask.get_pixel(x1 + 1, y)[0] > 0) {
+                x1 += 1;
+            }
+            while y0 > 0 && (x0..=x1).all(|x| mask.get_pixel(x, y0 - 1)[0] > 0) {
+                y0 -= 1;
+            }
+            while y1 + 1 < h && (x0..=x1).all(|x| mask.get_pixel(x, y1 + 1)[0] > 0) {
+                y1 += 1;
+            }
+
+            // Safety trim by 1px inward on each border to eliminate sub-pixel edge interpolation artifacts
+            if x1 > x0 + 4 && y1 > y0 + 4 {
+                x0 += 1;
+                y0 += 1;
+                x1 -= 1;
+                y1 -= 1;
+            }
+
+            let full_w = x1 - x0 + 1;
+            let full_h = y1 - y0 + 1;
             if full_w > 100 && full_h > 100 {
-                return Some((full_x, full_y, full_w, full_h));
+                return Some((x0, y0, full_w, full_h));
             }
         }
     }
@@ -831,7 +940,7 @@ fn find_maximum_inner_rectangle_exact(mask: &GrayImage) -> Option<(u32, u32, u32
         }
     }
 
-    if max_area > 0 && best_rect.2 > 100 && best_rect.3 > 100 {
+    if max_area > 0 && best_rect.2 > 10 && best_rect.3 > 10 {
         Some(best_rect)
     } else {
         None
@@ -843,7 +952,7 @@ pub fn crop_to_maximum_inner_rectangle(pano: &Rgb32FImage, mask: &GrayImage) -> 
     println!("  - crop_to_maximum_inner_rectangle: mask non-zero pixels = {} / {}", non_zero, mask.len());
     if let Some((rx, ry, rw, rh)) = find_maximum_inner_rectangle(mask) {
         println!("  - find_maximum_inner_rectangle found: x={}, y={}, w={}, h={}", rx, ry, rw, rh);
-        if rw > 100 && rh > 100 {
+        if rw > 10 && rh > 10 {
             let mut cropped = Rgb32FImage::new(rw, rh);
             for y in 0..rh {
                 for x in 0..rw {
@@ -855,7 +964,6 @@ pub fn crop_to_maximum_inner_rectangle(pano: &Rgb32FImage, mask: &GrayImage) -> 
     }
 
     println!("  - find_maximum_inner_rectangle returned None, falling back to crop_to_valid_mask");
-    // Fallback: If maximum inner rectangle fails or is degenerate, crop to valid mask bounding box
     crop_to_valid_mask(pano, mask)
 }
 

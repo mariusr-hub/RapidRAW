@@ -255,6 +255,7 @@ fn develop_internal(
             });
         }
         Intermediate::ThreeColor(pixels) => {
+            let skip_clip_recovery = linear_mode == "hdr_linear";
             pixels.data.iter_mut().for_each(|p| {
                 let mut r = (p[0] * rescale_factor).max(0.0);
                 let mut g = (p[1] * rescale_factor).max(0.0);
@@ -266,7 +267,11 @@ fn develop_internal(
                     b = srgb_to_linear(b.max(0.0));
                 }
 
-                let (rec_r, rec_g, rec_b) = recover_clipped_pixel(r, g, b);
+                let (rec_r, rec_g, rec_b) = if skip_clip_recovery {
+                    (r, g, b)
+                } else {
+                    recover_clipped_pixel(r, g, b)
+                };
 
                 p[0] = rec_r.clamp(0.0, clamp_limit);
                 p[1] = rec_g.clamp(0.0, clamp_limit);
