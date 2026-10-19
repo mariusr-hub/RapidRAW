@@ -144,6 +144,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         transformedOriginalUrl: null,
         isRelightPickerActive: false,
         activeRelightLightId: null,
+        activeCenterMarker: null,
         previewOverride: null,
       });
 

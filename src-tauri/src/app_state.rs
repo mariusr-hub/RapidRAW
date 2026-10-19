@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use wgpu::{Texture, TextureView};
 
 use crate::ai_processing::AiState;
+use crate::as_shot::AsShot;
 use crate::cache_utils::DecodedImageCache;
 use crate::camera_tethering::CameraSession;
 use crate::gpu_processing::GpuProcessor;
@@ -20,7 +21,6 @@ use crate::image_processing::GpuContext;
 use crate::launch_request::ExternalEditSession;
 use crate::lens_correction::LensDatabase;
 use crate::lut_processing::Lut;
-use crate::white_balance::WhiteBalance;
 
 pub struct AiTaskToken {
     cancelled: AtomicBool,
@@ -110,7 +110,7 @@ pub struct LoadedImage {
     pub image: Arc<DynamicImage>,
     pub is_raw: bool,
     pub screen_proxy: Option<Arc<DynamicImage>>,
-    pub as_shot_white_balance: WhiteBalance,
+    pub as_shot: AsShot,
 }
 
 #[derive(Clone)]
@@ -214,7 +214,8 @@ impl MetadataManager {
 }
 
 pub type ThumbnailGeometryEntry = (u64, Arc<DynamicImage>, f32);
-pub type TransformedImageCache = (u64, Arc<DynamicImage>, (f32, f32));
+pub type TransformedImageCache = (u64, Arc<DynamicImage>, f32, (f32, f32));
+pub type TransformedPreview = (Arc<DynamicImage>, f32, (f32, f32));
 
 pub struct AppState {
     pub window_setup_complete: AtomicBool,
@@ -251,7 +252,10 @@ pub struct AppState {
     pub lens_db: Mutex<Option<Arc<LensDatabase>>>,
     pub load_image_generation: Arc<AtomicUsize>,
     pub full_warped_cache: Mutex<Option<(u64, Arc<DynamicImage>)>>,
+    pub patched_cache: Mutex<Option<(u64, Arc<DynamicImage>)>>,
     pub patched_warped_cache: Mutex<Option<(u64, Arc<DynamicImage>)>>,
+    pub working_cache: Mutex<Option<(u64, Arc<DynamicImage>)>>,
+    pub effects_cache: Mutex<Option<(u64, Arc<DynamicImage>)>>,
     pub full_transformed_cache: Mutex<Option<TransformedImageCache>>,
     pub decoded_image_cache: Mutex<DecodedImageCache>,
     pub thumbnail_manager: Arc<ThumbnailManager>,

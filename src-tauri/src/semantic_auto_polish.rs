@@ -445,7 +445,7 @@ pub fn analyze_and_polish_active_image(
     let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
     if let Some(loaded_image) = &*orig_guard {
         let (scene, confidence) = detect_semantic_scene(&loaded_image.image);
-        let base_analysis = perform_auto_analysis(&loaded_image.image);
+        let base_analysis = perform_auto_analysis(&loaded_image.image, 0.0);
 
         let horizon_angle = if straighten {
             let horizon = detect_horizon_angle(&loaded_image.image);
@@ -552,7 +552,7 @@ pub async fn batch_polish_photoshoot(
                 let thumb = image.thumbnail(256, 256).to_rgb8();
                 let sharpness = compute_fast_sharpness(&thumb);
                 let (scene, _) = detect_semantic_scene(&image);
-                let base_analysis = perform_auto_analysis(&image);
+                let base_analysis = perform_auto_analysis(&image, 0.0);
 
                 let mut sum_luma = 0.0f32;
                 let mut sum_ok_a = 0.0f32;

@@ -1,4 +1,3 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, GenericImageView};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -77,13 +76,7 @@ pub fn apply_fog<'a>(
     image: Cow<'a, DynamicImage>,
     adjustments: &serde_json::Value,
 ) -> Cow<'a, DynamicImage> {
-    let effects_visible = adjustments
-        .get("sectionVisibility")
-        .and_then(|v| v.get("effects"))
-        .and_then(|s| s.as_bool())
-        .unwrap_or(true);
-
-    if !adjustments["fogEnabled"].as_bool().unwrap_or(false) || !effects_visible {
+    if !crate::image_processing::is_effect_enabled(adjustments, "fog", "fogEnabled") {
         return image;
     }
 
@@ -116,16 +109,8 @@ pub fn apply_fog<'a>(
     let flip_horizontal = adjustments["flipHorizontal"].as_bool().unwrap_or(false);
     let flip_vertical = adjustments["flipVertical"].as_bool().unwrap_or(false);
 
-    let b64_data = match depth_b64.find(',') {
-        Some(idx) => &depth_b64[idx + 1..],
-        None => depth_b64,
-    };
-    let depth_map = match BASE64
-        .decode(b64_data)
-        .ok()
-        .and_then(|decoded| image::load_from_memory(&decoded).ok())
-    {
-        Some(img) => img.into_luma8(),
+    let depth_map = match crate::effect_maps::resolve_luma_map(depth_b64, adjustments) {
+        Some(map) => map,
         None => return image,
     };
     let (dw, dh) = (depth_map.width() as usize, depth_map.height() as usize);

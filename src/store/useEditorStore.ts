@@ -6,6 +6,8 @@ import { ImageDimensions } from '../hooks/useImageRenderSize';
 import { ToolType } from '../components/panel/right/Masks';
 import { OverlayMode } from '../components/panel/right/CropPanel';
 
+export type CenterMarker = 'vignette' | 'centre';
+
 export interface InteractivePatch {
   url: string;
   normX: number;
@@ -74,11 +76,13 @@ interface EditorState {
   overlayMode: OverlayMode;
   overlayRotation: number;
   isStraightenActive: boolean;
+  isAutoStraightening: boolean;
   isWbPickerActive: boolean;
   isTatActive: boolean;
   tatMode: 'hsl_hue' | 'hsl_sat' | 'hsl_lum' | 'curve' | 'exposure' | null;
   isRelightPickerActive: boolean;
   activeRelightLightId: string | null;
+  activeCenterMarker: CenterMarker | null;
   isGuidedPerspectiveActive: boolean;
   liveRotation: number | null;
   brushSettings: BrushSettings | null;
@@ -91,6 +95,7 @@ interface EditorState {
   isMaskControlHovered: boolean;
   isGeneratingAiMask: boolean;
   isGeneratingAi: boolean;
+  aiDenoiseProgress: Record<string, number>;
   isAIConnectorConnected: boolean;
   hasRenderedFirstFrame: boolean;
   patchesSentToBackend: Set<string>;
@@ -147,11 +152,13 @@ export const useEditorStore = create<EditorState>((set) => ({
   overlayRotation: 0,
   transformedOriginalUrl: null,
   isStraightenActive: false,
+  isAutoStraightening: false,
   isWbPickerActive: false,
   isTatActive: false,
   tatMode: null,
   isRelightPickerActive: false,
   activeRelightLightId: null,
+  activeCenterMarker: null,
   isGuidedPerspectiveActive: false,
   liveRotation: null,
 
@@ -163,6 +170,7 @@ export const useEditorStore = create<EditorState>((set) => ({
   isGeneratingAiMask: false,
   isAIConnectorConnected: false,
   isGeneratingAi: false,
+  aiDenoiseProgress: {},
   isMaskControlHovered: false,
   hasRenderedFirstFrame: false,
   patchesSentToBackend: new Set<string>(),

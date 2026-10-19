@@ -343,7 +343,7 @@ pub async fn preview_denoised_roi(
             &_state.ai_state,
             &_state.ai_init_lock,
         ).await {
-            match crate::ai_processing::run_ai_denoise(&crop_for_denoiser, intensity, &model_arc, &app_handle) {
+            match crate::ai_processing::run_ai_denoise(&crop_for_denoiser, intensity, &model_arc, &|_| {}) {
                 Ok(dyn_res) => dyn_res,
                 Err(_) => run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle),
             }
@@ -1523,7 +1523,12 @@ fn denoise_image(
             &rgb_img_for_denoiser,
             intensity,
             &session_arc,
-            &app_handle,
+            &|progress| {
+                let _ = app_handle.emit(
+                    "denoise-progress",
+                    format!("Denoising… {:.0}%", progress * 100.0),
+                );
+            },
         )
         .map_err(|e| e.to_string())?
     } else {

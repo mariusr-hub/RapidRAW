@@ -290,7 +290,17 @@ export interface CullingModalState {
   pathsToCull: Array<string>;
 }
 
-interface UIState {
+
+
+export const isPanelVisible = (state: UIState, panel: Panel) =>
+  (Object.keys(state.activePanels) as PanelRegion[]).some(
+    (region) =>
+      state.activePanels[region] === panel &&
+      state.uiVisibility[region.startsWith('left') ? 'leftPanel' : 'rightPanel'],
+  );
+
+export interface UIState {
+  cropSectionsState: CropSectionsState;
   activeView: string;
   isFullScreen: boolean;
   isWindowFullScreen: boolean;
@@ -365,6 +375,7 @@ interface UIState {
   setImageSelectHandler: (handler: ((path: string, openInEditor?: boolean) => void) | null) => void;
   searchFocusRequest: number;
   requestSearchFocus: () => void;
+  toggleFullScreen: () => void;
   resetWorkspaceLayout: (isTetheringSupported?: boolean) => WorkspaceState;
 }
 
@@ -414,6 +425,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   renderedPanel: Panel.Adjustments,
   slideDirection: 1,
   collapsibleSectionsState: { basic: true, color: false, curves: true, details: false, effects: false },
+  cropSectionsState: { transform: false, lens: false } as CropSectionsState,
 
   isCreateFolderModalOpen: false,
   isRenameFolderModalOpen: false,
@@ -614,6 +626,25 @@ export const useUIStore = create<UIState>((set, get) => ({
       }
     }
     if (targetRegion) state.setActivePanel(targetRegion, panelId);
+  },
+
+  toggleFullScreen: () => {
+    const { isFullScreen } = get();
+    const { zoom, selectedImage } = useEditorStore.getState();
+
+    const isNotFitToScreen = Math.abs(zoom - 1) > 0.01;
+    set({ isInstantTransition: isNotFitToScreen });
+
+    if (isFullScreen) {
+      set({ isFullScreen: false });
+    } else {
+      if (!selectedImage) return;
+      set({ isFullScreen: true });
+    }
+
+    if (isNotFitToScreen) {
+      setTimeout(() => set({ isInstantTransition: false }), 100);
+    }
   },
 
   resetWorkspaceLayout: (isTetheringSupported = false) => {

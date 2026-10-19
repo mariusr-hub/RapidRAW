@@ -225,7 +225,7 @@ pub fn run_stock_photo_prep_batch(
 
         if !has_user_adjustments {
             // Apply Commercial Auto-Polish Baseline (Punchy tone curve, dynamic range recovery, skin locus guard)
-            let base_auto = perform_auto_analysis(&dyn_img);
+            let base_auto = perform_auto_analysis(&dyn_img, 0.0);
             let semantic_adj = generate_semantic_adjustments(
                 scene,
                 &base_auto,
@@ -549,6 +549,8 @@ fn save_commercial_jpeg(
             "jpg",
             true,
             true, // strip GPS & private tags for stock compliance
+            &crate::exif_processing::ExportXmp::default(),
+            None,
         );
         let _ = fs::write(out_path, jpeg_bytes);
     } else {

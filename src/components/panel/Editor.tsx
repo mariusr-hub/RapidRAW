@@ -3,23 +3,30 @@ import { Crop, PercentCrop } from 'react-image-crop';
 import { Loader2 } from 'lucide-react';
 import clsx from 'clsx';
 import { invoke } from '@tauri-apps/api/core';
-import { toast } from 'react-toastify';
-import debounce from 'lodash.debounce';
 
 import { ImageDimensions, RenderSize, useImageRenderSize } from '../../hooks/useImageRenderSize';
-import { Adjustments, AiPatch, MaskContainer } from '../../utils/adjustments';
-import { calculateCenteredCrop, rotateCropCenter } from '../../utils/cropUtils';
+import { Adjustments, AiPatch, MaskContainer, INITIAL_ADJUSTMENTS } from '../../utils/adjustments';
+import {
+  calculateCenteredCrop,
+  getOrientedDimensions,
+  isCropWithinBounds,
+  calculateStraightenAngle,
+  calculateAutoCropForRotation,
+  fitCropTowards,
+  moveCropInsideBounds,
+  zoomCrop,
+  normalizeCropChange,
+} from '../../utils/cropUtils';
 import EditorToolbar from './editor/EditorToolbar';
 import ImageCanvas from './editor/ImageCanvas';
 import { Mask, SubMask } from './right/Masks';
 import { Panel, TransformState, Invokes } from '../ui/AppProperties';
-import Text from '../ui/Text';
-import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { useEditorStore } from '../../store/useEditorStore';
 import { useSettingsStore } from '../../store/useSettingsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useAiMasking } from '../../hooks/useAiMasking';
+import { useEditorActions, withRotation } from '../../hooks/useEditorActions';
 
 const parseRgb = (rgbStr: string): [number, number, number, number] => {
   const match = rgbStr.match(/[\d.]+/g);
@@ -28,6 +35,8 @@ const parseRgb = (rgbStr: string): [number, number, number, number] => {
   }
   return [0, 0, 0, 1.0];
 };
+
+const NEUTRAL_GREY_RGB: [number, number, number, number] = [128 / 255, 128 / 255, 128 / 255, 1.0];
 
 const checkCropValid = (pixelCrop: Partial<Crop>, imageW: number, imageH: number, rotation: number) => {
   if (pixelCrop.x === undefined || pixelCrop.y === undefined || !pixelCrop.width || !pixelCrop.height) {
@@ -90,7 +99,6 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const adjustmentsHistoryIndex = useEditorStore((s) => s.historyIndex);
   const finalPreviewUrl = useEditorStore((s) => s.finalPreviewUrl);
   const uncroppedAdjustedPreviewUrl = useEditorStore((s) => s.uncroppedAdjustedPreviewUrl);
-  const transformedOriginalUrl = useEditorStore((s) => s.transformedOriginalUrl);
   const interactivePatch = useEditorStore((s) => s.interactivePatch);
   const showOriginal = useEditorStore((s) => s.showOriginal);
   const isSliderDragging = useEditorStore((s) => s.isSliderDragging);
@@ -101,8 +109,6 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const overlayRotation = useEditorStore((s) => s.overlayRotation);
   const isStraightenActive = useEditorStore((s) => s.isStraightenActive);
   const isWbPickerActive = useEditorStore((s) => s.isWbPickerActive);
-  const isTatActive = useEditorStore((s) => s.isTatActive);
-  const tatMode = useEditorStore((s) => s.tatMode);
   const isRelightPickerActive = useEditorStore((s) => s.isRelightPickerActive);
   const liveRotation = useEditorStore((s) => s.liveRotation);
   const brushSettings = useEditorStore((s) => s.brushSettings);
@@ -112,36 +118,27 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const activeAiSubMaskId = useEditorStore((s) => s.activeAiSubMaskId);
   const isMaskControlHovered = useEditorStore((s) => s.isMaskControlHovered);
   const hasRenderedFirstFrame = useEditorStore((s) => s.hasRenderedFirstFrame);
+  const transformedOriginalUrl = useEditorStore((s) => s.transformedOriginalUrl);
+  const isTatActive = useEditorStore((s) => s.isTatActive);
+  const tatMode = useEditorStore((s) => s.tatMode);
 
   const setEditor = useEditorStore((s) => s.setEditor);
+  const toggleFullScreen = useUIStore((s) => s.toggleFullScreen);
   const undo = useEditorStore((s) => s.undo);
   const redo = useEditorStore((s) => s.redo);
   const goToHistoryIndex = useEditorStore((s) => s.goToHistoryIndex);
-  const pushHistory = useEditorStore((s) => s.pushHistory);
   const canUndo = adjustmentsHistoryIndex > 0;
   const canRedo = adjustmentsHistoryIndex < adjustmentsHistory.length - 1;
 
   const isAndroid = osPlatform === 'android';
 
-  const debouncedSetHistory = useMemo(() => debounce((newAdj: Adjustments) => pushHistory(newAdj), 500), [pushHistory]);
-
-  const setAdjustments = useCallback(
-    (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)) => {
-      setEditor((state) => {
-        const prevAdjustments = state.adjustments;
-        const newAdjustments = typeof value === 'function' ? value(prevAdjustments) : { ...prevAdjustments, ...value };
-        debouncedSetHistory(newAdjustments);
-        return { adjustments: newAdjustments };
-      });
-    },
-    [debouncedSetHistory, setEditor],
-  );
-
-  const { handleGenerateAiMask, handleQuickErase, handleManualCleanup } = useAiMasking();
+  const { handleGenerateAiMask, handleQuickErase, handleDirectPatch } = useAiMasking();
+  const { setAdjustments, toggleShowOriginal } = useEditorActions();
 
   const [crop, setCrop] = useState<Crop | null>(null);
   const prevCropParams = useRef<any>(null);
   const lastValidCropRef = useRef<PercentCrop | null>(null);
+  const cropResizeStartRef = useRef<PercentCrop | null>(null);
 
   const [isMaskHovered, setIsMaskHovered] = useState(false);
   const [isMaskTouchInteracting, setIsMaskTouchInteracting] = useState(false);
@@ -150,9 +147,17 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const [maskOverlayUrl, setMaskOverlayUrl] = useState<string | null>(null);
   const [transformState, setTransformState] = useState<TransformState>({ scale: 1, positionX: 0, positionY: 0 });
 
+  const [isShiftPressed, setIsShiftPressed] = useState(false);
+  const [straightenDragLine, setStraightenDragLine] = useState<{
+    start: { x: number; y: number };
+    end: { x: number; y: number };
+  } | null>(null);
+  const straightenDragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const straightenDragCurrentRef = useRef<{ x: number; y: number } | null>(null);
+  const isStraightenDraggingRef = useRef(false);
+
   const imageContainerRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const isInitialMount = useRef(true);
   const transformStateRef = useRef<TransformState>(transformState);
   transformStateRef.current = transformState;
   const [isPanningState, setIsPanningState] = useState(false);
@@ -192,56 +197,107 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const wgpuSyncRef = useRef<number | null>(null);
   const lastWgpuTransformRef = useRef<string | null>(null);
 
-  const toggleShowOriginal = useCallback(
-    () => setEditor((state) => ({ showOriginal: !state.showOriginal })),
-    [setEditor],
-  );
+  const [isCtrlPressed, setIsCtrlPressed] = useState(false);
+  const isCtrlPressedRef = useRef(false);
 
-  const handleToggleFullScreen = useCallback(() => {
-    const currentlyZoomed = targetZoom > 1.01;
-    setUI({ isInstantTransition: currentlyZoomed });
+  const isCropPanningRef = useRef(false);
+  const cropPanStartRef = useRef<{ x: number; y: number } | null>(null);
+  const cropPanStartCropRef = useRef<Crop | null>(null);
+  const cropWheelTimeoutRef = useRef<number | null>(null);
+  const lastCtrlClickTimeRef = useRef<number>(0);
 
-    if (isFullScreen) {
-      setUI({ isFullScreen: false });
-    } else {
-      if (selectedImage) setUI({ isFullScreen: true });
-    }
+  const getEffectiveCrop = useCallback(() => {
+    if (!selectedImage) return null;
+    const orientationSteps = adjustments.orientationSteps || 0;
+    const { width: W, height: H } = getOrientedDimensions(selectedImage.width, selectedImage.height, orientationSteps);
+    const rotation = liveRotation !== null && liveRotation !== undefined ? liveRotation : adjustments.rotation || 0;
+    return (
+      adjustments.crop ??
+      calculateCenteredCrop(
+        selectedImage.width,
+        selectedImage.height,
+        orientationSteps,
+        adjustments.aspectRatio || W / H,
+        rotation,
+      ) ?? { unit: 'px', x: 0, y: 0, width: W, height: H }
+    );
+  }, [
+    selectedImage,
+    adjustments.crop,
+    adjustments.orientationSteps,
+    adjustments.aspectRatio,
+    adjustments.rotation,
+    liveRotation,
+  ]);
 
-    if (currentlyZoomed) {
-      setTimeout(() => setUI({ isInstantTransition: false }), 100);
-    }
-  }, [isFullScreen, selectedImage, targetZoom, setUI]);
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        setIsShiftPressed(true);
+      }
+      if (e.key === 'Control' || e.key === 'Meta') {
+        setIsCtrlPressed(true);
+        isCtrlPressedRef.current = true;
+      }
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        setIsShiftPressed(false);
+      }
+      if (e.key === 'Control' || e.key === 'Meta') {
+        setIsCtrlPressed(false);
+        isCtrlPressedRef.current = false;
+      }
+    };
+    const handleBlur = () => {
+      setIsShiftPressed(false);
+      setIsCtrlPressed(false);
+      isCtrlPressedRef.current = false;
+
+      if (isCropPanningRef.current) {
+        isCropPanningRef.current = false;
+        setEditor({ isSliderDragging: false });
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    const clearCropResizeStart = () => {
+      cropResizeStartRef.current = null;
+    };
+
+    window.addEventListener('pointerup', clearCropResizeStart);
+    window.addEventListener('pointercancel', clearCropResizeStart);
+    return () => {
+      window.removeEventListener('pointerup', clearCropResizeStart);
+      window.removeEventListener('pointercancel', clearCropResizeStart);
+    };
+  }, []);
 
   const handleDisplaySizeChange = useCallback(
     (size: RenderSize) => {
-      const state = useEditorStore.getState();
-      if (state.displaySize.width !== size.width || state.displaySize.height !== size.height) {
-        setEditor({ displaySize: { width: size.width, height: size.height } });
-      }
+      setEditor({ displaySize: { width: size.width, height: size.height } });
       if (size.scale) {
         const baseWidth = size.width / size.scale;
         const baseHeight = size.height / size.scale;
-        const curBase = state.baseRenderSize;
-        if (
-          !curBase ||
-          curBase.width !== baseWidth ||
-          curBase.height !== baseHeight ||
-          curBase.offsetX !== (size.offsetX || 0) ||
-          curBase.offsetY !== (size.offsetY || 0) ||
-          curBase.containerWidth !== (size.containerWidth || 0) ||
-          curBase.containerHeight !== (size.containerHeight || 0)
-        ) {
-          setEditor({
-            baseRenderSize: {
-              width: baseWidth,
-              height: baseHeight,
-              offsetX: size.offsetX || 0,
-              offsetY: size.offsetY || 0,
-              containerWidth: size.containerWidth || 0,
-              containerHeight: size.containerHeight || 0,
-            },
-          });
-        }
+        const newSize = {
+          width: baseWidth,
+          height: baseHeight,
+          offsetX: size.offsetX || 0,
+          offsetY: size.offsetY || 0,
+          containerWidth: size.containerWidth || 0,
+          containerHeight: size.containerHeight || 0,
+        };
+        setEditor({ baseRenderSize: newSize });
       }
     },
     [setEditor],
@@ -256,13 +312,10 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
   const handleStraighten = useCallback(
     (angleCorrection: number) => {
-      setAdjustments((prev: Adjustments) => {
-        const newRotation = (prev.rotation || 0) + angleCorrection;
-        return { ...prev, rotation: newRotation };
-      });
+      setAdjustments((prev: Adjustments) => withRotation(prev, selectedImage, (prev.rotation || 0) + angleCorrection));
       setEditor({ isStraightenActive: false });
     },
-    [setAdjustments, setEditor],
+    [selectedImage, setAdjustments, setEditor],
   );
 
   const updateSubMaskLocal = useCallback(
@@ -614,6 +667,10 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     return null;
   }, [adjustments.masks, adjustments.aiPatches, activeMaskId, activeAiSubMaskId, isMasking, isAiEditing]);
 
+  const isBrushActive = useMemo(() => {
+    return (isMasking || isAiEditing) && (activeSubMask?.type === Mask.Brush || activeSubMask?.type === Mask.Flow);
+  }, [isMasking, isAiEditing, activeSubMask?.type]);
+
   const isPanningDisabled =
     isMaskHovered ||
     isMaskTouchInteracting ||
@@ -629,6 +686,8 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       (activeSubMask?.type === Mask.Brush ||
         activeSubMask?.type === Mask.Flow ||
         activeSubMask?.type === Mask.Clone ||
+        activeSubMask?.type === Mask.Liquify ||
+        activeSubMask?.type === Mask.Retouch ||
         activeSubMask?.type === Mask.Heal ||
         activeSubMask?.type === Mask.AiSubject ||
         activeSubMask?.type === Mask.QuickEraser ||
@@ -637,34 +696,6 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         activeSubMask?.parameters?.isInitialDraw)) ||
     isWbPickerActive ||
     isRelightPickerActive;
-
-  const heldSpeedKeyRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-
-      const key = e.key.toLowerCase();
-      if (['q', 'w', 'e', 'r', 't', 'y', 'u'].includes(key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        heldSpeedKeyRef.current = key;
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      if (heldSpeedKeyRef.current === key) {
-        heldSpeedKeyRef.current = null;
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, []);
 
   useEffect(() => {
     const container = imageContainerRef.current;
@@ -675,49 +706,49 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
       if (physicsFrameId.current) cancelAnimationFrame(physicsFrameId.current);
 
-      // Speed-Edit Quick Dial Gesture
-      const activeSpeedKey = heldSpeedKeyRef.current;
-      if (activeSpeedKey && !e.ctrlKey && !e.metaKey) {
-        const stepDir = e.deltaY < 0 ? 1 : -1;
-        setAdjustments((prev: Adjustments) => {
-          switch (activeSpeedKey.toLowerCase()) {
-            case 'q': {
-              const next = Number(((prev.exposure ?? 0) + stepDir * 0.05).toFixed(2));
-              return { ...prev, exposure: Math.max(-5, Math.min(5, next)) };
-            }
-            case 'w': {
-              const next = Math.max(-100, Math.min(100, (prev.contrast ?? 0) + stepDir * 2));
-              return { ...prev, contrast: next };
-            }
-            case 'e': {
-              const next = Math.max(-100, Math.min(100, (prev.highlights ?? 0) + stepDir * 2));
-              return { ...prev, highlights: next };
-            }
-            case 'r': {
-              const next = Math.max(-100, Math.min(100, (prev.shadows ?? 0) + stepDir * 2));
-              return { ...prev, shadows: next };
-            }
-            case 't': {
-              const next = Math.max(2000, Math.min(12000, (prev.temperature ?? 5500) + stepDir * 50));
-              return { ...prev, temperature: next };
-            }
-            case 'y': {
-              const next = Math.max(-100, Math.min(100, (prev.tint ?? 0) + stepDir * 2));
-              return { ...prev, tint: next };
-            }
-            case 'u': {
-              const next = Math.max(-100, Math.min(100, (prev.saturation ?? 0) + stepDir * 2));
-              return { ...prev, saturation: next };
-            }
-            default:
-              return prev;
-          }
-        });
+      if (isCtrlPressedRef.current && selectedImage) {
+        const delta = e.deltaY !== 0 ? e.deltaY : e.deltaX;
+        const scaleFactor = delta > 0 ? 1.05 : 0.95;
+        const orientationSteps = adjustments.orientationSteps || 0;
+        const { width: W, height: H } = getOrientedDimensions(
+          selectedImage.width,
+          selectedImage.height,
+          orientationSteps,
+        );
+        const rotation = liveRotation !== null && liveRotation !== undefined ? liveRotation : adjustments.rotation || 0;
+        const baseCrop = getEffectiveCrop();
+
+        if (baseCrop) {
+          setEditor({ isSliderDragging: true });
+
+          const rect = container.getBoundingClientRect();
+          const clientX = e.clientX - rect.left;
+          const clientY = e.clientY - rect.top;
+
+          const canvasScale = transformStateRef.current.scale || 1;
+          const xUnscaled = (clientX - transformStateRef.current.positionX) / canvasScale;
+          const yUnscaled = (clientY - transformStateRef.current.positionY) / canvasScale;
+
+          const imgScale = imageRenderSizeRef.current.scale || 1;
+          const mouseX_cropped = (xUnscaled - imageRenderSizeRef.current.offsetX) / imgScale;
+          const mouseY_cropped = (yUnscaled - imageRenderSizeRef.current.offsetY) / imgScale;
+
+          const mouseX = baseCrop.x + mouseX_cropped;
+          const mouseY = baseCrop.y + mouseY_cropped;
+
+          const nextCrop = zoomCrop(baseCrop, scaleFactor, W, H, rotation, adjustments.aspectRatio, mouseX, mouseY);
+
+          setAdjustments((prev) => ({ ...prev, crop: nextCrop }));
+
+          if (cropWheelTimeoutRef.current) clearTimeout(cropWheelTimeoutRef.current);
+          cropWheelTimeoutRef.current = window.setTimeout(() => {
+            setEditor({ isSliderDragging: false });
+          }, 150);
+        }
         return;
       }
 
       const isPinch = e.ctrlKey;
-
       const isTrackpad = appSettings?.canvasInputMode === 'trackpad';
       let zoomSpeedMult = appSettings?.zoomSpeedMultiplier ?? 1.0;
 
@@ -796,11 +827,68 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     startPhysicsLoop,
     appSettings?.canvasInputMode,
     appSettings?.zoomSpeedMultiplier,
+    selectedImage,
+    adjustments.orientationSteps,
+    adjustments.rotation,
+    adjustments.aspectRatio,
+    liveRotation,
+    getEffectiveCrop,
+    setAdjustments,
   ]);
 
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       wasPanningDisabledOnDown.current = isPanningDisabled;
+
+      const isCropHandle = isCropping && e.button === 0 && !!(e.target as HTMLElement).closest('[data-ord]');
+      cropResizeStartRef.current = isCropHandle ? lastValidCropRef.current : null;
+
+      if (e.pointerType === 'mouse' && e.button === 0 && e.shiftKey && !isBrushActive && !isCropping) {
+        if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
+        if (physicsFrameId.current) cancelAnimationFrame(physicsFrameId.current);
+
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        straightenDragStartRef.current = { x, y };
+        straightenDragCurrentRef.current = { x, y };
+        isStraightenDraggingRef.current = false;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        return;
+      }
+
+      if (e.pointerType === 'mouse' && e.button === 0 && (e.ctrlKey || e.metaKey) && !isBrushActive) {
+        if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
+        if (physicsFrameId.current) cancelAnimationFrame(physicsFrameId.current);
+
+        const now = Date.now();
+        if (now - lastCtrlClickTimeRef.current < 300) {
+          lastCtrlClickTimeRef.current = 0;
+
+          setAdjustments((prev) => ({
+            ...prev,
+            crop: INITIAL_ADJUSTMENTS.crop,
+            rotation: INITIAL_ADJUSTMENTS.rotation ?? 0,
+            aspectRatio: INITIAL_ADJUSTMENTS.aspectRatio,
+          }));
+
+          setEditor({ liveRotation: null, isSliderDragging: false });
+          cropResizeStartRef.current = null;
+          return;
+        }
+
+        lastCtrlClickTimeRef.current = now;
+
+        if (isCropping) return;
+
+        isCropPanningRef.current = true;
+        cropPanStartRef.current = { x: e.clientX, y: e.clientY };
+        cropPanStartCropRef.current = getEffectiveCrop();
+        e.currentTarget.setPointerCapture(e.pointerId);
+
+        setEditor({ isSliderDragging: true });
+        return;
+      }
 
       if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 1) return;
 
@@ -833,7 +921,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
       if (e.pointerType === 'mouse') e.currentTarget.setPointerCapture(e.pointerId);
     },
-    [isPanningDisabled],
+    [isPanningDisabled, isBrushActive, isCropping, getEffectiveCrop],
   );
 
   useEffect(() => {
@@ -850,6 +938,45 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      if (straightenDragStartRef.current && e.pointerType === 'mouse') {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const dx = x - straightenDragStartRef.current.x;
+        const dy = y - straightenDragStartRef.current.y;
+
+        if (!isStraightenDraggingRef.current && Math.hypot(dx, dy) > 5) {
+          isStraightenDraggingRef.current = true;
+        }
+        if (isStraightenDraggingRef.current) {
+          straightenDragCurrentRef.current = { x, y };
+          setStraightenDragLine({ start: straightenDragStartRef.current, end: straightenDragCurrentRef.current });
+        }
+        return;
+      }
+
+      if (isCropPanningRef.current && cropPanStartRef.current && cropPanStartCropRef.current && selectedImage) {
+        const dx = e.clientX - cropPanStartRef.current.x;
+        const dy = e.clientY - cropPanStartRef.current.y;
+
+        const effectiveScale = (imageRenderSize.scale || 1) * (transformStateRef.current.scale || 1);
+        const imgDx = dx / effectiveScale;
+        const imgDy = dy / effectiveScale;
+
+        const orientationSteps = adjustments.orientationSteps || 0;
+        const { width: W, height: H } = getOrientedDimensions(
+          selectedImage.width,
+          selectedImage.height,
+          orientationSteps,
+        );
+        const rotation = liveRotation !== null && liveRotation !== undefined ? liveRotation : adjustments.rotation || 0;
+
+        const newCrop = moveCropInsideBounds(cropPanStartCropRef.current, -imgDx, -imgDy, W, H, rotation);
+
+        setAdjustments((prev) => ({ ...prev, crop: newCrop }));
+        return;
+      }
+
       if (!activePointers.current.has(e.pointerId)) return;
       activePointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
@@ -902,11 +1029,55 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         lastPinch.current = { dist, midX, midY };
       }
     },
-    [applyTransform, clampToBounds, getTransformBounds, isPanningDisabled, isPanningState],
+    [
+      applyTransform,
+      clampToBounds,
+      getTransformBounds,
+      isPanningDisabled,
+      isPanningState,
+      selectedImage,
+      adjustments.orientationSteps,
+      adjustments.rotation,
+      liveRotation,
+      imageRenderSize.scale,
+      setAdjustments,
+    ],
   );
 
   const handlePointerUp = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      if (straightenDragStartRef.current) {
+        if (isStraightenDraggingRef.current && straightenDragCurrentRef.current) {
+          const correction = calculateStraightenAngle(
+            straightenDragCurrentRef.current.x - straightenDragStartRef.current.x,
+            straightenDragCurrentRef.current.y - straightenDragStartRef.current.y,
+          );
+
+          handleStraighten(correction);
+        }
+
+        straightenDragStartRef.current = null;
+        straightenDragCurrentRef.current = null;
+        isStraightenDraggingRef.current = false;
+        setStraightenDragLine(null);
+
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+        return;
+      }
+
+      if (isCropPanningRef.current) {
+        isCropPanningRef.current = false;
+        cropPanStartRef.current = null;
+        cropPanStartCropRef.current = null;
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+        setEditor({ isSliderDragging: false });
+        return;
+      }
+
       activePointers.current.delete(e.pointerId);
 
       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -946,12 +1117,20 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         }
       }
     },
-    [getTransformBounds, startPhysicsLoop],
+    [getTransformBounds, startPhysicsLoop, handleStraighten],
   );
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
-      if (e.button !== 0) return;
+      if (
+        e.button !== 0 ||
+        e.shiftKey ||
+        e.ctrlKey ||
+        e.metaKey ||
+        straightenDragLine ||
+        isStraightenDraggingRef.current
+      )
+        return;
       if (isPanningDisabled || wasPanningDisabledOnDown.current) return;
 
       if (mouseDownPos.current) {
@@ -988,9 +1167,16 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
-        let zoomTarget = savedZoomState.current
-          ? savedZoomState.current.scale
-          : Math.min(currentScale * 2, maxScaleRef.current);
+        let zoomTarget = Math.min(currentScale * 2, maxScaleRef.current);
+
+        if (appSettings?.zoomPhotoToPixelClick) {
+          const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+          const scaleForCss100 = imageRenderSizeRef.current.scale ? 1 / imageRenderSizeRef.current.scale : 1;
+          const scaleForPhysical100 = scaleForCss100 / dpr;
+          zoomTarget = Math.max(1.05, Math.min(scaleForPhysical100, maxScaleRef.current));
+        } else {
+          zoomTarget = savedZoomState.current ? savedZoomState.current.scale : zoomTarget;
+        }
         const ratio = zoomTarget / currentScale;
 
         const newPositionX = mouseX - (mouseX - currentPositionX) * ratio;
@@ -999,18 +1185,8 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         animateTransform(newPositionX, newPositionY, zoomTarget, clickAnimationTime);
       }
     },
-    [isCropping, isMasking, isAiEditing, isWbPickerActive, animateTransform],
+    [isPanningDisabled, animateTransform, straightenDragLine, appSettings?.zoomPhotoToPixelClick],
   );
-
-  useEffect(() => {
-    if (isInitialMount.current) {
-      isInitialMount.current = false;
-      return;
-    }
-    if (showOriginal) {
-      setEditor({ showOriginal: false });
-    }
-  }, [adjustments, setEditor]);
 
   useEffect(() => {
     if (!isMasking && !isAiEditing) {
@@ -1030,7 +1206,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     const posOldX = transformStateRef.current.positionX;
     const posOldY = transformStateRef.current.positionY;
 
-    if (isInstantTransition && !transitionAnchorRef.current && scaleOld > 1.01) {
+    if (isInstantTransition && !transitionAnchorRef.current && Math.abs(scaleOld - 1) > 0.01) {
       transitionAnchorRef.current = {
         active: true,
         screenImageLeft: prevRenderState.current.containerLeft + posOldX + prevRenderState.current.offsetX * scaleOld,
@@ -1194,6 +1370,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     const rootStyle = getComputedStyle(document.documentElement);
     const bgPrimaryStr = rootStyle.getPropertyValue('--app-bg-primary') || 'rgb(24, 24, 24)';
     const bgSecondaryStr = rootStyle.getPropertyValue('--app-bg-secondary') || 'rgb(35, 35, 35)';
+    const isNeutralGrey = (appSettings as any)?.editorNeutralGreyBg ?? false;
 
     wgpuStateRef.current = {
       useWgpuRenderer: appSettings?.useWgpuRenderer,
@@ -1203,10 +1380,11 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       uncroppedAdjustedPreviewUrl,
       showOriginal,
       bgPrimary: parseRgb(bgPrimaryStr),
-      bgSecondary: parseRgb(bgSecondaryStr),
+      bgSecondary: isNeutralGrey ? NEUTRAL_GREY_RGB : parseRgb(bgSecondaryStr),
     };
   }, [
     appSettings?.useWgpuRenderer,
+    (appSettings as any)?.editorNeutralGreyBg,
     selectedImage?.isReady,
     hasRenderedFirstFrame,
     isCropping,
@@ -1220,6 +1398,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     syncWgpuRef.current();
   }, [
     appSettings?.useWgpuRenderer,
+    (appSettings as any)?.editorNeutralGreyBg,
     selectedImage?.isReady,
     hasRenderedFirstFrame,
     isCropping,
@@ -1509,7 +1688,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   }, [showSpinner]);
 
   useEffect(() => {
-    if (!isCropping || !selectedImage?.width) {
+    if (!isCropping || !selectedImage?.width || !selectedImage?.height) {
       return;
     }
 
@@ -1525,12 +1704,14 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     const needsRecalc = currentAdjCrop === null || geometryChanged || isDraggingRotation;
 
     if (needsRecalc) {
-      const isSwapped = orientationSteps === 1 || orientationSteps === 3;
-      const W = isSwapped ? selectedImage.height : selectedImage.width;
-      const H = isSwapped ? selectedImage.width : selectedImage.height;
-      const A = aspectRatio || W / H;
+      const { width: W, height: H } = getOrientedDimensions(
+        selectedImage.width,
+        selectedImage.height,
+        orientationSteps,
+      );
+      const A = aspectRatio || (W > 0 && H > 0 ? W / H : 1);
 
-      let nextPixelCrop = currentAdjCrop;
+      let nextPixelCrop: Crop | null;
       const aspectChanged = prevCropParams.current?.aspectRatio !== aspectRatio;
       const orientationChanged = prevCropParams.current?.orientationSteps !== orientationSteps;
       const rotationChanged = prevCropParams.current?.rotation !== rotation || isDraggingRotation;
@@ -1566,7 +1747,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
           effectiveRotation,
         );
       } else if (aspectChanged) {
-        if (!aspectRatio) {
+        if (aspectRatio === null) {
           nextPixelCrop = currentAdjCrop;
         } else {
           const curW = currentAdjCrop.width;
@@ -1591,7 +1772,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
           };
         }
 
-        if (!checkCropValid(nextPixelCrop, W, H, effectiveRotation)) {
+        if (!isCropWithinBounds(nextPixelCrop, W, H, effectiveRotation)) {
           nextPixelCrop = calculateCenteredCrop(
             selectedImage.width,
             selectedImage.height,
@@ -1610,85 +1791,52 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         );
       } else {
         const referenceRotation = prevCropParams.current?.rotation ?? rotation;
-        const rotationDelta = effectiveRotation - referenceRotation;
-        const followedCrop =
-          rotationChanged && rotationDelta !== 0
-            ? rotateCropCenter(currentAdjCrop, W, H, rotationDelta)
-            : currentAdjCrop;
+        const rotationDelta = rotationChanged ? effectiveRotation - referenceRotation : 0;
 
-        if (checkCropValid(followedCrop, W, H, effectiveRotation)) {
-          nextPixelCrop = followedCrop;
-        } else {
-          let low = 0.1;
-          let high = 1.0;
-          let bestCrop = followedCrop;
-
-          for (let i = 0; i < 10; i++) {
-            let mid = (low + high) / 2;
-            let cx = followedCrop.x + followedCrop.width / 2;
-            let cy = followedCrop.y + followedCrop.height / 2;
-            let nw = followedCrop.width * mid;
-            let nh = followedCrop.height * mid;
-            let testCrop = {
-              unit: 'px' as const,
-              x: cx - nw / 2,
-              y: cy - nh / 2,
-              width: nw,
-              height: nh,
-            };
-
-            if (checkCropValid(testCrop, W, H, effectiveRotation)) {
-              bestCrop = testCrop;
-              low = mid;
-            } else {
-              high = mid;
-            }
-          }
-
-          if (low < 0.15) {
-            nextPixelCrop = calculateCenteredCrop(
-              selectedImage.width,
-              selectedImage.height,
-              orientationSteps,
-              A,
-              effectiveRotation,
-            );
-          } else {
-            nextPixelCrop = {
-              unit: 'px',
-              x: Math.ceil(bestCrop.x),
-              y: Math.ceil(bestCrop.y),
-              width: Math.floor(bestCrop.width),
-              height: Math.floor(bestCrop.height),
-            };
-          }
-        }
+        nextPixelCrop = calculateAutoCropForRotation(
+          selectedImage.width,
+          selectedImage.height,
+          orientationSteps,
+          A,
+          effectiveRotation,
+          currentAdjCrop,
+          rotationDelta,
+        );
       }
 
-      if (isDraggingRotation) {
-        if (nextPixelCrop) {
-          const pc: PercentCrop = {
-            unit: '%',
-            x: (nextPixelCrop.x / W) * 100,
-            y: (nextPixelCrop.y / H) * 100,
-            width: (nextPixelCrop.width / W) * 100,
-            height: (nextPixelCrop.height / H) * 100,
-          };
-          setCrop(pc);
-          lastValidCropRef.current = pc;
-        }
-      } else {
+      if (nextPixelCrop) {
+        const pc: PercentCrop = {
+          unit: '%',
+          x: (nextPixelCrop.x / W) * 100,
+          y: (nextPixelCrop.y / H) * 100,
+          width: (nextPixelCrop.width / W) * 100,
+          height: (nextPixelCrop.height / H) * 100,
+        };
+        setCrop(pc);
+        lastValidCropRef.current = pc;
+      }
+      if (!isDraggingRotation) {
         prevCropParams.current = { rotation, aspectRatio, orientationSteps };
 
+        const normalizedCrop = normalizeCropChange(
+          currentAdjCrop,
+          nextPixelCrop,
+          selectedImage.width,
+          selectedImage.height,
+          orientationSteps,
+          rotation,
+        );
+
         if (
-          nextPixelCrop &&
-          (!currentAdjCrop ||
-            Math.abs(currentAdjCrop.x - nextPixelCrop.x) > 1 ||
-            Math.abs(currentAdjCrop.y - nextPixelCrop.y) > 1 ||
-            Math.abs(currentAdjCrop.width - nextPixelCrop.width) > 1 ||
-            Math.abs(currentAdjCrop.height - nextPixelCrop.height) > 1)
+          normalizedCrop !== currentAdjCrop &&
+          (!normalizedCrop ||
+            !currentAdjCrop ||
+            Math.abs(currentAdjCrop.x - normalizedCrop.x) > 1 ||
+            Math.abs(currentAdjCrop.y - normalizedCrop.y) > 1 ||
+            Math.abs(currentAdjCrop.width - normalizedCrop.width) > 1 ||
+            Math.abs(currentAdjCrop.height - normalizedCrop.height) > 1)
         ) {
-          setAdjustments((prev: Adjustments) => ({ ...prev, crop: nextPixelCrop }));
+          setAdjustments((prev: Adjustments) => ({ ...prev, crop: normalizedCrop }));
         }
       }
     }
@@ -1758,6 +1906,31 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         width: (pc.width / 100) * W,
         height: (pc.height / 100) * H,
       });
+
+      const resizeStart = cropResizeStartRef.current;
+      if (resizeStart && isCtrlPressedRef.current) {
+        const width = 2 * percentCrop.width - resizeStart.width;
+        const height = 2 * percentCrop.height - resizeStart.height;
+        if (width < minPctW || height < minPctH) {
+          return;
+        }
+
+        const centered: PercentCrop = {
+          unit: '%',
+          x: resizeStart.x + resizeStart.width / 2 - width / 2,
+          y: resizeStart.y + resizeStart.height / 2 - height / 2,
+          width,
+          height,
+        };
+
+        const nextCrop = fitCropTowards(resizeStart, centered, (candidate: any) =>
+          checkCropValid(toPixel(candidate), W, H, rotation),
+        );
+
+        setCrop(nextCrop);
+        lastValidCropRef.current = nextCrop;
+        return;
+      }
 
       if (checkCropValid(toPixel(percentCrop), W, H, rotation)) {
         setCrop(percentCrop);
@@ -1859,7 +2032,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
       const lastRatio = oldW / oldH;
       const newRatio = newW / newH;
-      const isProportional = adjustments.aspectRatio || Math.abs(lastRatio - newRatio) < 0.005;
+      const isProportional = adjustments.aspectRatio !== null || Math.abs(lastRatio - newRatio) < 0.005;
 
       if (isProportional) {
         const oldCX = oldL + oldW / 2;
@@ -2026,8 +2199,16 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       };
 
       setAdjustments((prev: Adjustments) => {
-        if (JSON.stringify(newPixelCrop) !== JSON.stringify(prev.crop)) {
-          return { ...prev, crop: newPixelCrop };
+        const nextCrop = normalizeCropChange(
+          prev.crop,
+          newPixelCrop,
+          selectedImage.width,
+          selectedImage.height,
+          orientationSteps,
+          prev.rotation,
+        );
+        if (nextCrop !== prev.crop) {
+          return { ...prev, crop: nextCrop };
         }
         return prev;
       });
@@ -2043,7 +2224,11 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const isMaxZoom = transformState.scale >= maxScaleRef.current - 0.5;
 
   let cursorStyle = 'default';
-  if (isPanningState && isMiddleMousePanning.current) {
+  if ((isShiftPressed && !isCropping) || straightenDragLine) {
+    cursorStyle = 'crosshair';
+  } else if (isCtrlPressed && !isBrushActive && !isCropping) {
+    cursorStyle = isCropPanningRef.current ? 'grabbing' : 'move';
+  } else if (isPanningState && isMiddleMousePanning.current) {
     cursorStyle = 'grabbing';
   } else if (isZoomActionActive) {
     if (isPanningState) {
@@ -2085,7 +2270,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
           onBackToLibrary={onBackToLibrary}
           onImageSelect={onImageSelect}
           onRedo={redo}
-          onToggleFullScreen={handleToggleFullScreen}
+          onToggleFullScreen={toggleFullScreen}
           onToggleShowOriginal={toggleShowOriginal}
           onUndo={undo}
           selectedImage={selectedImage}
@@ -2103,12 +2288,12 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
           'flex-1 relative overflow-hidden touch-none',
           isFullScreen ? 'rounded-none' : 'rounded-lg',
           appSettings?.useWgpuRenderer !== false && !isFullScreen && 'ring-[9999px] ring-bg-secondary',
-          !isWgpuActive && 'bg-bg-secondary',
+          !isWgpuActive && ((appSettings as any)?.editorNeutralGreyBg ? 'bg-[#808080]' : 'bg-bg-secondary'),
         )}
         style={{ cursor: cursorStyle }}
         onContextMenu={onContextMenu}
         ref={imageContainerRef}
-        onPointerDown={handlePointerDown}
+        onPointerDownCapture={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
@@ -2132,60 +2317,71 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
             transform: `translate(${transformState.positionX}px, ${transformState.positionY}px) scale(${transformState.scale})`,
           }}
         >
-          {selectedImage && (
-            <ImageCanvas
-              appSettings={appSettings}
-              activeAiPatchContainerId={activeAiPatchContainerId}
-              activeAiSubMaskId={activeAiSubMaskId}
-              activeMaskContainerId={activeMaskContainerId}
-              activeMaskId={activeMaskId}
-              adjustments={adjustments}
-              brushSettings={brushSettings}
-              crop={crop}
-              finalPreviewUrl={finalPreviewUrl}
-              handleCropComplete={handleCropComplete}
-              imageRenderSize={imageRenderSize}
-              interactivePatch={interactivePatch}
-              isAiEditing={isAiEditing}
-              isCropping={isCropping}
-              isMaskControlHovered={isMaskControlHovered}
-              isMasking={isMasking}
-              isStraightenActive={isStraightenActive}
-              isRotationActive={isRotationActive}
-              isSliderDragging={isSliderDragging}
-              maskOverlayUrl={maskOverlayUrl}
-              onGenerateAiMask={handleGenerateAiMask}
-              onSelectAiPatchContainer={(id) => setEditor({ activeAiPatchContainerId: id })}
-              onSelectMaskContainer={(id) => setEditor({ activeMaskContainerId: id })}
-              onLiveMaskPreview={handleLiveMaskPreview}
-              onManualCleanup={handleManualCleanup}
-              onQuickErase={handleQuickErase}
-              onSelectAiSubMask={(id) => setEditor({ activeAiSubMaskId: id })}
-              onSelectMask={(id) => setEditor({ activeMaskId: id })}
-              onStraighten={handleStraighten}
-              selectedImage={selectedImage}
-              setCrop={handleCropChange}
-              setIsMaskHovered={setIsMaskHovered}
-              setIsMaskTouchInteracting={setIsMaskTouchInteracting}
-              showOriginal={showOriginal}
-              transformedOriginalUrl={transformedOriginalUrl}
-              uncroppedAdjustedPreviewUrl={uncroppedAdjustedPreviewUrl}
-              updateSubMask={updateSubMaskLocal}
-              isWbPickerActive={isWbPickerActive}
-              isTatActive={isTatActive}
-              tatMode={tatMode}
-              onWbPicked={handleWbPicked}
-              setAdjustments={setAdjustments}
-              overlayRotation={overlayRotation}
-              overlayMode={overlayMode}
-              cursorStyle={cursorStyle}
-              isMaxZoom={isMaxZoom}
-              liveRotation={liveRotation}
-              transformState={transformState}
-              hasRenderedFirstFrame={hasRenderedFirstFrame}
-            />
-          )}
+          <ImageCanvas
+            appSettings={appSettings}
+            activeAiPatchContainerId={activeAiPatchContainerId}
+            activeAiSubMaskId={activeAiSubMaskId}
+            activeMaskContainerId={activeMaskContainerId}
+            activeMaskId={activeMaskId}
+            adjustments={adjustments}
+            brushSettings={brushSettings}
+            crop={crop}
+            finalPreviewUrl={finalPreviewUrl}
+            handleCropComplete={handleCropComplete}
+            imageRenderSize={imageRenderSize}
+            interactivePatch={interactivePatch}
+            isAiEditing={isAiEditing}
+            isCropping={isCropping}
+            isMaskControlHovered={isMaskControlHovered}
+            isMasking={isMasking}
+            isStraightenActive={isStraightenActive}
+            isRotationActive={isRotationActive}
+            isSliderDragging={isSliderDragging}
+            maskOverlayUrl={maskOverlayUrl}
+            onGenerateAiMask={handleGenerateAiMask}
+            onSelectAiPatchContainer={(id) => setEditor({ activeAiPatchContainerId: id })}
+            onSelectMaskContainer={(id) => setEditor({ activeMaskContainerId: id })}
+            onLiveMaskPreview={handleLiveMaskPreview}
+            onDirectPatch={handleDirectPatch}
+            onQuickErase={handleQuickErase}
+            onSelectAiSubMask={(id) => setEditor({ activeAiSubMaskId: id })}
+            onSelectMask={(id) => setEditor({ activeMaskId: id })}
+            onStraighten={handleStraighten}
+            selectedImage={selectedImage}
+            setCrop={handleCropChange}
+            setIsMaskHovered={setIsMaskHovered}
+            setIsMaskTouchInteracting={setIsMaskTouchInteracting}
+            showOriginal={showOriginal}
+            uncroppedAdjustedPreviewUrl={uncroppedAdjustedPreviewUrl}
+            transformedOriginalUrl={transformedOriginalUrl}
+            isTatActive={isTatActive}
+            tatMode={tatMode}
+            updateSubMask={updateSubMaskLocal}
+            isWbPickerActive={isWbPickerActive}
+            onWbPicked={handleWbPicked}
+            setAdjustments={setAdjustments}
+            overlayRotation={overlayRotation}
+            overlayMode={overlayMode}
+            cursorStyle={cursorStyle}
+            isMaxZoom={isMaxZoom}
+            liveRotation={liveRotation}
+            transformState={transformState}
+            hasRenderedFirstFrame={hasRenderedFirstFrame}
+          />
         </div>
+        {straightenDragLine && (
+          <svg className="absolute inset-0 pointer-events-none z-[100]" style={{ width: '100%', height: '100%' }}>
+            <line
+              x1={straightenDragLine.start.x}
+              y1={straightenDragLine.start.y}
+              x2={straightenDragLine.end.x}
+              y2={straightenDragLine.end.y}
+              stroke="#0ea5e9"
+              strokeWidth="2"
+              strokeDasharray="4 4"
+            />
+          </svg>
+        )}
       </div>
     </div>
   );

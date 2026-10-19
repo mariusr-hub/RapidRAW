@@ -127,6 +127,20 @@ const ImageCompare = ({
 
   const containerRef = useRef<HTMLDivElement>(null);
   const lastMousePos = useRef({ x: 0, y: 0 });
+  const [isTouchDragging, setIsTouchDragging] = useState(false);
+  const touchState = useRef({
+    initialPinchDist: 0,
+    initialZoom: 1,
+    initialPanX: 0,
+    initialPanY: 0,
+    lastCenterX: 0,
+    lastCenterY: 0,
+    lastTouchX: 0,
+    lastTouchY: 0,
+    isPinching: false,
+    isPanning: false,
+    isSliding: false,
+  });
 
   useEffect(() => {
     if (!isDragging && !isResizingSlider) return;
@@ -263,6 +277,7 @@ const ImageCompare = ({
           className="absolute top-0 bottom-0 w-1 bg-white cursor-ew-resize z-10 flex items-center justify-center shadow-[0_0_8px_rgba(0,0,0,0.5)]"
           style={{ left: `${sliderPosition}%`, transform: 'translateX(-50%)' }}
           onMouseDown={handleSliderMouseDown}
+          data-slider
         >
           <div className="w-6 h-6 rounded-full bg-white text-black flex items-center justify-center shadow-lg border border-neutral-300">
             <Move size={12} />

@@ -4,17 +4,17 @@ version = 4
 
 [[package]]
 name = "RapidRAW"
-version = "1.6.3"
+version = "1.6.6"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytemuck",
  "chrono",
+ "crc32fast",
  "fast_image_resize",
  "fern",
  "filetime",
- "flate2",
  "futures",
  "fuzzy-matcher",
  "glam 0.33.5",
@@ -23,6 +23,7 @@ dependencies = [
  "half",
  "hex",
  "image",
+ "image-hdr",
  "image_hasher",
  "imageproc",
  "imgref",
@@ -35,12 +36,19 @@ dependencies = [
  "libc",
  "little_exif",
  "log",
+ "lsdetect",
  "memmap2",
+ "mimalloc",
  "mozjpeg-rs",
  "nalgebra",
  "ndarray",
  "ndk-context",
  "objc",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-image",
+ "objc2-foundation",
  "once_cell",
  "ort",
  "pollster",
@@ -68,6 +76,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tauri-plugin-store",
+ "tauri-plugin-wayland-nvidia-quirk",
  "tempfile",
  "tiff",
  "tokenizers",
@@ -76,7 +85,6 @@ dependencies = [
  "uuid",
  "walkdir",
  "webkit2gtk",
- "webkit2gtk-nvidia-quirk",
  "webp",
  "wgpu",
 ]
@@ -2913,6 +2921,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "image-hdr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f401958e284ad5c7a124aa8cbd83e8072e91f7c04ca48c77e1f55d9b660206d"
+dependencies = [
+ "image",
+ "kamadak-exif",
+ "ndarray",
+ "rayon",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "image-webp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3621,6 +3642,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3712,6 +3742,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lsdetect"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "042f46bce4d9622bb7243bb1d18cac317d1df7891d5f648b96590aed3d773e6f"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "macro_rules_attribute"
@@ -3807,6 +3846,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -4036,6 +4084,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+ "rayon",
 ]
 
 [[package]]
@@ -4303,7 +4352,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.1",
+ "block2",
  "dispatch2",
+ "libc",
  "objc2",
 ]
 
@@ -4314,10 +4365,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.13.1",
+ "block2",
  "dispatch2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-io-surface",
+ "objc2-metal",
 ]
 
 [[package]]
@@ -4326,8 +4380,14 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5d563b38d2b97209f8e861173de434bd0214cf020e3423a52624cd1d989f006"
 dependencies = [
+ "block2",
  "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-video",
  "objc2-foundation",
+ "objc2-image-io",
+ "objc2-metal",
 ]
 
 [[package]]
@@ -4350,6 +4410,19 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
+]
+
+[[package]]
+name = "objc2-core-video"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -4378,6 +4451,17 @@ dependencies = [
  "libc",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-image-io"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32b0446e98cf4a784cc7a0177715ff317eeaa8463841c616cfc78aa4f953c4ea"
+dependencies = [
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
 ]
 
 [[package]]
@@ -4877,9 +4961,9 @@ dependencies = [
 
 [[package]]
 name = "pollster"
-version = "0.4.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
 
 [[package]]
 name = "portable-atomic"
@@ -5340,7 +5424,7 @@ dependencies = [
 [[package]]
 name = "rawler"
 version = "0.7.1"
-source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git#934af4b213a12b95f77d69529627067056066294"
+source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git#a32bc1ff1f4f3c56d4d3226082f6eb17414f9159"
 dependencies = [
  "backtrace",
  "bitstream-io",
@@ -6886,6 +6970,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-wayland-nvidia-quirk"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "523f6620fd0b6e87f25f7d2cde69be388ae5d1bcaf1696877e64ce3da8fa1483"
+dependencies = [
+ "gtk",
+ "tauri",
+]
+
+[[package]]
 name = "tauri-runtime"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7897,12 +7991,6 @@ dependencies = [
  "soup3",
  "webkit2gtk-sys",
 ]
-
-[[package]]
-name = "webkit2gtk-nvidia-quirk"
-version = "1.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346ca51979f591fd90693a1cd548c3ac482e665b1f736ea5bba6f2e7f2e6d18c"
 
 [[package]]
 name = "webkit2gtk-sys"

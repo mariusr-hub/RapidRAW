@@ -1,12 +1,14 @@
 use crate::Cursor;
 use crate::app_settings::{AppSettings, load_settings};
 use crate::app_state::{AppState, LoadedImage};
+use crate::baseline_exposure::BaselineOptions;
 use crate::exif_processing;
 use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
 use crate::image_processing::ImageMetadata;
 use crate::image_processing::{
-    apply_orientation, apply_srgb_to_linear, remove_raw_artifacts_and_enhance,
+    apply_orientation, apply_srgb_to_linear, effective_baseline_exposure,
+    remove_raw_artifacts_and_enhance,
 };
 use crate::mask_generation::{MaskDefinition, SubMask, generate_mask_bitmap};
 use crate::white_balance::WhiteBalance;
@@ -76,7 +78,23 @@ pub fn load_and_composite(
 ) -> Result<DynamicImage> {
     let base_image =
         load_base_image_from_bytes(base_image, path, use_fast_raw_dev, settings, cancel_token)?;
-    composite_patches_on_image(&base_image, adjustments)
+    prepare_base_image(&base_image, path, adjustments)
+}
+
+pub fn prepare_base_image(
+    base_image: &DynamicImage,
+    path: &str,
+    adjustments: &Value,
+) -> Result<DynamicImage> {
+    let has_patches = adjustments
+        .get("aiPatches")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+
+    match crate::ai_denoise::apply_ai_denoise(base_image, path, adjustments) {
+        std::borrow::Cow::Owned(denoised) if !has_patches => Ok(denoised),
+        denoised => composite_patches_on_image(&denoised, adjustments),
+    }
 }
 
 pub fn load_base_image_from_bytes(
@@ -837,11 +855,27 @@ pub async fn load_image(
     let cancel_token = Some((generation_tracker.clone(), my_generation));
 
     {
-        *state.original_image.lock().unwrap() = None;
-        *state.cached_preview.lock().unwrap() = None;
-        *state.gpu_image_cache.lock().unwrap() = None;
-        *state.full_warped_cache.lock().unwrap() = None;
-        *state.full_transformed_cache.lock().unwrap() = None;
+        *state
+            .original_image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *state
+            .cached_preview
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *state
+            .gpu_image_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *state
+            .full_warped_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *state
+            .full_transformed_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        crate::cache_utils::clear_preview_stage_caches(&state);
 
         state.mask_cache.lock().unwrap().clear();
         state.patch_cache.lock().unwrap().clear();
@@ -858,6 +892,7 @@ pub async fn load_image(
     let metadata: ImageMetadata = crate::exif_processing::load_sidecar(&sidecar_path);
 
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    let baseline_options = BaselineOptions::from_settings(&settings);
 
     let path_clone = source_path_str.clone();
 
@@ -954,14 +989,26 @@ pub async fn load_image(
 
     let (orig_width, orig_height) = pristine_arc.dimensions();
     let screen_proxy = Arc::new(crate::fast_resizer::fast_downscale_dynamic(&pristine_arc, 2560, 2560));
-    let as_shot_white_balance = crate::white_balance::as_shot_white_balance(&source_path_str);
+    let as_shot = crate::as_shot::as_shot(&source_path_str);
+    if is_raw {
+        log::info!(
+            "Baseline exposure for '{}': {:+.2} EV (DNG baseline {:+.2} EV, highlight preservation {:+.2} EV)",
+            source_path_str,
+            effective_baseline_exposure(&metadata.adjustments, as_shot, baseline_options),
+            as_shot.exposure.dng_baseline,
+            as_shot.exposure.highlight_preservation
+        );
+    }
 
-    *state.original_image.lock().unwrap() = Some(LoadedImage {
+    *state
+        .original_image
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(LoadedImage {
         path,
         image: pristine_arc,
         is_raw,
         screen_proxy: Some(screen_proxy),
-        as_shot_white_balance,
+        as_shot,
     });
 
     Ok(LoadImageResult {
@@ -970,6 +1017,6 @@ pub async fn load_image(
         metadata,
         exif: exif_data,
         is_raw,
-        as_shot_white_balance,
+        as_shot_white_balance: as_shot.white_balance,
     })
 }

@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Camera,
   Check,
+  CheckCheck,
   Folder,
   FolderInput,
   Home,
@@ -20,6 +21,7 @@ import {
   Zap,
   ChevronLeft,
   ChevronRight,
+  X,
 } from 'lucide-react';
 import CullingView from './library/CullingView';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -184,6 +186,7 @@ export default function MainLibrary(props: MainLibraryProps) {
   const [isBusyDelayed, setIsBusyDelayed] = useState(false);
   const [isBusyLoaderMounted, setIsBusyLoaderMounted] = useState(false);
   const [isProgressHovered, setIsProgressHovered] = useState(false);
+  const [selectionModeActive, setSelectionModeActive] = useState(false);
   const isSettingsOpen = useUIStore((state) => state.isSettingsOpen);
 
   const libraryDisplayMode = props.appSettings?.libraryDisplayMode || LibraryDisplayMode.Grid;
@@ -198,6 +201,7 @@ export default function MainLibrary(props: MainLibraryProps) {
   };
 
   const searchCriteria = useLibraryStore((state) => state.searchCriteria);
+  const setLibrary = useLibraryStore((state) => state.setLibrary);
   const folderHistory = useLibraryStore((state) => state.folderHistory);
   const folderHistoryIndex = useLibraryStore((state) => state.folderHistoryIndex);
   const canGoBack = folderHistoryIndex > 0;
@@ -566,152 +570,200 @@ export default function MainLibrary(props: MainLibraryProps) {
         onMouseEnter={() => setIsProgressHovered(true)}
         onMouseLeave={() => setIsProgressHovered(false)}
       >
-        <div className="min-w-0">
-          <Text variant={TextVariants.headline}>{t('library.header.title')}</Text>
-          {!props.isAndroid && (
-            <div className="flex items-center gap-2">
-              {props.currentFolderPath ? (
-                <Text className="truncate">{props.currentFolderPath}</Text>
-              ) : (
-                <p className="text-sm invisible select-none pointer-events-none h-5 overflow-hidden"></p>
+        {selectionModeActive && props.isAndroid ? (
+          <>
+            <div className="min-w-0">
+              <Text variant={TextVariants.headline}>{t('library.header.selectItems')}</Text>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              {props.multiSelectedPaths.length < props.imageList.length && (
+                <Button
+                  className="h-12 px-4 bg-surface text-text-primary shadow-none"
+                  onClick={() => setLibrary({ multiSelectedPaths: props.imageList.map((img: ImageFile) => img.path) })}
+                >
+                  <CheckCheck size={16} className="mr-2" />
+                  {t('library.header.selectAll')}
+                </Button>
               )}
-              <div
-                className={`flex items-center gap-2 overflow-hidden transition-all duration-300 whitespace-nowrap ${
-                  isBusyDelayed ? 'max-w-xs opacity-100' : 'max-w-0 opacity-0'
-                }`}
-                onTransitionEnd={(e) => {
-                  if (e.propertyName === 'opacity' && !isBusyDelayed) {
-                    setIsBusyLoaderMounted(false);
-                  }
+              {props.multiSelectedPaths.length === props.imageList.length && props.imageList.length > 0 && (
+                <Button
+                  className="h-12 px-4 bg-surface text-text-primary shadow-none"
+                  onClick={() => setLibrary({ multiSelectedPaths: [] })}
+                >
+                  {t('library.header.deselectAll')}
+                </Button>
+              )}
+              <Button
+                className="h-12 px-4 bg-surface text-text-primary shadow-none"
+                onClick={() => {
+                  setSelectionModeActive(false);
+                  if (props.multiSelectedPaths.length > 0) props.onClearSelection();
                 }}
               >
-                {isBusyLoaderMounted && <Loader2 size={14} className="animate-spin text-text-secondary shrink-0" />}
-                <div
-                  className={`flex items-center transition-all duration-300 ease-out overflow-hidden ${
-                    isProgressHovered && isBusyDelayed && (props.thumbnailProgress?.total ?? 0) > 0
-                      ? 'max-w-xs opacity-100'
-                      : 'max-w-0 opacity-0'
-                  }`}
-                >
-                  <Text variant={TextVariants.small} color={TextColors.secondary} className="whitespace-nowrap">
-                    ({props.thumbnailProgress?.current ?? 0}/{props.thumbnailProgress?.total ?? 0})
-                  </Text>
+                <X size={16} className="mr-2" />
+                {t('library.header.cancel')}
+              </Button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="min-w-0">
+              <Text variant={TextVariants.headline}>{t('library.header.title')}</Text>
+              {!props.isAndroid && (
+                <div className="flex items-center gap-2">
+                  {props.currentFolderPath ? (
+                    <Text className="truncate">{props.currentFolderPath}</Text>
+                  ) : (
+                    <p className="text-sm invisible select-none pointer-events-none h-5 overflow-hidden"></p>
+                  )}
+                  <div
+                    className={`flex items-center gap-2 overflow-hidden transition-all duration-300 whitespace-nowrap ${
+                      isBusyDelayed ? 'max-w-xs opacity-100' : 'max-w-0 opacity-0'
+                    }`}
+                    onTransitionEnd={(e) => {
+                      if (e.propertyName === 'opacity' && !isBusyDelayed) {
+                        setIsBusyLoaderMounted(false);
+                      }
+                    }}
+                  >
+                    {isBusyLoaderMounted && <Loader2 size={14} className="animate-spin text-text-secondary shrink-0" />}
+                    <div
+                      className={`flex items-center transition-all duration-300 ease-out overflow-hidden ${
+                        isProgressHovered && isBusyDelayed && (props.thumbnailProgress?.total ?? 0) > 0
+                          ? 'max-w-xs opacity-100'
+                          : 'max-w-0 opacity-0'
+                      }`}
+                    >
+                      <Text variant={TextVariants.small} color={TextColors.secondary} className="whitespace-nowrap">
+                        ({props.thumbnailProgress?.current ?? 0}/{props.thumbnailProgress?.total ?? 0})
+                      </Text>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
-          )}
-        </div>
-        <div className="flex items-center gap-4 shrink-0">
-          {props.importState.status === Status.Importing && (
-            <Text as="div" color={TextColors.accent} className="flex items-center gap-2 animate-pulse">
-              <FolderInput size={16} />
-              <span>
-                {t('library.import.progress', {
-                  current: props.importState.progress?.current,
-                  total: props.importState.progress?.total,
-                })}
-              </span>
-            </Text>
-          )}
-          {props.importState.status === Status.Success && (
-            <Text as="div" color={TextColors.success} className="flex items-center gap-2">
-              <Check size={16} />
-              <span>{t('library.import.complete')}</span>
-            </Text>
-          )}
-          {props.importState.status === Status.Error && (
-            <Text as="div" color={TextColors.error} className="flex items-center gap-2">
-              <AlertTriangle size={16} />
-              <span>{t('library.import.failed')}</span>
-            </Text>
-          )}
-          <DisplayModeSwitch displayMode={libraryDisplayMode} setDisplayMode={setLibraryDisplayMode} t={t} />
+            <div className="flex items-center gap-4 shrink-0">
+              {props.importState.status === Status.Importing && (
+                <Text as="div" color={TextColors.accent} className="flex items-center gap-2 animate-pulse">
+                  <FolderInput size={16} />
+                  <span>
+                    {t('library.import.progress', {
+                      current: props.importState.progress?.current,
+                      total: props.importState.progress?.total,
+                    })}
+                  </span>
+                </Text>
+              )}
+              {props.importState.status === Status.Success && (
+                <Text as="div" color={TextColors.success} className="flex items-center gap-2">
+                  <Check size={16} />
+                  <span>{t('library.import.complete')}</span>
+                </Text>
+              )}
+              {props.importState.status === Status.Error && (
+                <Text as="div" color={TextColors.error} className="flex items-center gap-2">
+                  <AlertTriangle size={16} />
+                  <span>{t('library.import.failed')}</span>
+                </Text>
+              )}
+              <DisplayModeSwitch displayMode={libraryDisplayMode} setDisplayMode={setLibraryDisplayMode} t={t} />
 
-          <div className="flex items-center bg-surface p-1 rounded-lg gap-1 border border-border-color/20">
-            {/* Folder History Navigation */}
-            <div className="flex items-center gap-0.5 mr-0.5">
-              <Button
-                className="h-10 w-10 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:bg-card-active rounded-md transition-colors disabled:opacity-25 disabled:pointer-events-none"
-                disabled={!canGoBack}
-                onClick={props.onHistoryBack}
-                data-tooltip="Go Back (History)"
-              >
-                <ChevronLeft size={18} />
-              </Button>
-              <Button
-                className="h-10 w-10 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:bg-card-active rounded-md transition-colors disabled:opacity-25 disabled:pointer-events-none"
-                disabled={!canGoForward}
-                onClick={props.onHistoryForward}
-                data-tooltip="Go Forward (History)"
-              >
-                <ChevronRight size={18} />
-              </Button>
-            </div>
-            <SearchInput indexingProgress={props.indexingProgress} isIndexing={props.isIndexing} />
-            <ViewOptionsDropdown
-              libraryViewMode={props.libraryViewMode}
-              onSelectSize={props.onThumbnailSizeChange}
-              onSelectAspectRatio={props.onThumbnailAspectRatioChange}
-              onLibraryRefresh={props.onLibraryRefresh}
-              setLibraryViewMode={props.setLibraryViewMode}
-              thumbnailSize={props.thumbnailSize}
-              thumbnailAspectRatio={props.thumbnailAspectRatio}
-              thumbnailSizeOptions={translatedThumbnailSizeOptions}
-              thumbnailAspectRatioOptions={translatedThumbnailAspectRatioOptions}
-              ratingFilterOptions={translatedRatingFilterOptions}
-              rawStatusOptions={translatedRawStatusOptions}
-              editedStatusOptions={translatedEditedStatusOptions}
-              flagStatusOptions={translatedFlagStatusOptions}
-              sortOptions={translatedSortOptions}
-            />
-            {!props.isAndroid && (
-              <>
-                <Button
-                  className="h-12 w-12 bg-transparent text-amber-400 shadow-none p-0 flex items-center justify-center hover:text-amber-300 hover:scale-105 transition-all"
-                  onClick={() =>
-                    setUI({
-                      speedCullerModalState: {
-                        isOpen: true,
-                        selectedPaths: props.multiSelectedPaths.length > 1 ? props.multiSelectedPaths : [],
-                        initialIndex: props.activePath
-                          ? Math.max(0, props.imageList.findIndex((im) => im.path === props.activePath))
-                          : 0,
-                      },
-                    })
-                  }
-                  data-tooltip="⚡ Speed Culler & AI Face Loupe (C)"
-                >
-                  <Zap className="w-5 h-5 fill-amber-400/20 text-amber-400" />
-                </Button>
-                <Button
-                  className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:text-accent transition-colors"
-                  onClick={() =>
-                    setUI((state) => ({
-                      tetheringModalState: { ...state.tetheringModalState, isOpen: true },
-                    }))
-                  }
-                  data-tooltip="Camera Tethering (Live View & Remote Shutter)"
-                >
-                  <Camera className="w-5 h-5" />
-                </Button>
+              <div className="flex items-center bg-surface p-1 rounded-lg gap-1 border border-border-color/20">
+                {/* Folder History Navigation */}
+                <div className="flex items-center gap-0.5 mr-0.5">
+                  <Button
+                    className="h-10 w-10 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:bg-card-active rounded-md transition-colors disabled:opacity-25 disabled:pointer-events-none"
+                    disabled={!canGoBack}
+                    onClick={props.onHistoryBack}
+                    data-tooltip="Go Back (History)"
+                  >
+                    <ChevronLeft size={18} />
+                  </Button>
+                  <Button
+                    className="h-10 w-10 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:bg-card-active rounded-md transition-colors disabled:opacity-25 disabled:pointer-events-none"
+                    disabled={!canGoForward}
+                    onClick={props.onHistoryForward}
+                    data-tooltip="Go Forward (History)"
+                  >
+                    <ChevronRight size={18} />
+                  </Button>
+                </div>
+                <SearchInput indexingProgress={props.indexingProgress} isIndexing={props.isIndexing} />
+                <ViewOptionsDropdown
+                  libraryViewMode={props.libraryViewMode}
+                  onSelectSize={props.onThumbnailSizeChange}
+                  onSelectAspectRatio={props.onThumbnailAspectRatioChange}
+                  onLibraryRefresh={props.onLibraryRefresh}
+                  setLibraryViewMode={props.setLibraryViewMode}
+                  thumbnailSize={props.thumbnailSize}
+                  thumbnailAspectRatio={props.thumbnailAspectRatio}
+                  thumbnailSizeOptions={translatedThumbnailSizeOptions}
+                  thumbnailAspectRatioOptions={translatedThumbnailAspectRatioOptions}
+                  ratingFilterOptions={translatedRatingFilterOptions}
+                  rawStatusOptions={translatedRawStatusOptions}
+                  editedStatusOptions={translatedEditedStatusOptions}
+                  flagStatusOptions={translatedFlagStatusOptions}
+                  sortOptions={translatedSortOptions}
+                />
+                {props.isAndroid && (
+                  <Button
+                    className="h-12 w-12 bg-accent text-button-text shadow-none p-0 flex items-center justify-center"
+                    onClick={() => setSelectionModeActive(true)}
+                    data-tooltip={t('library.tooltips.select')}
+                  >
+                    <CheckCheck className="w-6 h-6" />
+                  </Button>
+                )}
+                {!props.isAndroid && (
+                  <>
+                    <Button
+                      className="h-12 w-12 bg-transparent text-amber-400 shadow-none p-0 flex items-center justify-center hover:text-amber-300 hover:scale-105 transition-all"
+                      onClick={() =>
+                        setUI({
+                          speedCullerModalState: {
+                            isOpen: true,
+                            selectedPaths: props.multiSelectedPaths.length > 1 ? props.multiSelectedPaths : [],
+                            initialIndex: props.activePath
+                              ? Math.max(0, props.imageList.findIndex((im) => im.path === props.activePath))
+                              : 0,
+                          },
+                        })
+                      }
+                      data-tooltip="⚡ Speed Culler & AI Face Loupe (C)"
+                    >
+                      <Zap className="w-5 h-5 fill-amber-400/20 text-amber-400" />
+                    </Button>
+                    <Button
+                      className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:text-accent transition-colors"
+                      onClick={() =>
+                        setUI((state) => ({
+                          tetheringModalState: { ...state.tetheringModalState, isOpen: true },
+                        }))
+                      }
+                      data-tooltip="Camera Tethering (Live View & Remote Shutter)"
+                    >
+                      <Camera className="w-5 h-5" />
+                    </Button>
+                    <Button
+                      className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center"
+                      onClick={props.onNavigateToCommunity}
+                      data-tooltip={t('library.tooltips.communityPresets')}
+                    >
+                      <Users className="w-5 h-5" />
+                    </Button>
+                  </>
+                )}
                 <Button
                   className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center"
-                  onClick={props.onNavigateToCommunity}
-                  data-tooltip={t('library.tooltips.communityPresets')}
+                  onClick={props.onGoHome}
+                  data-tooltip={t('library.tooltips.goHome')}
                 >
-                  <Users className="w-5 h-5" />
+                  <Home className="w-5 h-5" />
                 </Button>
-              </>
-            )}
-            <Button
-              className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center"
-              onClick={props.onGoHome}
-              data-tooltip={t('library.tooltips.goHome')}
-            >
-              <Home className="w-5 h-5" />
-            </Button>
-          </div>
-        </div>
+              </div>
+            </div>
+          </>
+        )}
       </header>
 
       {props.imageList.length > 0 ? (
@@ -721,6 +773,7 @@ export default function MainLibrary(props: MainLibraryProps) {
           <LibraryGrid
             {...props}
             libraryDisplayMode={libraryDisplayMode}
+            selectionModeActive={selectionModeActive}
             thumbnailSizeOptions={translatedThumbnailSizeOptions}
           />
         )

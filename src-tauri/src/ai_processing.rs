@@ -7,7 +7,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use image::imageops::{self, FilterType};
 use image::{
-    DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb, Rgb32FImage, Rgba, RgbaImage,
+    DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb32FImage, Rgba, RgbaImage,
 };
 use ndarray::{Array, Array4, IxDyn};
 use ort::session::Session;
@@ -845,18 +845,25 @@ pub async fn get_or_init_normal_model(
 #[derive(Clone, Copy)]
 struct TileParams {
     cs: usize,
-    step: usize,
+    margin: usize,
+    overlap: usize,
 }
 
-impl TileParams {
-    const fn new(cs: usize, step: usize) -> Self {
-        Self { cs, step }
-    }
-}
-
-const TILE_BALANCED: TileParams = TileParams::new(504, 420);
-const TILE_FASTER: TileParams = TileParams::new(504, 480);
-const TILE_HIGHER_QUALITY: TileParams = TileParams::new(504, 336);
+const TILE_FASTER: TileParams = TileParams {
+    cs: 504,
+    margin: 8,
+    overlap: 32,
+};
+const TILE_BALANCED: TileParams = TileParams {
+    cs: 504,
+    margin: 12,
+    overlap: 64,
+};
+const TILE_HIGHER_QUALITY: TileParams = TileParams {
+    cs: 504,
+    margin: 16,
+    overlap: 128,
+};
 
 fn select_tile_params(quality_0_1: f32) -> TileParams {
     let q = quality_0_1.clamp(0.0, 1.0);
@@ -896,8 +903,6 @@ fn extract_tile_mirror(img: &Rgb32FImage, x0: i32, y0: i32, cs: usize) -> Array4
     arr
 }
 
-/// Generates a 2D Hann (raised cosine) weighting matrix for smooth overlap-add blending.
-/// Formula: W(x, y) = sin²(π * (x + 0.5) / S) * sin²(π * (y + 0.5) / S)
 pub fn generate_hann_window_2d(size: usize) -> Vec<f32> {
     let mut w = vec![0.0f32; size * size];
     let pi = std::f32::consts::PI;
@@ -913,126 +918,111 @@ pub fn generate_hann_window_2d(size: usize) -> Vec<f32> {
     w
 }
 
+fn tile_origins(len: usize, params: TileParams) -> Vec<i32> {
+    let valid = params.cs - 2 * params.margin;
+    let step = (valid - params.overlap).max(1);
+    let mut origins = Vec::new();
+    let mut start = 0;
+    loop {
+        origins.push(start as i32 - params.margin as i32);
+        if start + valid >= len {
+            break;
+        }
+        start += step;
+    }
+    origins
+}
+
+fn tile_blend_weights(params: TileParams) -> Vec<f32> {
+    let valid = params.cs - 2 * params.margin;
+    let ramp = |d: usize| ((d as f32 + 0.5) / params.overlap.max(1) as f32).min(1.0);
+    (0..valid)
+        .map(|i| {
+            let t = ramp(i).min(ramp(valid - 1 - i));
+            t * t * (3.0 - 2.0 * t)
+        })
+        .collect()
+}
+
 fn run_native_denoise(
     img: &Rgb32FImage,
     session: &Mutex<Session>,
-    accumulator: &mut [f32],
-    width: usize,
-    height: usize,
-    app_handle: &tauri::AppHandle,
     params: TileParams,
-) -> Result<()> {
-    let w = width as i32;
-    let h = height as i32;
-    let cs = params.cs;
-    let step = params.step.max(1);
+    on_progress: &dyn Fn(f32),
+) -> Result<Rgb32FImage> {
+    let (width, height) = (img.width() as usize, img.height() as usize);
+    let valid = params.cs - 2 * params.margin;
+    let weights = tile_blend_weights(params);
+    let xs = tile_origins(width, params);
+    let ys = tile_origins(height, params);
+    let total = xs.len() * ys.len();
 
-    let x_steps = ((w.saturating_sub(cs as i32)) as f64 / step as f64).ceil() as usize + 1;
-    let y_steps = ((h.saturating_sub(cs as i32)) as f64 / step as f64).ceil() as usize + 1;
-    let total = x_steps * y_steps;
+    let mut accumulator = vec![0.0f32; width * height * 3];
+    let mut weight_sum = vec![0.0f32; width * height];
 
-    let hann_window = generate_hann_window_2d(cs);
-    let mut weights_acc = vec![0.0f32; width * height];
+    for (i, (&y0, &x0)) in ys
+        .iter()
+        .flat_map(|y| xs.iter().map(move |x| (y, x)))
+        .enumerate()
+    {
+        on_progress(i as f32 / total as f32);
 
-    for i in 0..total {
-        let yi = i / x_steps;
-        let xi = i % x_steps;
+        let crop = extract_tile_mirror(img, x0, y0, params.cs);
+        let t_input = Tensor::from_array(crop.as_standard_layout().to_owned())?;
 
-        let x0 = (xi * step) as i32;
-        let y0 = (yi * step) as i32;
-
-        if i % 5 == 0 || i + 1 == total {
-            let pct = ((i + 1) as f32 / total as f32) * 100.0;
-            let _ = app_handle.emit("denoise-progress", format!("Denoising (AI Hann Tile)… {:.0}%", pct));
-        }
-
-        let crop = extract_tile_mirror(img, x0, y0, cs);
-        let input_values = crop.as_standard_layout().to_owned();
-        let t_input = Tensor::from_array(input_values)?;
-
-        let out = {
+        let tile = {
             let mut sess = session.lock().unwrap();
             let outputs = sess.run(ort::inputs![t_input])?;
-            let arr = outputs[0].try_extract_array::<f32>()?.to_owned();
-            arr.into_dimensionality::<ndarray::Ix4>()
+            outputs[0]
+                .try_extract_array::<f32>()?
+                .to_owned()
+                .into_dimensionality::<ndarray::Ix4>()
                 .map_err(|e| anyhow::anyhow!("Unexpected output shape: {}", e))?
         };
 
-        for dy in 0..cs {
-            let gy = y0 + dy as i32;
-            if gy < 0 || gy >= h {
+        for ty in 0..valid {
+            let gy = y0 + (params.margin + ty) as i32;
+            if gy < 0 || gy >= height as i32 {
                 continue;
             }
-            let gy_usize = gy as usize;
-
-            for dx in 0..cs {
-                let gx = x0 + dx as i32;
-                if gx < 0 || gx >= w {
+            for tx in 0..valid {
+                let gx = x0 + (params.margin + tx) as i32;
+                if gx < 0 || gx >= width as i32 {
                     continue;
                 }
-                let gx_usize = gx as usize;
-
-                let weight = hann_window[dy * cs + dx];
-                let idx_rgb = (gy_usize * width + gx_usize) * 3;
-                let idx_w = gy_usize * width + gx_usize;
-
-                accumulator[idx_rgb] += out[[0, 0, dy, dx]].clamp(0.0, 1.0) * weight;
-                accumulator[idx_rgb + 1] += out[[0, 1, dy, dx]].clamp(0.0, 1.0) * weight;
-                accumulator[idx_rgb + 2] += out[[0, 2, dy, dx]].clamp(0.0, 1.0) * weight;
-                weights_acc[idx_w] += weight;
+                let w = weights[ty] * weights[tx];
+                let idx = gy as usize * width + gx as usize;
+                for c in 0..3 {
+                    let v = tile[[0, c, params.margin + ty, params.margin + tx]].clamp(0.0, 1.0);
+                    accumulator[idx * 3 + c] += v * w;
+                }
+                weight_sum[idx] += w;
             }
         }
     }
 
-    // Normalize overlapping Hann accumulation to guarantee exact unity gain (sum(W) = 1.0)
-    for i in 0..(width * height) {
-        let w_sum = weights_acc[i];
-        let inv_w = if w_sum > 1e-6 { 1.0 / w_sum } else { 1.0 };
-        let i3 = i * 3;
-        accumulator[i3] = (accumulator[i3] * inv_w).clamp(0.0, 1.0);
-        accumulator[i3 + 1] = (accumulator[i3 + 1] * inv_w).clamp(0.0, 1.0);
-        accumulator[i3 + 2] = (accumulator[i3 + 2] * inv_w).clamp(0.0, 1.0);
-    }
-
-    Ok(())
-}
-
-fn accumulator_to_rgb32f(acc: &[f32], width: u32, height: u32) -> Rgb32FImage {
-    let mut out = Rgb32FImage::new(width, height);
-    for (i, p) in out.pixels_mut().enumerate() {
-        let i3 = i * 3;
-        *p = Rgb([
-            acc[i3].clamp(0.0, 1.0),
-            acc[i3 + 1].clamp(0.0, 1.0),
-            acc[i3 + 2].clamp(0.0, 1.0),
-        ]);
-    }
-    out
+    let mut out = Rgb32FImage::new(width as u32, height as u32);
+    out.par_chunks_exact_mut(3)
+        .zip(accumulator.par_chunks_exact(3))
+        .zip(weight_sum.par_iter())
+        .for_each(|((px, acc), &w)| {
+            let inv = if w > 0.0 { 1.0 / w } else { 0.0 };
+            for c in 0..3 {
+                px[c] = (acc[c] * inv).clamp(0.0, 1.0);
+            }
+        });
+    Ok(out)
 }
 
 pub fn run_ai_denoise(
     rgb_img: &Rgb32FImage,
     intensity: f32,
     session: &Mutex<Session>,
-    app_handle: &tauri::AppHandle,
+    on_progress: &dyn Fn(f32),
 ) -> Result<DynamicImage> {
-    let (width, height) = rgb_img.dimensions();
     let params = select_tile_params(intensity);
-
-    let _ = app_handle.emit("denoise-progress", "Denoising (AI NIND)...");
-    let mut accumulator = vec![0.0f32; width as usize * height as usize * 3];
-    run_native_denoise(
-        rgb_img,
-        session,
-        &mut accumulator,
-        width as usize,
-        height as usize,
-        app_handle,
-        params,
-    )?;
-
-    let out_img_buffer = accumulator_to_rgb32f(&accumulator, width, height);
-    Ok(DynamicImage::ImageRgb32F(out_img_buffer))
+    let out = run_native_denoise(rgb_img, session, params, on_progress)?;
+    Ok(DynamicImage::ImageRgb32F(out))
 }
 
 pub fn run_lama_inpainting(
