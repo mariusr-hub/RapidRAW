@@ -1446,27 +1446,131 @@ pub fn is_cloud_placeholder(_path: &Path) -> bool {
     false
 }
 
-pub fn read_file_mapped(path: &Path) -> Result<Mmap, ReadFileError> {
+#[derive(Debug)]
+pub enum SafeFileBuffer {
+    Mapped(memmap2::Mmap),
+    Buffered(Vec<u8>),
+}
+
+impl std::ops::Deref for SafeFileBuffer {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            SafeFileBuffer::Mapped(m) => m.as_ref(),
+            SafeFileBuffer::Buffered(b) => b.as_slice(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for SafeFileBuffer {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        std::ops::Deref::deref(self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_removable_or_remote_drive(path: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let path_str = path.to_string_lossy();
+    // Detect UNC network paths (e.g. \\server\share or //server/share)
+    if path_str.starts_with(r"\\") || path_str.starts_with("//") {
+        return true;
+    }
+
+    let canonical_path;
+    let effective_path = if path.is_relative() {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            canonical_path = canonical;
+            &canonical_path
+        } else if let Ok(current_dir) = std::env::current_dir() {
+            canonical_path = current_dir.join(path);
+            &canonical_path
+        } else {
+            path
+        }
+    } else {
+        path
+    };
+
+    // Extract root drive specification, e.g. "D:\"
+    let root_str = if let Some(std::path::Component::Prefix(prefix)) = effective_path.components().next() {
+        match prefix.kind() {
+            std::path::Prefix::Disk(c) | std::path::Prefix::VerbatimDisk(c) => {
+                format!("{}:\\", c as char)
+            }
+            std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _) => return true,
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+
+    let wide_root: Vec<u16> = OsStr::new(&root_str)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe extern "system" {
+        fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+    }
+
+    // Win32 Drive Types:
+    // 0 = DRIVE_UNKNOWN, 1 = DRIVE_NO_ROOT_DIR, 2 = DRIVE_REMOVABLE,
+    // 3 = DRIVE_FIXED, 4 = DRIVE_REMOTE, 5 = DRIVE_CDROM, 6 = DRIVE_RAMDISK
+    let drive_type = unsafe { GetDriveTypeW(wide_root.as_ptr()) };
+    drive_type == 2 || drive_type == 4 || drive_type == 5 || drive_type == 0 || drive_type == 1
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_removable_or_remote_drive(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("/Volumes/") || s.starts_with("/media/") || s.starts_with("/mnt/")
+}
+
+pub fn read_file_safe(path: &Path) -> Result<SafeFileBuffer, ReadFileError> {
+    read_file_mapped(path)
+}
+
+pub fn read_file_mapped(path: &Path) -> Result<SafeFileBuffer, ReadFileError> {
     if !path.is_file() {
         return Err(ReadFileError::Invalid);
     }
     if !path.exists() {
         return Err(ReadFileError::NotFound);
     }
-    if path.metadata().map_err(ReadFileError::Io)?.len() == 0 {
+    let len = path.metadata().map_err(ReadFileError::Io)?.len();
+    if len == 0 {
         return Err(ReadFileError::Empty);
     }
+
+    // Safety Guard: Removable USB drives and network shares must use standard buffered I/O
+    // to prevent uncatchable 0xc0000006 STATUS_IN_PAGE_ERROR kernel faults
+    if is_removable_or_remote_drive(path) {
+        let bytes = fs::read(path).map_err(ReadFileError::Io)?;
+        return Ok(SafeFileBuffer::Buffered(bytes));
+    }
+
     let file = fs::File::open(path).map_err(ReadFileError::Io)?;
     if file.try_lock_shared().is_err() {
         return Err(ReadFileError::Locked);
     }
-    let mmap = unsafe {
+
+    match unsafe {
         MmapOptions::new()
-            .len(file.metadata().map_err(ReadFileError::Io)?.len() as usize)
+            .len(len as usize)
             .map(&file)
-            .map_err(ReadFileError::Io)?
-    };
-    Ok(mmap)
+    } {
+        Ok(mmap) => Ok(SafeFileBuffer::Mapped(mmap)),
+        Err(_) => {
+            // Graceful fallback to buffered read if mmap allocation fails
+            let bytes = fs::read(path).map_err(ReadFileError::Io)?;
+            Ok(SafeFileBuffer::Buffered(bytes))
+        }
+    }
 }
 
 fn find_embedded_jpeg(exif: &exif::Exif, ifd: exif::In) -> Option<&[u8]> {
@@ -1511,17 +1615,252 @@ fn exif_embedded_preview(exif: &exif::Exif) -> Option<DynamicImage> {
     Some(apply_exif_orientation(img, orientation))
 }
 
-fn try_load_embedded_raw_preview(source_path: &Path, target_res: u32) -> Option<DynamicImage> {
-    let mmap = read_file_mapped(source_path).ok()?;
+/// Seek-based TIFF/RAW embedded JPEG extractor.
+/// Reads only small IFD tables and the target JPEG slice (~1-3 MB) instead of reading the entire
+/// 30-60 MB RAW sensor payload over USB/HDD. Supports Canon CR2 IFD0 StripOffsets JPEGs, Nikon NEF,
+/// Sony ARW, Pentax PEF, and Adobe DNG SubIFD previews.
+fn try_extract_tiff_jpeg_preview_seek(source_path: &Path, min_dim: u32) -> Option<DynamicImage> {
+    use std::collections::HashSet;
+    use std::io::{Read, Seek, SeekFrom};
 
-    let preview = match exif_processing::read_exif(&mmap) {
-        Some(exif) => exif_embedded_preview(&exif)?,
-        None => {
-            image_loader::safe_embedded_preview_fallback(&mmap, &source_path.to_string_lossy())?
-        }
+    let mut file = fs::File::open(source_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 16 {
+        return None;
+    }
+
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header).ok()?;
+
+    let le = match &header[..4] {
+        [0x49, 0x49, 0x2A, 0x00] => true,
+        [0x4D, 0x4D, 0x00, 0x2A] => false,
+        _ => return None,
     };
 
-    (preview.width().max(preview.height()) >= (target_res as f32 * 0.95) as u32).then_some(preview)
+    let rd16_slice = |buf: &[u8], o: usize| -> Option<u16> {
+        let b: [u8; 2] = buf.get(o..o + 2)?.try_into().ok()?;
+        Some(if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+    };
+    let rd32_slice = |buf: &[u8], o: usize| -> Option<u32> {
+        let b: [u8; 4] = buf.get(o..o + 4)?.try_into().ok()?;
+        Some(if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    };
+
+    let ifd0 = rd32_slice(&header, 4)? as u64;
+    if ifd0 < 8 || ifd0 >= file_len {
+        return None;
+    }
+
+    // (offset, byte_len, orientation)
+    let mut candidates: Vec<(u64, u64, u32)> = Vec::new();
+    let mut queue: Vec<u64> = vec![ifd0];
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut primary_orientation: Option<u32> = None;
+
+    while let Some(ifd_off) = queue.pop() {
+        if ifd_off + 2 > file_len || !seen.insert(ifd_off) || seen.len() > 64 {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(ifd_off)).is_err() {
+            continue;
+        }
+        let mut cnt_buf = [0u8; 2];
+        if file.read_exact(&mut cnt_buf).is_err() {
+            continue;
+        }
+        let Some(entry_count) = rd16_slice(&cnt_buf, 0) else {
+            continue;
+        };
+        if entry_count == 0 || entry_count > 512 {
+            continue;
+        }
+
+        let table_bytes_len = (entry_count as usize) * 12 + 4;
+        if ifd_off + 2 + (table_bytes_len as u64) > file_len {
+            continue;
+        }
+        let mut table = vec![0u8; table_bytes_len];
+        if file.read_exact(&mut table).is_err() {
+            continue;
+        }
+
+        let mut compression: u32 = 0;
+        let mut photometric: Option<u32> = None;
+        let mut bits_per_sample: Option<u32> = None;
+        let mut ifd_orientation: Option<u32> = None;
+        let mut has_cr2_slices = false;
+        let mut strip_off: Option<u64> = None;
+        let mut strip_len: Option<u64> = None;
+        let mut jpeg_off: Option<u64> = None;
+        let mut jpeg_len: Option<u64> = None;
+        let mut sub_ifd_ptrs: Vec<(u32, u64)> = Vec::new();
+        let mut bps_ptr: Option<(u16, u32, u64)> = None;
+
+        for i in 0..entry_count as usize {
+            let e = i * 12;
+            let (Some(tag), Some(typ), Some(count), Some(raw_val)) = (
+                rd16_slice(&table, e),
+                rd16_slice(&table, e + 2),
+                rd32_slice(&table, e + 4),
+                rd32_slice(&table, e + 8),
+            ) else {
+                continue;
+            };
+
+            let val = if typ == 3 && count == 1 {
+                rd16_slice(&table, e + 8).map(|v| v as u32).unwrap_or(raw_val)
+            } else {
+                raw_val
+            };
+
+            match tag {
+                258 => {
+                    if count == 1 {
+                        bits_per_sample = Some(val);
+                    } else if typ == 3 && count == 2 {
+                        bits_per_sample = rd16_slice(&table, e + 8).map(|v| v as u32);
+                    } else if count >= 3 && count <= 8 {
+                        bps_ptr = Some((typ, count, raw_val as u64));
+                    }
+                }
+                259 => compression = val,
+                262 => photometric = Some(val),
+                273 if count == 1 => strip_off = Some(val as u64),
+                274 => {
+                    ifd_orientation = Some(val);
+                    if primary_orientation.is_none() {
+                        primary_orientation = Some(val);
+                    }
+                }
+                279 if count == 1 => strip_len = Some(val as u64),
+                513 => jpeg_off = Some(val as u64),
+                514 => jpeg_len = Some(val as u64),
+                330 => {
+                    if count == 1 {
+                        queue.push(val as u64);
+                    } else if count > 1 && count <= 16 {
+                        sub_ifd_ptrs.push((count, raw_val as u64));
+                    }
+                }
+                0xC640 => has_cr2_slices = true,
+                _ => {}
+            }
+        }
+
+        if let Some((typ, _cnt, ptr)) = bps_ptr
+            && typ == 3
+            && ptr + 2 <= file_len
+            && file.seek(SeekFrom::Start(ptr)).is_ok()
+        {
+            let mut b2 = [0u8; 2];
+            if file.read_exact(&mut b2).is_ok() {
+                bits_per_sample = rd16_slice(&b2, 0).map(|v| v as u32);
+            }
+        }
+
+        for (cnt, ptr) in sub_ifd_ptrs {
+            let byte_cnt = (cnt as usize) * 4;
+            if ptr + (byte_cnt as u64) <= file_len && file.seek(SeekFrom::Start(ptr)).is_ok() {
+                let mut sbuf = vec![0u8; byte_cnt];
+                if file.read_exact(&mut sbuf).is_ok() {
+                    for j in 0..cnt as usize {
+                        if let Some(sub_off) = rd32_slice(&sbuf, j * 4)
+                            && sub_off > 0
+                        {
+                            queue.push(sub_off as u64);
+                        }
+                    }
+                }
+            }
+        }
+
+        let orient = ifd_orientation.or(primary_orientation).unwrap_or(1);
+        let is_raw_sensor_ifd = has_cr2_slices
+            || matches!(photometric, Some(32803 | 34892))
+            || bits_per_sample.is_some_and(|bps| bps > 8);
+
+        if !is_raw_sensor_ifd
+            && matches!(compression, 6 | 7)
+            && let (Some(off), Some(len)) = (strip_off, strip_len)
+            && len > 256
+            && len <= 32 * 1024 * 1024
+            && off.saturating_add(len) <= file_len
+        {
+            candidates.push((off, len, orient));
+        }
+
+        if !is_raw_sensor_ifd
+            && let (Some(off), Some(len)) = (jpeg_off, jpeg_len)
+            && len > 256
+            && len <= 32 * 1024 * 1024
+            && off.saturating_add(len) <= file_len
+        {
+            candidates.push((off, len, orient));
+        }
+
+        if let Some(next_ifd) = rd32_slice(&table, (entry_count as usize) * 12)
+            && next_ifd > 0
+        {
+            queue.push(next_ifd as u64);
+        }
+    }
+
+    candidates.sort_by_key(|&(_, len, _)| std::cmp::Reverse(len));
+    candidates.dedup_by_key(|c| (c.0, c.1));
+
+    for (off, len, orient) in candidates {
+        if file.seek(SeekFrom::Start(off)).is_err() {
+            continue;
+        }
+        // Check JPEG SOI marker (FF D8 FF) before reading megabytes over USB
+        let mut soi = [0u8; 3];
+        if file.read_exact(&mut soi).is_err() || soi != [0xFF, 0xD8, 0xFF] {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(off)).is_err() {
+            continue;
+        }
+        let mut jpeg_buf = vec![0u8; len as usize];
+        if file.read_exact(&mut jpeg_buf).is_err() {
+            continue;
+        }
+        if let Ok(img) = image::load_from_memory_with_format(&jpeg_buf, image::ImageFormat::Jpeg) {
+            let oriented = apply_exif_orientation(img, orient);
+            if oriented.width().max(oriented.height()) >= min_dim {
+                return Some(oriented);
+            }
+        }
+    }
+
+    None
+}
+
+pub fn try_load_embedded_raw_preview(source_path: &Path, target_res: u32) -> Option<DynamicImage> {
+    let min_dim = (target_res as f32 * 0.95) as u32;
+
+    // Fast path: seek-only TIFF/CR2/NEF/ARW/DNG embedded JPEG extraction (~1-3 MB read instead of 30-60 MB)
+    if let Some(preview) = try_extract_tiff_jpeg_preview_seek(source_path, min_dim) {
+        return Some(preview);
+    }
+
+    let mmap = read_file_mapped(source_path).ok()?;
+    let path_lossy = source_path.to_string_lossy();
+
+    // Linear DNGs with no embedded JPEG preview must fall through to full 32-bit Linear DNG thumbnail render
+    if image_loader::is_linear_dng_file(&path_lossy, &mmap) {
+        return None;
+    }
+
+    if let Some(exif) = exif_processing::read_exif(&mmap)
+        && let Some(preview) = exif_embedded_preview(&exif)
+        && preview.width().max(preview.height()) >= min_dim
+    {
+        return Some(preview);
+    }
+
+    let preview = image_loader::safe_embedded_preview_fallback(&mmap, &path_lossy)?;
+    (preview.width().max(preview.height()) >= min_dim).then_some(preview)
 }
 
 pub fn generate_thumbnail_data(
@@ -1932,9 +2271,8 @@ fn generate_single_thumbnail_and_cache(
     None
 }
 
-fn prefetch_source_file(path_str: &str) {
-    let (source_path, _) = parse_virtual_path(path_str);
-    let _ = fs::read(&source_path);
+fn prefetch_source_file(_path_str: &str) {
+    // Redundant whole-file prefetch eliminated to avoid bus saturation and 2x I/O duplication
 }
 
 pub fn start_thumbnail_workers(app_handle: tauri::AppHandle) {
@@ -1977,10 +2315,7 @@ pub fn start_thumbnail_workers(app_handle: tauri::AppHandle) {
                     crate::gpu_processing::get_or_init_gpu_context(&state, &app_clone).ok();
 
                 if let Ok(cache_dir) = get_thumb_cache_dir(&app_clone) {
-                    if manager_clone.rotational_disk.load(Ordering::Relaxed) {
-                        let _io_permit = manager_clone.io_gate.lock().unwrap();
-                        prefetch_source_file(&path_to_process);
-                    }
+                    // Whole-file prefetch removed to eliminate USB queue congestion
 
                     let result = generate_single_thumbnail_and_cache(
                         &path_to_process,

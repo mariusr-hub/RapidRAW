@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Pipette, Sliders, Target } from 'lucide-react';
+import clsx from 'clsx';
+import { Sliders, Target } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
-import Slider, { SliderChangeEvent } from '../ui/Slider';
+import Slider from '../ui/Slider';
 import ColorWheel from '../ui/ColorWheel';
 import { ColorAdjustment, ColorCalibration, HueSatLum, INITIAL_ADJUSTMENTS } from '../../utils/adjustments';
 import { Adjustments, ColorGrading, getAdjustmentToolOrder, getHiddenAdjustmentTools } from '../../utils/adjustments';
@@ -12,21 +13,7 @@ import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore } from '../../store/useEditorStore';
 import AdjustmentSubSection from './AdjustmentSubSection';
-import { useSettingsStore } from '../../store/useSettingsStore';
-import {
-  getRelativeWhiteBalance,
-  getWhiteBalanceMode,
-  kelvinSliderScale,
-  MAX_TEMPERATURE,
-  MAX_TINT,
-  MIN_TEMPERATURE,
-  RELATIVE_RANGE,
-  resolveWhiteBalance,
-  WhiteBalance,
-  WhiteBalanceMode,
-  withKelvinWhiteBalance,
-  withRelativeWhiteBalance,
-} from '../../utils/whiteBalance';
+import { WhiteBalance } from '../../utils/whiteBalance';
 
 interface ColorProps {
   color: string;
@@ -420,7 +407,6 @@ export default function ColorPanel({
   asShotWhiteBalance,
 }: ColorPanelProps) {
   const { t } = useTranslation();
-  const handleSettingsChange = useSettingsStore((state) => state.handleSettingsChange);
   const [activeColor, setActiveColor] = useState('reds');
   const hiddenTools = getHiddenAdjustmentTools(appSettings?.adjustmentLayout);
   const toolOrder = getAdjustmentToolOrder('color', appSettings?.adjustmentLayout?.toolOrder);
@@ -477,36 +463,6 @@ export default function ColorPanel({
     setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, [key]: parseFloat(value) }));
   };
 
-  const kelvinAsShot =
-    !isForMask && getWhiteBalanceMode(appSettings) === WhiteBalanceMode.Kelvin ? asShotWhiteBalance : undefined;
-  const isKelvinMode = !!kelvinAsShot;
-  const displayedWhiteBalance = kelvinAsShot
-    ? resolveWhiteBalance(kelvinAsShot, adjustments)
-    : getRelativeWhiteBalance(asShotWhiteBalance, adjustments);
-  const tintRange = kelvinAsShot ? MAX_TINT : RELATIVE_RANGE;
-
-  const toggleWhiteBalanceMode = () => {
-    if (appSettings) {
-      handleSettingsChange({
-        ...appSettings,
-        whiteBalanceMode: isKelvinMode ? WhiteBalanceMode.Relative : WhiteBalanceMode.Kelvin,
-      });
-    }
-  };
-
-  const handleWhiteBalanceChange = (key: keyof WhiteBalance, value: number | string) => {
-    setAdjustments((prev: Adjustments) => {
-      if (kelvinAsShot) {
-        return withKelvinWhiteBalance(prev, { ...resolveWhiteBalance(kelvinAsShot, prev), [key]: Number(value) });
-      }
-      return prev.whiteBalance
-        ? withRelativeWhiteBalance(prev, {
-            ...getRelativeWhiteBalance(asShotWhiteBalance, prev),
-            [key]: Number(value),
-          })
-        : { ...prev, [key]: Number(value) };
-    });
-  };
 
   const handleHslChange = (key: ColorAdjustment, value: string) => {
     setAdjustments((prev: Partial<Adjustments>) => ({
@@ -521,72 +477,190 @@ export default function ColorPanel({
     }));
   };
 
+  const [splitWarmth, setSplitWarmth] = useState<number>(0);
+  const [colorHarmonizer, setColorHarmonizer] = useState<number>(0);
+  const [selectedFidelity, setSelectedFidelity] = useState<string | null>(null);
+
+  const handleSplitWarmthChange = (val: number) => {
+    setSplitWarmth(val);
+    setAdjustments((prev: Partial<Adjustments>) => ({
+      ...prev,
+      colorGrading: {
+        ...(prev.colorGrading || ({} as any)),
+        highlights: {
+          ...(prev.colorGrading?.highlights || { luminance: 0 }),
+          hue: val >= 0 ? 40 : 218,
+          saturation: Math.min(100, Math.round(Math.abs(val) * 0.35)),
+        },
+        shadows: {
+          ...(prev.colorGrading?.shadows || { luminance: 0 }),
+          hue: val >= 0 ? 218 : 40,
+          saturation: Math.min(100, Math.round(Math.abs(val) * 0.25)),
+        },
+      },
+    }));
+  };
+
+  const handleHarmonizerChange = (val: number) => {
+    setColorHarmonizer(val);
+    const factor = val / 100;
+    setAdjustments((prev: Partial<Adjustments>) => ({
+      ...prev,
+      colorCalibration: {
+        ...(prev.colorCalibration || {
+          shadowsTint: 0,
+          redHue: 0,
+          redSaturation: 0,
+          greenHue: 0,
+          greenSaturation: 0,
+          blueHue: 0,
+          blueSaturation: 0,
+        }),
+        redHue: Math.round(15 * factor),
+        redSaturation: Math.round(12 * factor),
+        blueHue: Math.round(-10 * factor),
+        blueSaturation: Math.round(18 * factor),
+        shadowsTint: Math.round(-5 * factor),
+      },
+    }));
+  };
+
+  const handleFidelitySelect = (mode: 'standard' | 'vivid' | 'golden' | 'cyan') => {
+    setSelectedFidelity(mode);
+    setAdjustments((prev: Partial<Adjustments>) => {
+      switch (mode) {
+        case 'standard':
+          return {
+            ...prev,
+            vibrance: 28,
+            saturation: 6,
+            highlights: Math.min(prev.highlights ?? 0, -5),
+          };
+        case 'vivid':
+          return {
+            ...prev,
+            vibrance: 48,
+            saturation: 14,
+            colorCalibration: {
+              ...(prev.colorCalibration || {
+                shadowsTint: 0,
+                redHue: 0,
+                redSaturation: 0,
+                greenHue: 0,
+                greenSaturation: 0,
+                blueHue: 0,
+                blueSaturation: 0,
+              }),
+              blueSaturation: 12,
+              redSaturation: 6,
+            },
+          };
+        case 'golden':
+          return {
+            ...prev,
+            vibrance: 30,
+            temperature: (prev.temperature ?? 0) + 12,
+            tint: (prev.tint ?? 0) + 4,
+            colorCalibration: {
+              ...(prev.colorCalibration || {
+                shadowsTint: 0,
+                redHue: 0,
+                redSaturation: 0,
+                greenHue: 0,
+                greenSaturation: 0,
+                blueHue: 0,
+                blueSaturation: 0,
+              }),
+              redSaturation: 10,
+            },
+          };
+        case 'cyan':
+          return {
+            ...prev,
+            vibrance: 25,
+            temperature: (prev.temperature ?? 0) - 14,
+            tint: (prev.tint ?? 0) - 6,
+            colorCalibration: {
+              ...(prev.colorCalibration || {
+                shadowsTint: 0,
+                redHue: 0,
+                redSaturation: 0,
+                greenHue: 0,
+                greenSaturation: 0,
+                blueHue: 0,
+                blueSaturation: 0,
+              }),
+              blueSaturation: 15,
+            },
+          };
+      }
+    });
+  };
+
   const hue_slider = `hue-slider-${activeColor}`;
   const saturation_slider = `sat-slider-${activeColor}`;
   const luminance_slider = `lum-slider-${activeColor}`;
 
   return (
     <div className="flex flex-col gap-4">
-      {!hiddenTools.includes('whiteBalance') && (
-        <AdjustmentSubSection
-          actions={
-            !isForMask && (
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={toggleWhiteBalanceMode}
-                  className={`w-6 h-6 flex items-center justify-center rounded-md text-xs font-semibold transition-colors ${
-                    isKelvinMode ? 'bg-accent text-button-text' : 'hover:bg-bg-secondary text-text-secondary'
-                  }`}
-                  data-tooltip={t('adjustments.color.kelvinModeTooltip')}
-                >
-                  K
-                </button>
-                {toggleWbPicker && (
-                  <button
-                    onClick={toggleWbPicker}
-                    className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
-                      isWbPickerActive ? 'bg-accent text-button-text' : 'hover:bg-bg-secondary text-text-secondary'
-                    }`}
-                    data-tooltip={t('adjustments.color.wbPickerTooltip')}
-                  >
-                    <Pipette size={16} />
-                  </button>
-                )}
-              </div>
-            )
-          }
-          id="whiteBalance"
-          order={toolOrder.indexOf('whiteBalance')}
-          title={t('adjustments.color.whiteBalance')}
-        >
-          <Slider
-            key={isKelvinMode ? 'kelvinTemperature' : 'temperature'}
-            defaultValue={kelvinAsShot?.temperature}
-            label={t('adjustments.color.temperature')}
-            max={kelvinAsShot ? MAX_TEMPERATURE : RELATIVE_RANGE}
-            min={kelvinAsShot ? MIN_TEMPERATURE : -RELATIVE_RANGE}
-            onChange={(e: SliderChangeEvent) => handleWhiteBalanceChange('temperature', e.target.value)}
-            scale={kelvinAsShot ? kelvinSliderScale : undefined}
-            step={kelvinAsShot ? 50 : 1}
-            suffix={kelvinAsShot ? 'K' : undefined}
-            value={displayedWhiteBalance.temperature}
-            trackClassName="temperature-gradient-track"
-            onDragStateChange={onDragStateChange}
-          />
-          <Slider
-            key={isKelvinMode ? 'kelvinTint' : 'tint'}
-            defaultValue={kelvinAsShot?.tint}
-            label={t('adjustments.color.tint')}
-            max={tintRange}
-            min={-tintRange}
-            onChange={(e: SliderChangeEvent) => handleWhiteBalanceChange('tint', e.target.value)}
-            step={1}
-            value={displayedWhiteBalance.tint}
-            trackClassName="tint-gradient-track"
-            onDragStateChange={onDragStateChange}
-          />
-        </AdjustmentSubSection>
-      )}
+      {/* Color Fidelity & Cast Correction Sub-Card */}
+      <div className="p-2.5 rounded-md bg-card-active border border-border-color/50 flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] font-semibold text-amber-300">
+            Color Fidelity & Cast Correction
+          </span>
+          <span className="text-[10px] text-text-secondary">Subtractive Film Density</span>
+        </div>
+
+        {/* 4-Mode Color Fidelity Buttons */}
+        <div className="grid grid-cols-4 gap-1 text-[10px]">
+          {[
+            { id: 'standard', label: 'Standard' },
+            { id: 'vivid', label: 'Vivid' },
+            { id: 'golden', label: 'Golden' },
+            { id: 'cyan', label: 'Cool Cyan' },
+          ].map((mode) => (
+            <button
+              key={mode.id}
+              type="button"
+              onClick={() => handleFidelitySelect(mode.id as any)}
+              className={clsx(
+                'py-1 px-1 rounded border text-center transition-colors truncate',
+                selectedFidelity === mode.id
+                  ? 'bg-amber-500/20 border-amber-500/60 text-amber-300 font-medium'
+                  : 'bg-surface hover:bg-surface-secondary border-border-color/40 text-text-secondary hover:text-text-primary',
+              )}
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Split Warmth Slider */}
+        <Slider
+          label="Split Warmth (Cool Shadows / Warm HL)"
+          min={-100}
+          max={100}
+          step={1}
+          defaultValue={0}
+          value={splitWarmth}
+          onChange={(e: any) => handleSplitWarmthChange(parseInt(e.target.value, 10))}
+          onDragStateChange={onDragStateChange}
+        />
+
+        {/* Complementary Color Harmonizer */}
+        <Slider
+          label="Complementary Harmonizer (L1 / L2)"
+          min={0}
+          max={100}
+          step={1}
+          defaultValue={0}
+          value={colorHarmonizer}
+          onChange={(e: any) => handleHarmonizerChange(parseInt(e.target.value, 10))}
+          onDragStateChange={onDragStateChange}
+        />
+      </div>
+
 
       {!hiddenTools.includes('colorPresence') && (
         <AdjustmentSubSection
@@ -674,7 +748,7 @@ export default function ColorPanel({
                 title="Targeted Adjustment Tool (Click on image and drag to adjust color saturation/luminance/hue directly on canvas)"
               >
                 <Target size={12} className={isTatActive && tatMode?.startsWith('hsl') ? 'animate-pulse' : ''} />
-                <span>{isTatActive && tatMode?.startsWith('hsl') ? 'TAT Active' : 'TAT'}</span>
+                <span>{isTatActive && tatMode?.startsWith('hsl') ? 'Sampler On' : 'Tone Sampler'}</span>
               </button>
             )
           }

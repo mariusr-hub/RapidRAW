@@ -1468,7 +1468,57 @@ pub struct GlobalAdjustments {
     pub halation_amount: f32,
     pub flare_amount: f32,
     pub sharpness_threshold: f32,
+
+    // Phase 1: SNS-HDR Lights Sub-Pipeline & Halo-Free Contrast Cleaner (16 bytes)
+    pub lights_brightness: f32,
+    pub lights_contrast: f32,
+    pub lights_details: f32,
+    pub contrast_cleaner_strength: f32,
+
+    // Phase 1: Lights Dedicated White Balance & Saturation (16 bytes)
+    pub lights_wb_temp: f32,
+    pub lights_wb_tint: f32,
+    pub lights_saturation: f32,
+    pub lights_vibrance: f32,
+
+    // Phase 1: Supercontrast 3-Band Parametric Cubic Hermite Pivots (16 bytes)
+    pub supercontrast_shadows: f32,
+    pub supercontrast_midtones: f32,
+    pub supercontrast_highlights: f32,
+    pub supercontrast_pivots: f32,
+
+    // Phase 1: Skin-Shielded Structure & Orton Soft-Light Spread (16 bytes)
+    pub skin_shield_strength: f32,
+    pub orton_spread: f32,
+    pub foliage_enhancer: f32,
+    pub _pad_phase1_end: f32,
+
+    // Phase 1: Real-Time GPU 6th-Order Lens Distortion & AutoCrop (16 bytes)
+    pub lens_k1: f32,
+    pub lens_k2: f32,
+    pub lens_k3: f32,
+    pub lens_autocrop_scale: f32,
+
+    // Phase 1: Lens Center & Feature Enable Flag (16 bytes)
+    pub lens_center_x: f32,
+    pub lens_center_y: f32,
+    pub lens_distortion_enabled: u32,
+    pub _pad_lens: f32,
+
+    // Phase 3 & 4: Spatially-Varying Lens Softness & HLR (16 bytes)
+    pub corner_sharpness_boost: f32,
+    pub bokeh_mask_protection: f32,
+    pub hlr_enabled: u32,
+    pub hlr_clip_ceiling: f32,
+
+    // Phase 5 & 6: ClearView Plus & MicroContrast V3 (16 bytes)
+    pub clearview_strength: f32,
+    pub clearview_t0: f32,
+    pub micro_contrast: f32,
+    pub _pad_reserved: f32,
 }
+
+const _: () = assert!(std::mem::size_of::<GlobalAdjustments>() % 16 == 0);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
 #[repr(C)]
@@ -2095,6 +2145,24 @@ fn get_global_adjustments_from_json(
 ) -> GlobalAdjustments {
     let is_visible = |tool: &str| is_tool_active(js_adjustments, tool);
 
+    let get_scoped_val = |tool: &str, keys: &[&str], scale: f32, default_val: f64| -> f32 {
+        if !is_visible(tool) {
+            return default_val as f32 / scale;
+        }
+        if let Some(tool_obj) = js_adjustments.get(tool) {
+            for &k in keys {
+                if let Some(v) = tool_obj.get(k).and_then(|v| v.as_f64()) {
+                    return (v as f32) / scale;
+                }
+            }
+        }
+        for &k in keys {
+            if let Some(v) = js_adjustments.get(k).and_then(|v| v.as_f64()) {
+                return (v as f32) / scale;
+            }
+        }
+        default_val as f32 / scale
+    };
     let get_val = |tool: &str, key: &str, scale: f32, default: Option<f64>| -> f32 {
         if is_visible(tool) {
             js_adjustments[key]
@@ -2210,6 +2278,38 @@ fn get_global_adjustments_from_json(
     } else {
         (0, 1.0, 0)
     };
+
+    let lens_distortion_enabled = js_adjustments
+        .get("lensDistortionEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let (lens_k1, lens_k2, lens_k3, gpu_lens_enabled) = if let Some(val) = js_adjustments.get("lensDistortionParams") {
+        if let Ok(params) = serde_json::from_value::<crate::lens_correction::LensDistortionParams>(val.clone()) {
+            params.to_gpu_render_uniforms(lens_distortion_enabled)
+        } else {
+            let k1 = val.get("k1").and_then(|k| k.as_f64()).unwrap_or(0.0) as f32;
+            let k2 = val.get("k2").and_then(|k| k.as_f64()).unwrap_or(0.0) as f32;
+            let k3 = val.get("k3").and_then(|k| k.as_f64()).unwrap_or(0.0) as f32;
+            let en = if lens_distortion_enabled && (k1.abs() > 1e-6 || k2.abs() > 1e-6 || k3.abs() > 1e-6) { 1u32 } else { 0u32 };
+            (k1, k2, k3, en)
+        }
+    } else {
+        (0.0, 0.0, 0.0, 0u32)
+    };
+
+    let target_w = js_adjustments
+        .get("originalWidth")
+        .or_else(|| js_adjustments.get("width"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(6000.0) as f32;
+    let target_h = js_adjustments
+        .get("originalHeight")
+        .or_else(|| js_adjustments.get("height"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(4000.0) as f32;
+    let geom_for_crop = get_geometry_params_from_json(js_adjustments);
+    let lens_autocrop_scale = compute_lens_auto_crop_scale(&geom_for_crop, target_w, target_h) as f32;
 
     GlobalAdjustments {
         exposure: get_val("basic", "exposure", SCALES.exposure, None) + baseline_exposure,
@@ -2387,6 +2487,52 @@ fn get_global_adjustments_from_json(
             SCALES.sharpness_threshold,
             Some(15.0),
         ),
+
+        // Phase 1: SNS-HDR Lights Sub-Pipeline & Zero-Halo Micro-Contrast
+        lights_brightness: get_scoped_val("lights", &["lightsBrightness", "brightness", "lights_brightness"], 1.0, 0.0),
+        lights_contrast: get_scoped_val("lights", &["lightsContrast", "contrast", "lights_contrast"], 1.0, 0.0),
+        lights_details: get_scoped_val("lights", &["lightsDetails", "details", "lights_details"], 1.0, 0.0),
+        contrast_cleaner_strength: get_scoped_val("presence", &["contrastCleaner", "contrast_cleaner"], 1.0, 1.0),
+
+        // Phase 1: Lights Dedicated White Balance & Saturation
+        lights_wb_temp: get_scoped_val("lights", &["lightsTemperature", "lightsTemp", "temperature", "lights_wb_temp"], 1.0, 0.0),
+        lights_wb_tint: get_scoped_val("lights", &["lightsTint", "tint", "lights_wb_tint"], 1.0, 0.0),
+        lights_saturation: get_scoped_val("lights", &["lightsSaturation", "saturation", "lights_saturation"], 1.0, 0.0),
+        lights_vibrance: get_scoped_val("lights", &["lightsVibrance", "vibrance", "lights_vibrance"], 1.0, 0.0),
+
+        // Phase 1: Supercontrast 3-Band Parametric Cubic Hermite Pivots
+        supercontrast_shadows: get_scoped_val("supercontrast", &["supercontrastShadows", "shadows", "supercontrast_shadows"], 1.0, 0.0),
+        supercontrast_midtones: get_scoped_val("supercontrast", &["supercontrastMidtones", "midtones", "supercontrast_midtones"], 1.0, 0.0),
+        supercontrast_highlights: get_scoped_val("supercontrast", &["supercontrastHighlights", "highlights", "supercontrast_highlights"], 1.0, 0.0),
+        supercontrast_pivots: get_scoped_val("supercontrast", &["supercontrastPivots", "pivots", "supercontrast_pivots"], 1.0, 0.0),
+
+        // Phase 1: Skin-Shielded Structure & Orton Soft-Light Spread
+        skin_shield_strength: get_scoped_val("presence", &["skinShield", "skin_shield"], 1.0, 0.90),
+        orton_spread: get_scoped_val("creative", &["ortonSpread", "orton_spread"], 1.0, 0.0),
+        foliage_enhancer: get_scoped_val("creative", &["foliageEnhancer", "foliage_enhancer"], 1.0, 0.0),
+        _pad_phase1_end: 0.0,
+
+        // Phase 1: Real-Time GPU 6th-Order Lens Distortion & AutoCrop
+        lens_k1,
+        lens_k2,
+        lens_k3,
+        lens_autocrop_scale,
+        lens_center_x: 0.5,
+        lens_center_y: 0.5,
+        lens_distortion_enabled: gpu_lens_enabled,
+        _pad_lens: 0.0,
+
+        // Phase 3 & 4: Spatially-Varying Lens Softness & HLR
+        corner_sharpness_boost: get_scoped_val("details", &["cornerSharpnessBoost", "corner_sharpness_boost"], 1.0, 0.0),
+        bokeh_mask_protection: get_scoped_val("details", &["bokehMaskProtection", "bokeh_mask_protection"], 1.0, 0.0),
+        hlr_enabled: if is_tool_active(js_adjustments, "hlr") || js_adjustments.get("hlrEnabled").and_then(|v| v.as_bool()).unwrap_or(true) { 1 } else { 0 },
+        hlr_clip_ceiling: js_adjustments.get("hlrClipCeiling").and_then(|v| v.as_f64()).unwrap_or(0.95) as f32,
+
+        // Phase 5 & 6: ClearView Plus & MicroContrast V3
+        clearview_strength: get_scoped_val("presence", &["clearView", "clearview", "clearViewStrength"], 1.0, 0.0),
+        clearview_t0: 0.12,
+        micro_contrast: get_scoped_val("details", &["microContrast", "micro_contrast"], 1.0, 0.0),
+        _pad_reserved: 0.0,
     }
 }
 

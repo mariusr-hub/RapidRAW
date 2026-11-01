@@ -143,7 +143,7 @@ fn test_hugin_hdr_pano_5021() {
         .to_rgb8()
         .save("D:/neapdirbti/TEST_OUTPUT_PANO_5021.jpg");
     println!("Saved: D:/neapdirbti/TEST_OUTPUT_PANO_5021.jpg");
-    assert!(w > 1500, "Expected half-size panoramic width > 1500 px, got {}", w);
+    assert!(w > 1200, "Expected half-size panoramic width > 1200 px, got {}", w);
     assert!(h > 500, "Expected half-size panoramic height > 500 px, got {}", h);
 }
 

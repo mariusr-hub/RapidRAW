@@ -79,6 +79,10 @@ export enum DetailsAdjustment {
   SharpnessThreshold = 'sharpnessThreshold',
   ChromaticAberrationRedCyan = 'chromaticAberrationRedCyan',
   ChromaticAberrationBlueYellow = 'chromaticAberrationBlueYellow',
+  CornerSharpnessBoost = 'cornerSharpnessBoost',
+  BokehMaskProtection = 'bokehMaskProtection',
+  MicroContrast = 'microContrast',
+  ClearView = 'clearView',
 }
 
 export enum Effect {
@@ -396,6 +400,21 @@ export interface Adjustments {
   vignetteRoundness: number;
   whiteBalance: WhiteBalance | null;
   whites: number;
+  contrastCleaner: number;
+  skinShield: number;
+  foliageEnhancer: number;
+  ortonSpread: number;
+  lightsBrightness: number;
+  lightsContrast: number;
+  lightsDetails: number;
+  lightsTemperature: number;
+  lightsTint: number;
+  lightsSaturation: number;
+  lightsVibrance: number;
+  supercontrastShadows: number;
+  supercontrastMidtones: number;
+  supercontrastHighlights: number;
+  supercontrastPivots: number;
 }
 
 export interface AiPatch {
@@ -807,6 +826,10 @@ export interface AdjustmentGroup {
 export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
   basic: [
     {
+      label: 'modals.copyPaste.groups.whiteBalance',
+      keys: [ColorAdjustment.Temperature, ColorAdjustment.Tint, ColorAdjustment.WhiteBalance],
+    },
+    {
       label: 'modals.copyPaste.groups.exposureToneMapper',
       keys: [BasicAdjustment.Exposure, 'toneMapper'],
     },
@@ -827,10 +850,6 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
     },
   ],
   color: [
-    {
-      label: 'modals.copyPaste.groups.whiteBalance',
-      keys: [ColorAdjustment.Temperature, ColorAdjustment.Tint, ColorAdjustment.WhiteBalance],
-    },
     { label: 'modals.copyPaste.groups.presence', keys: [ColorAdjustment.Saturation, ColorAdjustment.Vibrance] },
     {
       label: 'modals.copyPaste.groups.hueShift',
@@ -847,6 +866,7 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
         DetailsAdjustment.Clarity,
         DetailsAdjustment.Structure,
         DetailsAdjustment.Dehaze,
+        DetailsAdjustment.ClearView,
         DetailsAdjustment.Centré,
         DetailsAdjustment.CentréX,
         DetailsAdjustment.CentréY,
@@ -854,7 +874,13 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
     },
     {
       label: 'modals.copyPaste.groups.sharpness',
-      keys: [DetailsAdjustment.Sharpness, DetailsAdjustment.SharpnessThreshold],
+      keys: [
+        DetailsAdjustment.Sharpness,
+        DetailsAdjustment.SharpnessThreshold,
+        DetailsAdjustment.CornerSharpnessBoost,
+        DetailsAdjustment.BokehMaskProtection,
+        DetailsAdjustment.MicroContrast,
+      ],
     },
     {
       label: 'modals.copyPaste.groups.noiseReduction',
@@ -941,6 +967,9 @@ export const COPYABLE_ADJUSTMENT_KEYS: string[] = Object.values(ADJUSTMENT_GROUP
 
 export const ADJUSTMENT_SECTIONS: Sections = {
   basic: [
+    ColorAdjustment.Temperature,
+    ColorAdjustment.Tint,
+    ColorAdjustment.WhiteBalance,
     BasicAdjustment.Brightness,
     BasicAdjustment.Contrast,
     BasicAdjustment.Highlights,
@@ -949,13 +978,26 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     BasicAdjustment.Blacks,
     BasicAdjustment.Exposure,
     'toneMapper',
+    'lightsBrightness',
+    'lightsContrast',
+    'lightsDetails',
+    'lightsTemperature',
+    'lightsTint',
+    'lightsSaturation',
+    'lightsVibrance',
   ],
-  curves: ['curves', 'pointCurves', 'parametricCurve', 'curveMode'],
+  curves: [
+    'curves',
+    'pointCurves',
+    'parametricCurve',
+    'curveMode',
+    'supercontrastShadows',
+    'supercontrastMidtones',
+    'supercontrastHighlights',
+    'supercontrastPivots',
+  ],
   color: [
     ColorAdjustment.Saturation,
-    ColorAdjustment.Temperature,
-    ColorAdjustment.Tint,
-    ColorAdjustment.WhiteBalance,
     ColorAdjustment.Vibrance,
     ColorAdjustment.Hsl,
     ColorAdjustment.ColorGrading,
@@ -965,12 +1007,16 @@ export const ADJUSTMENT_SECTIONS: Sections = {
   details: [
     DetailsAdjustment.Clarity,
     DetailsAdjustment.Dehaze,
+    DetailsAdjustment.ClearView,
     DetailsAdjustment.Structure,
     DetailsAdjustment.Centré,
     DetailsAdjustment.CentréX,
     DetailsAdjustment.CentréY,
     DetailsAdjustment.Sharpness,
     DetailsAdjustment.SharpnessThreshold,
+    DetailsAdjustment.CornerSharpnessBoost,
+    DetailsAdjustment.BokehMaskProtection,
+    DetailsAdjustment.MicroContrast,
     DetailsAdjustment.LumaNoiseReduction,
     DetailsAdjustment.ColorNoiseReduction,
     DetailsAdjustment.AiDenoiseEnabled,
@@ -1061,8 +1107,10 @@ export interface AdjustmentSectionTool {
 }
 
 export const ADJUSTMENT_SECTION_TOOLS: Record<string, Array<AdjustmentSectionTool>> = {
-  color: [
+  basic: [
     { id: 'whiteBalance', label: 'adjustments.color.whiteBalance' },
+  ],
+  color: [
     { id: 'colorPresence', label: 'adjustments.color.presence' },
     { id: 'hue', label: 'adjustments.color.hue' },
     { id: 'colorGrading', label: 'adjustments.color.colorGrading' },

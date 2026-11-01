@@ -225,19 +225,53 @@ pub fn box_filter(src: &Plane, radius: usize) -> Plane {
 }
 
 pub fn downsample(src: &Plane) -> Plane {
-    const K: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
-    let blurred = convolve_separable(src, &K);
-    let w2 = src.w.div_ceil(2).max(1);
-    let h2 = src.h.div_ceil(2).max(1);
+    if src.w == 0 || src.h == 0 {
+        return Plane::new(0, 0);
+    }
+    let (w, h) = (src.w, src.h);
+    let w2 = w.div_ceil(2).max(1);
+    let h2 = h.div_ceil(2).max(1);
+
+    let mut tmp_h = Plane::new(w2, h);
+    let max_x = (w - 1) as i64;
+    tmp_h
+        .data
+        .par_chunks_mut(w2)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            let src_row = &src.data[y * w..(y + 1) * w];
+            for x2 in 0..w2 {
+                let sx = (2 * x2) as i64;
+                let p_m2 = src_row[(sx - 2).clamp(0, max_x) as usize];
+                let p_m1 = src_row[(sx - 1).clamp(0, max_x) as usize];
+                let p_0 = src_row[sx.clamp(0, max_x) as usize];
+                let p_p1 = src_row[(sx + 1).clamp(0, max_x) as usize];
+                let p_p2 = src_row[(sx + 2).clamp(0, max_x) as usize];
+                row_out[x2] = 0.0625 * (p_m2 + p_p2) + 0.25 * (p_m1 + p_p1) + 0.375 * p_0;
+            }
+        });
+
     let mut out = Plane::new(w2, h2);
+    let max_y = (h - 1) as i64;
     out.data
         .par_chunks_mut(w2)
         .enumerate()
-        .for_each(|(y, row)| {
-            let sy = (2 * y).min(src.h.saturating_sub(1));
-            for (x, out_val) in row.iter_mut().enumerate() {
-                let sx = (2 * x).min(src.w.saturating_sub(1));
-                *out_val = blurred.data[sy * src.w + sx];
+        .for_each(|(y2, row_out)| {
+            let sy = (2 * y2) as i64;
+            let y_m2 = (sy - 2).clamp(0, max_y) as usize;
+            let y_m1 = (sy - 1).clamp(0, max_y) as usize;
+            let y_0 = sy.clamp(0, max_y) as usize;
+            let y_p1 = (sy + 1).clamp(0, max_y) as usize;
+            let y_p2 = (sy + 2).clamp(0, max_y) as usize;
+
+            let r0 = &tmp_h.data[y_m2 * w2..(y_m2 + 1) * w2];
+            let r1 = &tmp_h.data[y_m1 * w2..(y_m1 + 1) * w2];
+            let r2 = &tmp_h.data[y_0 * w2..(y_0 + 1) * w2];
+            let r3 = &tmp_h.data[y_p1 * w2..(y_p1 + 1) * w2];
+            let r4 = &tmp_h.data[y_p2 * w2..(y_p2 + 1) * w2];
+
+            for x2 in 0..w2 {
+                row_out[x2] = 0.0625 * (r0[x2] + r4[x2]) + 0.25 * (r1[x2] + r3[x2]) + 0.375 * r2[x2];
             }
         });
     out
@@ -401,8 +435,8 @@ pub fn collapse_pyramid(lp: &LaplacianPyramid) -> Plane {
         let up = upsample_to(&cur, d.w, d.h);
         let mut next = up;
         next.data
-            .iter_mut()
-            .zip(d.data.iter())
+            .par_iter_mut()
+            .zip(d.data.par_iter())
             .for_each(|(o, &v)| *o += v);
         cur = next;
     }
@@ -1080,8 +1114,23 @@ pub fn warp_frame(
     (out, mask)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FocusStackMode {
+    /// FST_METHOD_DETAIL: Laplacian energy sharpest-wins fusion (specimens, macro, micro-texture)
+    Detail,
+    /// FST_METHOD_SMOOTH: Continuous MRF depth map guidance with smooth out-of-focus bokeh preservation
+    Smooth,
+}
+
+impl Default for FocusStackMode {
+    fn default() -> Self {
+        FocusStackMode::Detail
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FusionConfig {
+    pub mode: FocusStackMode,
     pub decision_dim: usize,
     pub max_levels: usize,
     pub pool_sigma: f32,
@@ -1096,6 +1145,7 @@ pub struct FusionConfig {
 impl Default for FusionConfig {
     fn default() -> Self {
         FusionConfig {
+            mode: FocusStackMode::Detail,
             decision_dim: 2048,
             max_levels: 9,
             pool_sigma: 2.0,
@@ -1108,6 +1158,7 @@ impl Default for FusionConfig {
         }
     }
 }
+
 
 pub fn guided_filter(guide: &Plane, input: &Plane, radius: usize, eps: f32) -> Plane {
     let mean_i = box_filter(guide, radius);

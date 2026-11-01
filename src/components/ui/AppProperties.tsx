@@ -279,6 +279,7 @@ export interface AppSettings {
   groupPreferredType?: GroupPreference; // legacy
   alwaysDecodeRawThumbnails?: boolean;
   workspace?: WorkspaceState;
+  autoAnalyzeOnOpen?: boolean;
 }
 
 export interface BrushSettings {
@@ -457,10 +458,12 @@ export interface UiVisibility {
 
 export interface CollapsibleSectionsState {
   basic: boolean;
+  lights?: boolean;
   color: boolean;
   curves: boolean;
   details: boolean;
   effects: boolean;
+  [key: string]: boolean | undefined;
 }
 
 export interface AdjustmentLayout {

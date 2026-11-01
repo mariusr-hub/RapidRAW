@@ -7,12 +7,12 @@
       "exposure": "Exposure",
       "highlights": "Highlights",
       "mappers": {
-        "agx": "AgX",
-        "agxDesc": "Film-like Tonemapping",
-        "basic": "Basic",
-        "basicDesc": "Standard Tonemapping",
-        "oklab": "Oklab",
-        "oklabDesc": "Perceptual Color & Highlight Science"
+        "agx": "Film Rolloff",
+        "agxDesc": "Smooth Film-like Highlight Rolloff",
+        "basic": "Standard",
+        "basicDesc": "Neutral Contrast Tonemapping",
+        "oklab": "Perceptual",
+        "oklabDesc": "Perceptual Color & Highlight Preservation"
       },
       "reset": "Reset",
       "nightSkyMagic": "Night Sky & Astro Magic",
@@ -49,6 +49,27 @@
       "toneMapper": "Tone Mapper",
       "whites": "Whites",
       "brightness": "Brightness"
+    },
+    "lights": {
+      "title": "Shadow & Highlight Recovery Details",
+      "desc": "Dedicated highlight recovery, contrast, micro-texture, and color tuning",
+      "brightness": "Highlights Brightness",
+      "contrast": "Highlights Contrast",
+      "details": "Highlights Structure",
+      "temperature": "Highlights Warmth",
+      "tint": "Highlights Tint",
+      "saturation": "Highlights Saturation",
+      "vibrance": "Highlights Vibrance",
+      "reset": "Reset Highlights Pipeline"
+    },
+    "supercontrast": {
+      "title": "Tonal Dynamics",
+      "desc": "Targeted 3-zone shadow, midtone, and highlight contrast balance",
+      "shadows": "Shadows Contrast",
+      "midtones": "Midtones Contrast",
+      "highlights": "Highlights Contrast",
+      "pivots": "Zone Balance",
+      "reset": "Reset Tonal Dynamics"
     },
     "color": {
       "ariaSelectColor": "Select {{name}} color",
@@ -397,10 +418,12 @@
       },
       "sections": {
         "basic": "Basic",
-        "color": "Color",
+        "lights": "Highlights Pipeline",
         "curves": "Curves",
+        "color": "Color",
         "details": "Details",
-        "effects": "Effects"
+        "effects": "Effects",
+        "supercontrast": "Tonal Dynamics"
       },
       "title": "Adjustments",
       "tooltips": {
@@ -467,7 +490,7 @@
       "generatingDepthMap": "Calculating AI Depth Map...",
       "generatingNormalMap": "Calculating AI Normal Map...",
       "generativeEditTitle": "Generative Edit",
-      "inpaintingTitle": "Inpainting",
+      "inpaintingTitle": "Smart Object & Spot Removal",
       "manualCleanupTitle": "Manual Cleanup",
       "noImageSelected": "No image selected.",
       "params": {
@@ -529,7 +552,20 @@
           "twirl": "Twirl"
         }
       },
-      "touchUpTitle": "Touch Up"
+      "touchUpTitle": "Touch Up",
+      "inpaintGuides": {
+        "title": "Structure Guides & Shield",
+        "mode": "Guide Tool",
+        "modes": {
+          "none": "Off",
+          "linepen": "Isophote LinePen",
+          "shield": "Exemplar Shield"
+        },
+        "addLinePen": "Add Directional Guide",
+        "addShield": "Add Protection Shield",
+        "clear": "Clear",
+        "feather": "Corridor Feather"
+      }
     },
     "crop": {
       "aspectRatioHeading": "Aspect Ratio",

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use image::codecs::jpeg::{JpegEncoder, PixelDensity};
 use image::codecs::png::PngEncoder;
 use image::{
-    DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageEncoder, ImageFormat, Luma,
+    DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageEncoder, ImageFormat, Luma, Rgba,
     imageops,
 };
 use jxl_encoder::{
@@ -32,10 +32,11 @@ use crate::file_management::{
 };
 use crate::formats::is_raw_file;
 use crate::image_loader::{load_and_composite, load_base_image_from_bytes, prepare_base_image};
+use crate::raw_processing::srgb_to_linear;
 use crate::image_processing::{
-    AllAdjustments, Crop, GpuContext, RenderOptions, RenderOutputPrecision, RenderRequest,
+    AllAdjustments, Crop, GpuContext, RenderOptions, RenderRequest,
     downscale_f32_image, get_all_adjustments_from_json, get_or_init_gpu_context,
-    process_and_get_dynamic_image, process_and_get_dynamic_image_with_precision,
+    process_and_get_dynamic_image,
     resolve_render_options_from_handle,
 };
 use crate::lut_processing::{
@@ -167,6 +168,30 @@ pub struct ExportSettings {
     #[serde(default)]
     pub dpi: Option<u16>,
 }
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            jpeg_quality: 90,
+            tiff_bit_depth: TiffBitDepth::default(),
+            resize: None,
+            border: None,
+            pad: None,
+            keep_metadata: true,
+            preserve_timestamps: false,
+            strip_gps: false,
+            filename_template: None,
+            watermark: None,
+            output_sharpening: None,
+            export_masks: false,
+            preserve_folders: false,
+            destination_type: None,
+            subfolder: None,
+            dpi: None,
+        }
+    }
+}
+
 
 #[derive(Clone)]
 pub(crate) enum ExportAdjustmentsMode {
@@ -405,6 +430,57 @@ pub fn apply_output_sharpening(image: &mut DynamicImage, settings: &OutputSharpe
     *image = DynamicImage::ImageRgb32F(rgb32f);
 }
 
+/// Resamples image using Lanczos3 in 32-bit linear radiance space before tone mapping and gamma encoding,
+/// completely eliminating the Alvy Ray Smith gamma-dimming bug.
+pub fn resize_in_linear_space(
+    image: &DynamicImage,
+    target_w: u32,
+    target_h: u32,
+) -> DynamicImage {
+    let (cur_w, cur_h) = image.dimensions();
+    if cur_w == target_w && cur_h == target_h {
+        return image.clone();
+    }
+
+    match image {
+        DynamicImage::ImageRgba32F(buf) => {
+            DynamicImage::ImageRgba32F(crate::fast_resizer::fast_resize_rgba32f(buf, target_w, target_h))
+        }
+        DynamicImage::ImageRgb32F(buf) => {
+            DynamicImage::ImageRgb32F(crate::fast_resizer::fast_resize_rgb32f(buf, target_w, target_h))
+        }
+        _ => {
+            let rgba8 = image.to_rgba8();
+            let (w, h) = rgba8.dimensions();
+            let mut linear_buf = vec![0.0f32; (w * h * 4) as usize];
+            linear_buf
+                .par_chunks_exact_mut(4)
+                .zip(rgba8.as_raw().par_chunks_exact(4))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = srgb_to_linear(in_pix[0] as f32 / 255.0);
+                    out_pix[1] = srgb_to_linear(in_pix[1] as f32 / 255.0);
+                    out_pix[2] = srgb_to_linear(in_pix[2] as f32 / 255.0);
+                    out_pix[3] = in_pix[3] as f32 / 255.0;
+                });
+            let linear_img = ImageBuffer::<Rgba<f32>, Vec<f32>>::from_raw(w, h, linear_buf).unwrap();
+            let resized_linear = imageops::resize(&linear_img, target_w, target_h, imageops::FilterType::Lanczos3);
+
+            let (rw, rh) = resized_linear.dimensions();
+            let mut srgb_buf = vec![0u8; (rw * rh * 4) as usize];
+            srgb_buf
+                .par_chunks_exact_mut(4)
+                .zip(resized_linear.as_raw().par_chunks_exact(4))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = (crate::hdr_fusion::to_srgb(in_pix[0]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[1] = (crate::hdr_fusion::to_srgb(in_pix[1]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[2] = (crate::hdr_fusion::to_srgb(in_pix[2]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[3] = (in_pix[3] * 255.0).clamp(0.0, 255.0).round() as u8;
+                });
+            DynamicImage::ImageRgba8(ImageBuffer::from_raw(rw, rh, srgb_buf).unwrap())
+        }
+    }
+}
+
 fn apply_export_resize_and_watermark(
     mut image: DynamicImage,
     export_settings: &ExportSettings,
@@ -414,7 +490,7 @@ fn apply_export_resize_and_watermark(
         let (target_w, target_h) = calculate_resize_target(current_w, current_h, resize_opts);
 
         if target_w != current_w || target_h != current_h {
-            image = image.resize(target_w, target_h, imageops::FilterType::Lanczos3);
+            image = resize_in_linear_space(&image, target_w, target_h);
         }
     }
 
@@ -557,9 +633,30 @@ fn process_image_for_export_pipeline(
     is_raw: bool,
     debug_tag: &str,
     app_handle: &tauri::AppHandle,
+    export_settings: Option<&ExportSettings>,
 ) -> Result<DynamicImage, String> {
-    let (transformed_image, unscaled_crop_offset) =
+    let (mut transformed_image, unscaled_crop_offset) =
         apply_all_transformations(Cow::Borrowed(base_image), js_adjustments);
+    let (cur_w, cur_h) = transformed_image.dimensions();
+
+    let (target_w, target_h) = if let Some(settings) = export_settings {
+        if let Some(resize_opts) = &settings.resize {
+            calculate_resize_target(cur_w, cur_h, resize_opts)
+        } else {
+            (cur_w, cur_h)
+        }
+    } else {
+        (cur_w, cur_h)
+    };
+
+    let scale_factor = if target_w != cur_w || target_h != cur_h {
+        let resized = resize_in_linear_space(transformed_image.as_ref(), target_w, target_h);
+        transformed_image = Cow::Owned(resized);
+        target_w as f64 / cur_w as f64
+    } else {
+        1.0
+    };
+
     let (img_w, img_h) = transformed_image.dimensions();
 
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
@@ -576,8 +673,11 @@ fn process_image_for_export_pipeline(
                 def,
                 img_w,
                 img_h,
-                1.0,
-                unscaled_crop_offset,
+                scale_factor as f32,
+                (
+                    unscaled_crop_offset.0 * scale_factor as f32,
+                    unscaled_crop_offset.1 * scale_factor as f32,
+                ),
                 warped_image.as_deref(),
             )
         })
@@ -658,7 +758,7 @@ fn save_image_with_metadata(
     }
 
     #[cfg(not(target_os = "android"))]
-    fs::write(output_path, image_bytes).map_err(|e| e.to_string())?;
+    crate::atomic_output::atomic_write_bytes(output_path, &image_bytes).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -688,15 +788,49 @@ fn process_image_for_export(
     is_raw: bool,
     app_handle: &tauri::AppHandle,
 ) -> Result<DynamicImage, String> {
+    let mut working_base = Cow::Borrowed(base_image);
+
+    if is_raw {
+        // Wire radial chromatic aberration correction into single RAW export pipeline
+        let db_guard = state.lens_db.lock().ok();
+        let db_ref = db_guard.as_ref().and_then(|opt| opt.as_deref());
+        let (maker, model) = match (
+            js_adjustments.get("lensMaker").and_then(|v| v.as_str()),
+            js_adjustments.get("lensModel").and_then(|v| v.as_str()),
+        ) {
+            (Some(m), Some(md)) => (m, md),
+            _ => ("", ""),
+        };
+        let (tca_r, tca_b) = crate::lens_correction::resolve_or_autodetect_tca(
+            db_ref,
+            maker,
+            model,
+            50.0,
+            None,
+            None,
+            base_image,
+        );
+        if (tca_r - 1.0).abs() > 1e-5 || (tca_b - 1.0).abs() > 1e-5 {
+            let mut ca_corrected = base_image.clone();
+            crate::lens_correction::apply_radial_chromatic_aberration_correction_dynamic(
+                &mut ca_corrected,
+                tca_r,
+                tca_b,
+            );
+            working_base = Cow::Owned(ca_corrected);
+        }
+    }
+
     let processed_image = process_image_for_export_pipeline(
         path,
-        base_image,
+        working_base.as_ref(),
         js_adjustments,
         context,
         state,
         is_raw,
         "process_image_for_export",
         app_handle,
+        Some(export_settings),
     )?;
 
     apply_export_resize_and_watermark(processed_image, export_settings)
@@ -743,7 +877,71 @@ fn encode_image_to_bytes(
             let (width, height) = image.dimensions();
             let has_alpha = image.color().has_alpha();
 
-            let jxl_data = if jpeg_quality == 100 {
+            // Check if source image contains 32-bit linear float data (HDR pipeline)
+            let is_float_linear = image.as_rgb32f().is_some() || image.as_rgba32f().is_some();
+
+            let jxl_data = if is_float_linear {
+                // High Dynamic Range (HDR) export path: Map scene linear RGB to BT.2100 PQ transfer
+                // curve and tag the JXL bitstream with explicit BT.2100 PQ NCLX container metadata.
+                let pq_ce = jxl_encoder::ColorEncoding::bt2100_pq();
+
+                if let Some(rgba32f) = image.as_rgba32f() {
+                    let mut u16_pixels: Vec<u16> = Vec::with_capacity((width * height * 4) as usize);
+                    for px in rgba32f.pixels() {
+                        let r_pq = crate::hdr_color_science::linear_scene_to_pq(px[0]);
+                        let g_pq = crate::hdr_color_science::linear_scene_to_pq(px[1]);
+                        let b_pq = crate::hdr_color_science::linear_scene_to_pq(px[2]);
+                        let a_val = (px[3].clamp(0.0, 1.0) * 65535.0).round() as u16;
+                        u16_pixels.push(crate::hdr_color_science::pq_normalized_to_u16(r_pq));
+                        u16_pixels.push(crate::hdr_color_science::pq_normalized_to_u16(g_pq));
+                        u16_pixels.push(crate::hdr_color_science::pq_normalized_to_u16(b_pq));
+                        u16_pixels.push(a_val);
+                    }
+                    let byte_slice = bytemuck::cast_slice(&u16_pixels);
+                    if jpeg_quality == 100 {
+                        LosslessConfig::new()
+                            .encode_request(width, height, PixelLayout::Rgba16)
+                            .with_color_encoding(pq_ce)
+                            .encode(byte_slice)
+                            .map_err(|e| format!("Failed to encode lossless HDR JXL: {}", e))?
+                    } else {
+                        let jxl_quality = calibrated_jxl_quality(jpeg_quality as f32);
+                        let distance = quality_to_distance(jxl_quality);
+                        LossyConfig::new(distance)
+                            .encode_request(width, height, PixelLayout::Rgba16)
+                            .with_color_encoding(pq_ce)
+                            .encode(byte_slice)
+                            .map_err(|e| format!("Failed to encode lossy HDR JXL: {}", e))?
+                    }
+                } else {
+                    let rgb32f = image.to_rgb32f();
+                    let mut u16_pixels: Vec<u16> = Vec::with_capacity((width * height * 3) as usize);
+                    for px in rgb32f.pixels() {
+                        let r_pq = crate::hdr_color_science::linear_scene_to_pq(px[0]);
+                        let g_pq = crate::hdr_color_science::linear_scene_to_pq(px[1]);
+                        let b_pq = crate::hdr_color_science::linear_scene_to_pq(px[2]);
+                        u16_pixels.push(crate::hdr_color_science::pq_normalized_to_u16(r_pq));
+                        u16_pixels.push(crate::hdr_color_science::pq_normalized_to_u16(g_pq));
+                        u16_pixels.push(crate::hdr_color_science::pq_normalized_to_u16(b_pq));
+                    }
+                    let byte_slice = bytemuck::cast_slice(&u16_pixels);
+                    if jpeg_quality == 100 {
+                        LosslessConfig::new()
+                            .encode_request(width, height, PixelLayout::Rgb16)
+                            .with_color_encoding(pq_ce)
+                            .encode(byte_slice)
+                            .map_err(|e| format!("Failed to encode lossless HDR JXL: {}", e))?
+                    } else {
+                        let jxl_quality = calibrated_jxl_quality(jpeg_quality as f32);
+                        let distance = quality_to_distance(jxl_quality);
+                        LossyConfig::new(distance)
+                            .encode_request(width, height, PixelLayout::Rgb16)
+                            .with_color_encoding(pq_ce)
+                            .encode(byte_slice)
+                            .map_err(|e| format!("Failed to encode lossy HDR JXL: {}", e))?
+                    }
+                }
+            } else if jpeg_quality == 100 {
                 if has_alpha {
                     let rgba = image.to_rgba8();
                     LosslessConfig::new()
@@ -775,13 +973,18 @@ fn encode_image_to_bytes(
             return Ok(jxl_data);
         }
         "webp" => {
-            let encoder = webp::Encoder::from_image(image)
+            let dithered = if image.color().has_alpha() {
+                DynamicImage::ImageRgba8(quantize_to_rgba8_with_tpdf_dither(image))
+            } else {
+                DynamicImage::ImageRgb8(quantize_to_rgb8_with_tpdf_dither(image))
+            };
+            let encoder = webp::Encoder::from_image(&dithered)
                 .map_err(|_| "Failed to create WebP encoder".to_string())?;
             let webp_mem = encoder.encode(jpeg_quality as f32);
             return Ok(webp_mem.to_vec());
         }
         "jpg" | "jpeg" => {
-            let rgb_image = image.to_rgb8();
+            let rgb_image = quantize_to_rgb8_with_tpdf_dither(image);
             let mut encoder = JpegEncoder::new_with_quality(&mut cursor, jpeg_quality);
             encoder
                 .set_icc_profile(SRGB_ICC_PROFILE.to_vec())
@@ -796,8 +999,10 @@ fn encode_image_to_bytes(
         "png" => {
             let image_to_encode = if image.as_rgb32f().is_some() {
                 DynamicImage::ImageRgb16(image.to_rgb16())
+            } else if image.color().has_alpha() {
+                DynamicImage::ImageRgba8(quantize_to_rgba8_with_tpdf_dither(image))
             } else {
-                image.clone()
+                DynamicImage::ImageRgb8(quantize_to_rgb8_with_tpdf_dither(image))
             };
 
             let mut encoder = PngEncoder::new(&mut cursor);
@@ -912,6 +1117,93 @@ pub fn tpdf_dither(seed: &mut u64) -> f32 {
     let u2 = (*seed as u32) as f32 / 4294967296.0;
     // TPDF dither in [-1.0, 1.0], triangular distribution centered at 0
     (u1 + u2 - 1.0) * 0.5
+}
+
+/// Quantizes any image to 8-bit RgbImage using Triangular Probability Density Function (TPDF)
+/// dithering to dissolve quantization banding in sky gradients.
+pub fn quantize_to_rgb8_with_tpdf_dither(image: &DynamicImage) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let mut out = image::RgbImage::new(w, h);
+    let mut rng_seed = 0x853c49e6748fea9b_u64;
+
+    match image {
+        DynamicImage::ImageRgb32F(f_img) => {
+            for (p_out, p_in) in out.pixels_mut().zip(f_img.pixels()) {
+                let d0 = tpdf_dither(&mut rng_seed) / 255.0;
+                let d1 = tpdf_dither(&mut rng_seed) / 255.0;
+                let d2 = tpdf_dither(&mut rng_seed) / 255.0;
+                p_out[0] = ((p_in[0] + d0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[1] = ((p_in[1] + d1).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[2] = ((p_in[2] + d2).clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+        DynamicImage::ImageRgba32F(f_img) => {
+            for (p_out, p_in) in out.pixels_mut().zip(f_img.pixels()) {
+                let d0 = tpdf_dither(&mut rng_seed) / 255.0;
+                let d1 = tpdf_dither(&mut rng_seed) / 255.0;
+                let d2 = tpdf_dither(&mut rng_seed) / 255.0;
+                p_out[0] = ((p_in[0] + d0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[1] = ((p_in[1] + d1).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[2] = ((p_in[2] + d2).clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+        DynamicImage::ImageRgb16(u16_img) => {
+            for (p_out, p_in) in out.pixels_mut().zip(u16_img.pixels()) {
+                let d0 = tpdf_dither(&mut rng_seed);
+                let d1 = tpdf_dither(&mut rng_seed);
+                let d2 = tpdf_dither(&mut rng_seed);
+                p_out[0] = (p_in[0] as f32 / 257.0 + d0).clamp(0.0, 255.0).round() as u8;
+                p_out[1] = (p_in[1] as f32 / 257.0 + d1).clamp(0.0, 255.0).round() as u8;
+                p_out[2] = (p_in[2] as f32 / 257.0 + d2).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+        _ => {
+            let rgb8 = image.to_rgb8();
+            for (p_out, p_in) in out.pixels_mut().zip(rgb8.pixels()) {
+                let d0 = tpdf_dither(&mut rng_seed);
+                let d1 = tpdf_dither(&mut rng_seed);
+                let d2 = tpdf_dither(&mut rng_seed);
+                p_out[0] = (p_in[0] as f32 + d0).clamp(0.0, 255.0).round() as u8;
+                p_out[1] = (p_in[1] as f32 + d1).clamp(0.0, 255.0).round() as u8;
+                p_out[2] = (p_in[2] as f32 + d2).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Quantizes any image to 8-bit RgbaImage using Triangular Probability Density Function (TPDF) dithering.
+pub fn quantize_to_rgba8_with_tpdf_dither(image: &DynamicImage) -> image::RgbaImage {
+    let (w, h) = image.dimensions();
+    let mut out = image::RgbaImage::new(w, h);
+    let mut rng_seed = 0x853c49e6748fea9b_u64;
+
+    match image {
+        DynamicImage::ImageRgba32F(f_img) => {
+            for (p_out, p_in) in out.pixels_mut().zip(f_img.pixels()) {
+                let d0 = tpdf_dither(&mut rng_seed) / 255.0;
+                let d1 = tpdf_dither(&mut rng_seed) / 255.0;
+                let d2 = tpdf_dither(&mut rng_seed) / 255.0;
+                p_out[0] = ((p_in[0] + d0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[1] = ((p_in[1] + d1).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[2] = ((p_in[2] + d2).clamp(0.0, 1.0) * 255.0).round() as u8;
+                p_out[3] = (p_in[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+        _ => {
+            let rgba8 = image.to_rgba8();
+            for (p_out, p_in) in out.pixels_mut().zip(rgba8.pixels()) {
+                let d0 = tpdf_dither(&mut rng_seed);
+                let d1 = tpdf_dither(&mut rng_seed);
+                let d2 = tpdf_dither(&mut rng_seed);
+                p_out[0] = (p_in[0] as f32 + d0).clamp(0.0, 255.0).round() as u8;
+                p_out[1] = (p_in[1] as f32 + d1).clamp(0.0, 255.0).round() as u8;
+                p_out[2] = (p_in[2] as f32 + d2).clamp(0.0, 255.0).round() as u8;
+                p_out[3] = p_in[3];
+            }
+        }
+    }
+    out
 }
 
 /// Injects standard ICC Profile tag (Tag 34675 / 0x8773) and 300 DPI Resolution Tags
@@ -1077,11 +1369,12 @@ pub fn save_jpeg_high_quality_with_metadata<P: AsRef<Path>>(
     reference_raw_path: Option<&str>,
 ) -> Result<(), String> {
     use std::io::BufWriter;
+    let dithered = quantize_to_rgb8_with_tpdf_dither(&DynamicImage::ImageRgb8(sdr_image.clone()));
     let mut base_jpeg = Vec::new();
     {
         let mut encoder = JpegEncoder::new_with_quality(&mut base_jpeg, 95);
         encoder
-            .encode_image(&DynamicImage::ImageRgb8(sdr_image.clone()))
+            .encode_image(&DynamicImage::ImageRgb8(dithered))
             .map_err(|e| format!("JPEG encode error: {}", e))?;
     }
 
@@ -1102,10 +1395,11 @@ pub fn save_jpeg_high_quality_with_metadata<P: AsRef<Path>>(
         final_jpeg = base_jpeg;
     }
 
-    let file = fs::File::create(path).map_err(|e| format!("Failed to create JPEG file: {}", e))?;
-    let mut writer = BufWriter::new(file);
-    std::io::Write::write_all(&mut writer, &final_jpeg).map_err(|e| format!("Failed to write JPEG: {}", e))?;
-    std::io::Write::flush(&mut writer).map_err(|e| format!("Failed to flush JPEG: {}", e))?;
+    let mut writer = crate::atomic_output::AtomicFileWriter::new(path.as_ref())
+        .map_err(|e| format!("Failed to create JPEG atomic writer: {}", e))?;
+    writer.write_all(&final_jpeg).map_err(|e| format!("Failed to write JPEG: {}", e))?;
+    writer.flush().map_err(|e| format!("Failed to flush JPEG: {}", e))?;
+    writer.commit().map_err(|e| format!("Failed to commit JPEG file: {}", e))?;
     Ok(())
 }
 
@@ -1146,7 +1440,7 @@ pub fn save_png_high_quality_with_metadata<P: AsRef<Path>>(
                 .write_image(&ne_bytes, w, h, image::ExtendedColorType::Rgb16)
                 .map_err(|e| format!("PNG 16-bit encoding error: {}", e))?;
         } else {
-            let rgb8 = img.to_rgb8();
+            let rgb8 = quantize_to_rgb8_with_tpdf_dither(img);
             encoder
                 .write_image(rgb8.as_raw(), w, h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| format!("PNG 8-bit encoding error: {}", e))?;
@@ -1179,10 +1473,11 @@ pub fn save_png_high_quality_with_metadata<P: AsRef<Path>>(
         final_png = raw_png;
     }
 
-    let file = fs::File::create(path).map_err(|e| format!("Failed to create PNG file: {}", e))?;
-    let mut writer = BufWriter::new(file);
-    std::io::Write::write_all(&mut writer, &final_png).map_err(|e| format!("Failed to write PNG: {}", e))?;
-    std::io::Write::flush(&mut writer).map_err(|e| format!("Failed to flush PNG: {}", e))?;
+    let mut writer = crate::atomic_output::AtomicFileWriter::new(path.as_ref())
+        .map_err(|e| format!("Failed to create PNG atomic writer: {}", e))?;
+    writer.write_all(&final_png).map_err(|e| format!("Failed to write PNG: {}", e))?;
+    writer.flush().map_err(|e| format!("Failed to flush PNG: {}", e))?;
+    writer.commit().map_err(|e| format!("Failed to commit PNG file: {}", e))?;
     Ok(())
 }
 
@@ -1307,9 +1602,10 @@ pub fn save_ultrahdr_jpeg_with_metadata<P: AsRef<Path>>(
 
     let mut base_jpeg = Vec::new();
     {
+        let dithered = quantize_to_rgb8_with_tpdf_dither(&DynamicImage::ImageRgb8(sdr_preview.clone()));
         let mut encoder = JpegEncoder::new_with_quality(&mut base_jpeg, 95);
         encoder
-            .encode_image(&DynamicImage::ImageRgb8(sdr_preview.clone()))
+            .encode_image(&DynamicImage::ImageRgb8(dithered))
             .map_err(|e| format!("Base JPEG encode error: {}", e))?;
     }
 
@@ -1349,12 +1645,12 @@ pub fn save_ultrahdr_jpeg_with_metadata<P: AsRef<Path>>(
         final_base = base_with_xmp;
     }
 
-    let file = fs::File::create(path).map_err(|e| format!("Failed to create Ultra HDR file: {}", e))?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = crate::atomic_output::AtomicFileWriter::new(path.as_ref())
+        .map_err(|e| format!("Failed to create Ultra HDR atomic writer: {}", e))?;
     writer.write_all(&final_base).map_err(|e| e.to_string())?;
     writer.write_all(&gain_map_with_xmp).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
-
+    writer.commit().map_err(|e| format!("Failed to commit Ultra HDR file: {}", e))?;
     Ok(())
 }
 
@@ -2462,28 +2758,33 @@ mod tests {
         }
         let dynamic_img = DynamicImage::ImageRgb8(img_raw);
 
+        let mut settings = ExportSettings::default();
+
         // JPEG
-        let jpg_bytes = encode_image_to_bytes(&dynamic_img, "jpg", 90);
+        settings.jpeg_quality = 90;
+        let jpg_bytes = encode_image_to_bytes(&dynamic_img, "jpg", &settings);
         assert!(jpg_bytes.is_ok(), "JPEG encoding must succeed");
         assert!(!jpg_bytes.unwrap().is_empty());
 
         // PNG
-        let png_bytes = encode_image_to_bytes(&dynamic_img, "png", 90);
+        let png_bytes = encode_image_to_bytes(&dynamic_img, "png", &settings);
         assert!(png_bytes.is_ok(), "PNG encoding must succeed");
         assert!(!png_bytes.unwrap().is_empty());
 
         // TIFF
-        let tiff_bytes = encode_image_to_bytes(&dynamic_img, "tiff", 90);
+        let tiff_bytes = encode_image_to_bytes(&dynamic_img, "tiff", &settings);
         assert!(tiff_bytes.is_ok(), "TIFF encoding must succeed");
         assert!(!tiff_bytes.unwrap().is_empty());
 
         // WebP
-        let webp_bytes = encode_image_to_bytes(&dynamic_img, "webp", 85);
+        settings.jpeg_quality = 85;
+        let webp_bytes = encode_image_to_bytes(&dynamic_img, "webp", &settings);
         assert!(webp_bytes.is_ok(), "WebP encoding must succeed");
         assert!(!webp_bytes.unwrap().is_empty());
 
         // DNG (LinearRaw 32-bit float)
-        let dng_bytes = encode_image_to_bytes(&dynamic_img, "dng", 100);
+        settings.jpeg_quality = 100;
+        let dng_bytes = encode_image_to_bytes(&dynamic_img, "dng", &settings);
         assert!(dng_bytes.is_ok(), "Linear DNG encoding must succeed");
         assert!(!dng_bytes.unwrap().is_empty());
     }
@@ -2538,4 +2839,44 @@ mod tests {
         let (tw2, th2) = calculate_resize_target(4000, 3000, &opts_short);
         assert_eq!((tw2, th2), (2000, 1500));
     }
+
+    #[test]
+    fn test_resize_in_linear_space_32f() {
+        let (w, h) = (100u32, 80u32);
+        let mut img = image::Rgb32FImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x as f32 / w as f32) * 2.0; // Dynamic range > 1.0
+                img.put_pixel(x, y, Rgb([v, v * 0.5, v * 0.25]));
+            }
+        }
+        let dynamic_img = DynamicImage::ImageRgb32F(img);
+        let resized = resize_in_linear_space(&dynamic_img, 50, 40);
+        assert_eq!(resized.dimensions(), (50, 40));
+        if let DynamicImage::ImageRgb32F(res_buf) = resized {
+            let px_mid = res_buf.get_pixel(25, 20);
+            assert!(px_mid[0] > 0.8 && px_mid[0] < 1.2, "Linear radiance preserved across resize: got {}", px_mid[0]);
+        } else {
+            panic!("Resized linear image must remain ImageRgb32F");
+        }
+    }
+
+    #[test]
+    fn test_tpdf_dithering_and_quantization() {
+        let (w, h) = (64u32, 64u32);
+        let mut img = image::Rgb32FImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x as f32) / (w as f32);
+                img.put_pixel(x, y, Rgb([v, v, v]));
+            }
+        }
+        let dynamic_img = DynamicImage::ImageRgb32F(img);
+        let quantized = quantize_to_rgb8_with_tpdf_dither(&dynamic_img);
+        assert_eq!(quantized.dimensions(), (w, h));
+        // Verify non-zero distribution across dithered gradient
+        let sum_lum: u64 = quantized.pixels().map(|p| p[0] as u64).sum();
+        assert!(sum_lum > 0, "Quantized pixel sum must be positive");
+    }
 }
+

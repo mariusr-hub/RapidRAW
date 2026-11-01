@@ -108,6 +108,7 @@ pub struct MatchInfo {
     pub homography: Matrix3<f64>,
     pub inliers: usize,
     pub inlier_matches: Vec<Match>,
+    pub is_subpixel: bool,
 }
 
 #[tauri::command]
@@ -318,15 +319,10 @@ pub async fn save_panorama(
                 .map_err(|e| format!("Failed to save 32-bit Linear DNG panorama: {}", e))?;
         }
         _ => {
-            let lin_img_fallback;
-            let lin_img: &Rgb32FImage = match linear_radiance {
-                Some(r) => r,
-                None => {
-                    lin_img_fallback = panorama_image.to_rgb32f();
-                    &lin_img_fallback
-                }
-            };
-            crate::export_processing::save_tiff_compressed(&output_path, lin_img)?;
+            // High-bit-depth 16-bit TIFF receives the approved tone-mapped sRGB image
+            // with full 16-bit dynamic gradation, matching on-screen preview 100%
+            let tm_img = panorama_image.to_rgb32f();
+            crate::export_processing::save_tiff_compressed(&output_path, &tm_img)?;
         }
     }
 
@@ -436,96 +432,109 @@ fn stitch_images_impl(
     sorted_scales.sort_by(|a, b| a.total_cmp(b));
     let median_phys_scale = sorted_scales[sorted_scales.len() / 2];
 
-    let mut image_data = Vec::with_capacity(image_paths.len());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .map_err(|e| format!("Failed to create thread pool: {}", e))?;
 
-    for (i, filename) in image_paths.iter().enumerate() {
-        if let Some(token) = cancel_token {
-            if token.load(Ordering::Relaxed) {
-                return Err("Panorama stitching cancelled by user".to_string());
-            }
-        }
-        let pct = 10 + ((i + 1) * 15 / image_paths.len());
-        let name = Path::new(filename)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        if let Some(h) = app_handle {
-            let _ = h.emit(
-                "panorama-progress",
-                format!("Extracting features '{}' ({}%)", name, pct),
-            );
-        }
-        println!("  - Processing '{}' ({}/{})", filename, i + 1, image_paths.len());
+    let completed_count = std::sync::atomic::AtomicUsize::new(0);
+    let total_images = image_paths.len();
 
-        let file_bytes = fs::read(filename)
-            .map_err(|e| format!("Failed to read image {}: {}", filename, e))?;
+    let image_data = pool.install(|| {
+        image_paths
+            .par_iter()
+            .enumerate()
+            .map(|(i, filename)| -> Result<ImageInfo, String> {
+                if let Some(token) = cancel_token {
+                    if token.load(Ordering::Relaxed) {
+                        return Err("Panorama stitching cancelled by user".to_string());
+                    }
+                }
+                let count = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let pct = 10 + (count * 15 / total_images);
+                let name = Path::new(filename)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                if let Some(h) = app_handle {
+                    let _ = h.emit(
+                        "panorama-progress",
+                        format!("Extracting features '{}' ({}%)", name, pct),
+                    );
+                }
+                println!("  - Processing '{}' ({}/{})", filename, i + 1, total_images);
 
-        let mut load_settings = settings.clone();
-        if is_raw_file(filename) {
-            load_settings.raw_preprocessing_sharpening = Some(0.0);
-        }
+                let file_bytes = fs::read(filename)
+                    .map_err(|e| format!("Failed to read image {}: {}", filename, e))?;
 
-        let mut dynamic_image = crate::image_loader::load_base_image_from_bytes(
-            &file_bytes,
-            filename,
-            half_size,
-            &load_settings,
-            None,
-        )
-        .map_err(|e| format!("Failed to load image {}: {}", filename, e))?;
+                let mut load_settings = settings.clone();
+                if is_raw_file(filename) {
+                    load_settings.raw_preprocessing_sharpening = Some(0.0);
+                }
 
-        let target_gain = (median_phys_scale / physical_scales[i]).clamp(0.125, 8.0);
-        let exposure_gain = if is_raw_file(filename) {
-            prepare_linear_raw_for_panorama(&mut dynamic_image, Some(target_gain))
-        } else {
-            1.0
-        };
+                let mut dynamic_image = crate::image_loader::load_base_image_from_bytes(
+                    &file_bytes,
+                    filename,
+                    half_size,
+                    &load_settings,
+                    None,
+                )
+                .map_err(|e| format!("Failed to load image {}: {}", filename, e))?;
 
-        let (full_w, full_h) = dynamic_image.dimensions();
-        let (new_w, new_h, scale_factor) =
-            processing::calculate_downscale_dimensions(full_w, full_h);
+                let target_gain = (median_phys_scale / physical_scales[i]).clamp(0.125, 8.0);
+                let exposure_gain = if is_raw_file(filename) {
+                    prepare_linear_raw_for_panorama(&mut dynamic_image, Some(target_gain))
+                } else {
+                    1.0
+                };
 
-        let proxy_dyn =
-            dynamic_image.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
-        let proxy_image = proxy_dyn.to_rgb32f();
+                let (full_w, full_h) = dynamic_image.dimensions();
+                let (new_w, new_h, scale_factor) =
+                    processing::calculate_downscale_dimensions(full_w, full_h);
 
-        let gray_small = if is_raw_file(filename) {
-            crate::hdr_panorama::hdr_to_feature_grayscale(&proxy_image)
-        } else {
-            let color_small_u8 = proxy_dyn.to_rgb8();
-            image::imageops::colorops::grayscale(&color_small_u8)
-        };
-        drop(proxy_dyn);
+                let proxy_dyn =
+                    dynamic_image.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+                let proxy_image = proxy_dyn.to_rgb32f();
 
-        let full_image = if image_paths.len() <= 8 || half_size {
-            Some(dynamic_image.to_rgb32f())
-        } else {
-            None
-        };
-        drop(dynamic_image);
+                let gray_small = if is_raw_file(filename) {
+                    crate::hdr_panorama::hdr_to_feature_grayscale(&proxy_image)
+                } else {
+                    let color_small_u8 = proxy_dyn.to_rgb8();
+                    image::imageops::colorops::grayscale(&color_small_u8)
+                };
+                drop(proxy_dyn);
 
-        let low_detail_mask = processing::generate_low_detail_mask(&gray_small);
+                let full_image = if total_images <= 8 || half_size {
+                    Some(dynamic_image.to_rgb32f())
+                } else {
+                    None
+                };
+                drop(dynamic_image);
 
-        let features = processing::find_features(&gray_small, &brief_pairs);
-        println!(
-            "    Found {} multi-scale ORB features in '{}'",
-            features.len(),
-            filename
-        );
+                let low_detail_mask = processing::generate_low_detail_mask(&gray_small);
 
-        image_data.push(ImageInfo {
-            id: i,
-            filename: filename.to_string(),
-            full_width: full_w,
-            full_height: full_h,
-            proxy_image,
-            full_image,
-            low_detail_mask,
-            scale_factor,
-            features,
-            exposure_gain,
-        });
-    }
+                let features = processing::find_features(&gray_small, &brief_pairs);
+                println!(
+                    "    Found {} multi-scale ORB features in '{}'",
+                    features.len(),
+                    filename
+                );
+
+                Ok(ImageInfo {
+                    id: i,
+                    filename: filename.to_string(),
+                    full_width: full_w,
+                    full_height: full_h,
+                    proxy_image,
+                    full_image,
+                    low_detail_mask,
+                    scale_factor,
+                    features,
+                    exposure_gain,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
 
     println!(
         "Image loading and feature detection completed in {:.2?}\n",
@@ -598,6 +607,7 @@ fn stitch_images_impl(
                         homography: h_full,
                         inliers: inliers.len(),
                         inlier_matches: inliers,
+                        is_subpixel: false,
                     };
                     return Some(((i, j), match_info));
                 }
@@ -698,14 +708,19 @@ fn stitch_images_impl(
             let img1 = &image_data[id1].proxy_image;
             let img2 = &image_data[id2].proxy_image;
 
+            let is_subpixel = match_info.is_subpixel;
             for m in &match_info.inlier_matches {
                 let p1 = f1[m.index1].keypoint;
                 let p2 = f2[m.index2].keypoint;
                 let p1_proxy = Point2::new(p1.x as f64, p1.y as f64);
                 let p2_proxy = Point2::new(p2.x as f64, p2.y as f64);
 
-                // Sub-pixel (1/16th px) Lucas-Kanade optical flow refinement on proxy radiance
-                let p2_refined_proxy = processing::refine_match_klt_subpixel(img1, p1_proxy, img2, p2_proxy);
+                // Sub-pixel Lucas-Kanade optical flow refinement: bypassed when LightGlue provides true sub-pixel tie-points
+                let p2_refined_proxy = if is_subpixel {
+                    p2_proxy
+                } else {
+                    processing::refine_match_klt_subpixel(img1, p1_proxy, img2, p2_proxy)
+                };
                 let p1_full = Point2::new(p1.x as f64 * s1, p1.y as f64 * s1);
                 let p2_refined_full = Point2::new(p2_refined_proxy.x * s2, p2_refined_proxy.y * s2);
 

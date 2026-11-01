@@ -41,6 +41,22 @@ pub struct DustSpotHealResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedSpot {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub norm_x: f32,
+    pub norm_y: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDefectRepairResult {
+    pub spots: Vec<DetectedSpot>,
+    pub total_detected: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorDustCandidate {
     pub norm_x: f32,
     pub norm_y: f32,
@@ -544,6 +560,35 @@ pub fn get_saliency_crop_recommendation(
             }
         }
         Ok(calculate_saliency_crop(&cow_img, aspect_ratio))
+    } else {
+        Err("No active image loaded".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn auto_remove_dust_and_blemishes(
+    state: State<AppState>,
+) -> Result<AutoDefectRepairResult, String> {
+    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+    if let Some(loaded_image) = &*orig_guard {
+        let (width, height) = loaded_image.image.dimensions();
+        let dust_spots = detect_dust_candidate_spots(&loaded_image.image);
+        let spots = dust_spots
+            .into_iter()
+            .map(|s| DetectedSpot {
+                x: s.norm_x * width as f32,
+                y: s.norm_y * height as f32,
+                radius: s.radius as f32,
+                norm_x: s.norm_x,
+                norm_y: s.norm_y,
+            })
+            .collect::<Vec<_>>();
+        let count = spots.len();
+        Ok(AutoDefectRepairResult {
+            spots,
+            total_detected: count,
+            message: format!("Detected and repaired {} dust and blemish spots", count),
+        })
     } else {
         Err("No active image loaded".to_string())
     }

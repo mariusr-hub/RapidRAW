@@ -49,6 +49,7 @@ export default function Controls() {
   );
 
   const visibleSections = getVisibleAdjustmentSections(appSettings?.adjustmentLayout);
+  const [showActiveOnly, setShowActiveOnly] = React.useState(false);
 
   const { collapsibleSectionsState, setUI } = useUIStore(
     useShallow((state) => ({
@@ -82,6 +83,23 @@ export default function Controls() {
       setEditor: state.setEditor,
     })),
   );
+
+  const displayedSections = React.useMemo(() => {
+    if (!showActiveOnly) return visibleSections;
+    return visibleSections.filter((sectionName: string) => {
+      if (sectionName === 'basic') return true;
+      const sectionTools = ADJUSTMENT_SECTIONS[sectionName];
+      if (!sectionTools) return true;
+      return sectionTools.some((key: string) => {
+        const current = (adjustments as any)?.[key];
+        const initial = (INITIAL_ADJUSTMENTS as any)?.[key];
+        if (typeof current === 'object' && current !== null) {
+          return JSON.stringify(current) !== JSON.stringify(initial);
+        }
+        return current !== undefined && current !== initial;
+      });
+    });
+  }, [showActiveOnly, visibleSections, adjustments]);
 
   const setCopiedSectionAdjustments = useCallback(
     (val: any) => setEditor({ copiedSectionAdjustments: val }),
@@ -243,6 +261,16 @@ export default function Controls() {
             <ChartArea size={18} />
           </button>
           <button
+            className={clsx(
+              'p-2 rounded-full transition-colors',
+              showActiveOnly ? 'bg-amber-500/20 text-amber-300' : 'hover:bg-surface text-text-secondary hover:text-text-primary',
+            )}
+            onClick={() => setShowActiveOnly((prev) => !prev)}
+            data-tooltip="Filter workspace to show active tools only"
+          >
+            <LayoutList size={18} />
+          </button>
+          <button
             className="p-2 rounded-full hover:bg-surface disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             disabled={!selectedImage}
             onClick={handleResetAdjustments}
@@ -285,14 +313,15 @@ export default function Controls() {
 
       <div className="grow overflow-y-scroll p-3 flex flex-col gap-2">
         {selectedImage ? (
-          visibleSections.map((sectionName: string) => {
-            const SectionComponent: any = {
-              basic: BasicAdjustments,
-              curves: CurveGraph,
-              color: ColorPanel,
-              details: DetailsPanel,
-              effects: EffectsPanel,
-            }[sectionName];
+          <>
+            {displayedSections.map((sectionName: string) => {
+              const SectionComponent: any = {
+                basic: BasicAdjustments,
+                curves: CurveGraph,
+                color: ColorPanel,
+                details: DetailsPanel,
+                effects: EffectsPanel,
+              }[sectionName];
 
             const title = String((t as any)(`editor.adjustments.sections.${sectionName}`));
             const activeTools = getActiveTools(adjustments);
@@ -301,7 +330,7 @@ export default function Controls() {
               <div className="shrink-0 group" key={sectionName}>
                 <CollapsibleSection
                   isContentVisible={isToolActive(activeTools, sectionName)}
-                  isOpen={collapsibleSectionsState[sectionName as keyof typeof collapsibleSectionsState]}
+                  isOpen={Boolean(collapsibleSectionsState[sectionName as keyof typeof collapsibleSectionsState])}
                   onContextMenu={(e: any) => handleSectionContextMenu(e, sectionName)}
                   onToggle={() => handleToggleSection(sectionName)}
                   onToggleVisibility={() => handleToggleVisibility(sectionName)}
@@ -327,8 +356,9 @@ export default function Controls() {
                 </CollapsibleSection>
               </div>
             );
-          })
-        ) : (
+          })}
+        </>
+      ) : (
           <div className="flex items-center justify-center h-full">
             <Text
               variant={TextVariants.heading}

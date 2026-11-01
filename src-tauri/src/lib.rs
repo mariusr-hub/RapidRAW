@@ -15,11 +15,11 @@ macro_rules! cli_eprintln {
     }};
 }
 
-mod adjustment_utils;
+pub mod adjustment_utils;
 mod ai_commands;
 mod ai_connector;
 mod ai_denoise;
-mod ai_processing;
+pub mod ai_processing;
 mod android_integration;
 mod apple_raw;
 pub mod agency_uploader;
@@ -53,7 +53,7 @@ pub mod hdr_presets;
 pub mod hugin_engine;
 pub mod image_loader;
 pub mod image_processing;
-mod inpainting;
+pub mod inpainting;
 mod launch_request;
 mod lens_blur;
 pub mod lens_correction;
@@ -80,12 +80,16 @@ pub mod bokeh_simulator;
 pub mod batch_export_engine;
 pub mod speed_culler;
 pub mod hdr_fusion;
+pub mod hdr2;
+pub mod hdr2_ai;
 pub mod quality_shield;
 pub mod bilateral_decomposition;
 pub mod filmic_color_science;
 pub mod photographic_critic;
 pub mod auto_tune_loop;
 pub mod stability;
+pub mod hdr_color_science;
+pub mod atomic_output;
 mod tagging;
 mod tagging_utils;
 mod white_balance;
@@ -555,9 +559,9 @@ fn process_preview_job(
 
     let default_preview_dim = settings.editor_preview_resolution.unwrap_or(1920);
     let preview_dim = target_resolution.unwrap_or(default_preview_dim);
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
     let use_wgpu_renderer = settings.use_wgpu_renderer.unwrap_or(true);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
     let use_wgpu_renderer = false;
 
     let has_roi = roi.is_some();
@@ -1617,7 +1621,7 @@ async fn merge_hdr(
     *state.hdr_linear_radiance.lock().unwrap() = Some(fusion_res.linear_radiance);
     let hdr_merged = DynamicImage::ImageRgb32F(fusion_res.tone_mapped_preview);
 
-    let _ = app_handle.emit("hdr-progress", "Creating preview... 98%");
+    let _ = app_handle.emit("hdr-progress", "Creating high-fidelity preview... 98%");
     let mut buf = Cursor::new(Vec::new());
     if let Err(e) = hdr_merged.to_rgb8().write_to(&mut buf, ImageFormat::Png) {
         return Err(format!("Failed to encode hdr preview: {}", e));
@@ -1628,6 +1632,7 @@ async fn merge_hdr(
 
     *hdr_result_handle.lock().unwrap() = Some(hdr_merged);
 
+    let _ = app_handle.emit("hdr-progress", "HDR synthesis complete... 100%");
     let _ = app_handle.emit(
         "hdr-complete",
         serde_json::json!({
@@ -1782,8 +1787,10 @@ async fn save_hdr(
                 .map_err(|e| format!("Failed to save 32-bit Linear DNG image: {}", e))?;
         }
         _ => {
-            let lin_img = linear_radiance.unwrap_or_else(|| hdr_preview.to_rgb32f());
-            crate::export_processing::save_tiff_compressed(&output_path, &lin_img)?;
+            // High-bit-depth 16-bit TIFF receives the approved tone-mapped sRGB image
+            // with full 16-bit dynamic gradation, matching on-screen preview 100%
+            let tm_img = hdr_preview.to_rgb32f();
+            crate::export_processing::save_tiff_compressed(&output_path, &tm_img)?;
         }
     }
 
@@ -2307,8 +2314,8 @@ pub fn run() {
 
             {
                 let state = app.state::<AppState>();
-                let cache_size = settings.image_cache_size.unwrap_or(5) as usize;
-                state.decoded_image_cache.lock().unwrap().set_capacity(cache_size);
+                let cache_size = settings.image_cache_size.unwrap_or(3) as usize;
+                state.decoded_image_cache.lock().unwrap_or_else(|e| e.into_inner()).set_capacity(cache_size);
             }
 
             if crash_flag_path.exists() {
@@ -2614,7 +2621,10 @@ pub fn run() {
             cached_preview: Mutex::new(None),
             gpu_context: Mutex::new(None),
             gpu_image_cache: Mutex::new(None),
+            export_image_cache: Mutex::new(None),
             gpu_processor: Mutex::new(None),
+            preview_processor: Mutex::new(None),
+            export_processor: Mutex::new(None),
             ai_state: Mutex::new(None),
             ai_init_lock: TokioMutex::new(()),
             active_ai_tasks: Mutex::new(HashMap::new()),
@@ -2647,7 +2657,7 @@ pub fn run() {
             working_cache: Mutex::new(None),
             effects_cache: Mutex::new(None),
             full_transformed_cache: Mutex::new(None),
-            decoded_image_cache: Mutex::new(DecodedImageCache::new(5)),
+            decoded_image_cache: Mutex::new(DecodedImageCache::new(3)),
             thumbnail_manager: ThumbnailManager::new(),
             metadata_manager: MetadataManager::new(),
             disks_cache: Mutex::new(None),
@@ -2713,6 +2723,7 @@ pub fn run() {
             focus_stacking::save_focus_stack,
             image_loader::load_image,
             image_loader::is_image_cached,
+            image_loader::prefetch_adjacent_image,
             panorama_stitching::stitch_panorama,
             panorama_stitching::cancel_panorama,
             panorama_stitching::save_panorama,
@@ -2791,6 +2802,7 @@ pub fn run() {
             lens_correction::solve_guided_upright,
             defect_repair::detect_auto_horizon,
             defect_repair::get_saliency_crop_recommendation,
+            defect_repair::auto_remove_dust_and_blemishes,
             astro_stacking::stack_astro_frames,
             astro_stacking::remove_active_light_pollution_gradient,
             stock_prep::batch_stock_photo_prep,
@@ -2877,6 +2889,15 @@ pub fn run() {
                 }
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
                     api.prevent_exit();
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state.thumbnail_cancellation_token.store(true, Ordering::SeqCst);
+                        if let Ok(mut g) = state.gpu_image_cache.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.export_image_cache.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.gpu_processor.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.preview_processor.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.export_processor.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.gpu_context.try_lock() { let _ = g.take(); }
+                    }
                     let code = resolve_exit_code(code, process_exit_code());
 
                     #[cfg(target_os = "macos")]
@@ -2886,6 +2907,15 @@ pub fn run() {
                     std::process::exit(code);
                 }
                 tauri::RunEvent::Exit => {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state.thumbnail_cancellation_token.store(true, Ordering::SeqCst);
+                        if let Ok(mut g) = state.gpu_image_cache.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.export_image_cache.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.gpu_processor.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.preview_processor.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.export_processor.try_lock() { let _ = g.take(); }
+                        if let Ok(mut g) = state.gpu_context.try_lock() { let _ = g.take(); }
+                    }
                     let code = process_exit_code();
 
                     #[cfg(target_os = "macos")]

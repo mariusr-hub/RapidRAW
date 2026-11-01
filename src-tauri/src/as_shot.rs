@@ -26,6 +26,21 @@ fn as_shot_cache() -> &'static Mutex<HashMap<String, AsShot>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub fn as_shot_with_bytes(path: &str, bytes: &[u8]) -> AsShot {
+    let (source_path, _) = parse_virtual_path(path);
+    let source_path = source_path.to_string_lossy().to_string();
+    if !is_raw_file(&source_path) {
+        return AsShot::reference();
+    }
+    if let Some(cached) = as_shot_cache().lock().unwrap().get(&source_path) {
+        return *cached;
+    }
+
+    let as_shot = crate::raw_processing::read_as_shot(bytes).unwrap_or_else(AsShot::reference);
+    as_shot_cache().lock().unwrap().insert(source_path, as_shot);
+    as_shot
+}
+
 pub fn as_shot(path: &str) -> AsShot {
     let (source_path, _) = parse_virtual_path(path);
     let source_path = source_path.to_string_lossy().to_string();

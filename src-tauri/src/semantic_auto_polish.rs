@@ -251,7 +251,19 @@ pub fn generate_semantic_adjustments(
     let curve_style = tone_style.unwrap_or_default();
     let protect_skin = skin_protection.unwrap_or(true);
 
-    let mut exposure = base.exposure * 0.9 * mult as f64;
+    let (governor, min_strength, preprocess_ev) = match scene {
+        SemanticScene::Portrait => (25.0, 10.0, 0.0),
+        SemanticScene::Animal => (30.0, 10.0, 0.0),
+        SemanticScene::Architecture => (35.0, 10.0, 0.0),
+        SemanticScene::Landscape => (25.0, 10.0, 0.0),
+        SemanticScene::Sunset => (40.0, 10.0, -0.24),
+        SemanticScene::Overcast => (35.0, 10.0, 0.0),
+        SemanticScene::NightSky => (5.0, 5.0, 0.0),
+        SemanticScene::Macro => (15.0, 10.0, 0.0),
+        SemanticScene::General => (35.0, 10.0, 0.0),
+    };
+    let governed_exp = compute_governed_exposure(base.exposure as f32, governor, min_strength, preprocess_ev) as f64;
+    let mut exposure = governed_exp * 0.9 * mult as f64;
     let mut contrast = base.contrast * mult as f64;
     let mut highlights = base.highlights * mult as f64;
     let mut shadows = base.shadows * mult as f64;
@@ -763,3 +775,142 @@ pub async fn batch_polish_photoshoot(
         elapsed_ms: elapsed,
     })
 }
+
+/// 1. Master Smart-Strength Piecewise Asymmetric Headroom Curve
+pub fn apply_super_slider_strength(nominal: f32, min_val: f32, max_ceiling: f32, strength_pct: f32) -> f32 {
+    let s = strength_pct.clamp(0.0, 200.0);
+    let delta = (s - 100.0) / 100.0; // [-1.0, +1.0]
+    if delta <= 0.0 {
+        nominal + (nominal - min_val) * delta
+    } else {
+        nominal + (max_ceiling - nominal) * delta
+    }
+}
+
+/// 2. 10-Cluster Dermatological Skin Calibration & Deflash Roll-off (from rapidraw-dsp)
+pub use rapidraw_dsp::{
+    apply_deflash_specular_rolloff, classify_skin_cluster_oklab, SkinClusterCalibration,
+};
+
+
+/// 3. Scene-Governed Auto-Exposure with Deadband & Preprocess EV (pro_and_universal_20211221.pnn)
+pub fn compute_governed_exposure(raw_ev_delta: f32, governor_pct: f32, min_strength_pct: f32, preprocess_ev: f32) -> f32 {
+    let min_ev = (min_strength_pct / 100.0) * 0.5;
+    if raw_ev_delta.abs() < min_ev {
+        return preprocess_ev;
+    }
+    let max_ev = (governor_pct / 100.0) * 1.5; // e.g. governor=5 -> +0.075 EV max for Night; governor=25 -> +0.375 EV
+    raw_ev_delta.clamp(-max_ev, max_ev) + preprocess_ev
+}
+
+/// 4. Pre-tone automatic noise variance gate evaluation
+pub fn evaluate_pre_tone_noise_variance_gate(thumb: &image::RgbImage, iso: Option<u32>) -> (bool, f32, f32) {
+    let (w, h) = thumb.dimensions();
+    if w < 16 || h < 16 {
+        return (false, 0.0, 0.0);
+    }
+
+    let mut patch_vars = Vec::with_capacity(64);
+    let step_x = ((w - 4) / 8).max(1);
+    let step_y = ((h - 4) / 8).max(1);
+
+    for py in (2..h - 2).step_by(step_y as usize) {
+        for px in (2..w - 2).step_by(step_x as usize) {
+            let mut lumas = [0.0f32; 9];
+            let mut idx = 0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let p = thumb.get_pixel((px as i32 + dx) as u32, (py as i32 + dy) as u32);
+                    lumas[idx] = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+                    idx += 1;
+                }
+            }
+            let mean = lumas.iter().sum::<f32>() / 9.0;
+            let var = lumas.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 9.0;
+            patch_vars.push(var);
+        }
+    }
+
+    patch_vars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p20_idx = (patch_vars.len() as f32 * 0.20) as usize;
+    let noise_var = patch_vars.get(p20_idx).copied().unwrap_or(0.0);
+
+    let iso_val = iso.unwrap_or(100);
+    let noise_thresh = if iso_val > 800 { 1.5 } else if iso_val > 400 { 3.0 } else { 6.0 };
+
+    if noise_var > noise_thresh || iso_val >= 1250 {
+        let rec_denoise = if iso_val >= 3200 || noise_var > 25.0 {
+            65.0
+        } else if iso_val >= 800 || noise_var > 12.0 {
+            50.0
+        } else {
+            30.0
+        };
+        (true, noise_var, rec_denoise)
+    } else {
+        (false, noise_var, 0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_super_slider_strength() {
+        // nominal=50, min=0, max=100
+        // At 100%: delta=0 -> nominal 50
+        assert_eq!(apply_super_slider_strength(50.0, 0.0, 100.0, 100.0), 50.0);
+        // At 0%: delta=-1.0 -> 0
+        assert_eq!(apply_super_slider_strength(50.0, 0.0, 100.0, 0.0), 0.0);
+        // At 50%: delta=-0.5 -> 25
+        assert_eq!(apply_super_slider_strength(50.0, 0.0, 100.0, 50.0), 25.0);
+        // At 200%: delta=+1.0 -> max_ceiling 100
+        assert_eq!(apply_super_slider_strength(50.0, 0.0, 100.0, 200.0), 100.0);
+        // At 150%: delta=+0.5 -> 75
+        assert_eq!(apply_super_slider_strength(50.0, 0.0, 100.0, 150.0), 75.0);
+    }
+
+    #[test]
+    fn test_classify_skin_cluster_oklab() {
+        let pale = classify_skin_cluster_oklab(0.85);
+        assert_eq!(pale.cluster_id, 1);
+        assert!(pale.exposure_bias_ev > 0.0);
+
+        let dark = classify_skin_cluster_oklab(0.40);
+        assert_eq!(dark.cluster_id, 9);
+        assert!(dark.exposure_bias_ev < 0.0);
+
+        let ebony = classify_skin_cluster_oklab(0.30);
+        assert_eq!(ebony.cluster_id, 10);
+        assert!(ebony.exposure_bias_ev < 0.0);
+
+        let deflashed = apply_deflash_specular_rolloff(0.95, 0.8, 0.5, 0.72);
+        assert!(deflashed < 0.95);
+        assert!(deflashed > 0.72);
+    }
+
+    #[test]
+    fn test_compute_governed_exposure() {
+        // Inside deadband
+        let deadband_exp = compute_governed_exposure(0.02, 25.0, 10.0, 0.0);
+        assert_eq!(deadband_exp, 0.0);
+
+        // Outside deadband, capped by governor (governor=25 -> max 0.375)
+        let capped_exp = compute_governed_exposure(1.5, 25.0, 10.0, 0.0);
+        assert!((capped_exp - 0.375).abs() < 1e-4);
+
+        // Sunset preprocess_ev
+        let sunset_exp = compute_governed_exposure(0.01, 40.0, 10.0, -0.24);
+        assert_eq!(sunset_exp, -0.24);
+    }
+
+    #[test]
+    fn test_evaluate_pre_tone_noise_variance_gate() {
+        let clean_img = image::RgbImage::from_fn(32, 32, |_x, _y| image::Rgb([128, 128, 128]));
+        let (noise_detected, var, _) = evaluate_pre_tone_noise_variance_gate(&clean_img, Some(100));
+        assert!(!noise_detected);
+        assert_eq!(var, 0.0);
+    }
+}
+

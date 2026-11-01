@@ -76,6 +76,48 @@ export default function DetailsPanel({
               fillOrigin="min"
             />
           )}
+          {!isForMask && (
+            <>
+              <Slider
+                label={t('adjustments.details.cornerSharpnessBoost', { defaultValue: 'Corner Sharpness Boost' })}
+                max={100}
+                min={0}
+                onChange={(e: any) =>
+                  handleAdjustmentChange(DetailsAdjustment.CornerSharpnessBoost, e.target.value)
+                }
+                step={1}
+                value={adjustments.cornerSharpnessBoost ?? 0}
+                onDragStateChange={onDragStateChange}
+                defaultValue={0}
+                fillOrigin="min"
+              />
+              <Slider
+                label={t('adjustments.details.bokehMaskProtection', { defaultValue: 'Bokeh Mask Protection' })}
+                max={100}
+                min={0}
+                onChange={(e: any) =>
+                  handleAdjustmentChange(DetailsAdjustment.BokehMaskProtection, e.target.value)
+                }
+                step={1}
+                value={adjustments.bokehMaskProtection ?? 0}
+                onDragStateChange={onDragStateChange}
+                defaultValue={0}
+                fillOrigin="min"
+              />
+              <Slider
+                label={t('adjustments.details.microContrast', { defaultValue: 'MicroContrast' })}
+                max={100}
+                min={-100}
+                onChange={(e: any) =>
+                  handleAdjustmentChange(DetailsAdjustment.MicroContrast, e.target.value)
+                }
+                step={1}
+                value={adjustments.microContrast ?? 0}
+                onDragStateChange={onDragStateChange}
+                defaultValue={0}
+              />
+            </>
+          )}
         </AdjustmentSubSection>
       )}
 
@@ -102,6 +144,17 @@ export default function DetailsPanel({
             step={1}
             value={adjustments.dehaze}
             onDragStateChange={onDragStateChange}
+          />
+          <Slider
+            label={t('adjustments.details.clearView', { defaultValue: 'ClearView Plus' })}
+            max={100}
+            min={0}
+            onChange={(e: any) => handleAdjustmentChange(DetailsAdjustment.ClearView, e.target.value)}
+            step={1}
+            value={adjustments.clearView ?? 0}
+            onDragStateChange={onDragStateChange}
+            defaultValue={0}
+            fillOrigin="min"
           />
           <Slider
             label={t('adjustments.details.structure')}
@@ -139,6 +192,45 @@ export default function DetailsPanel({
           order={toolOrder.indexOf('noiseReduction')}
           title={t('adjustments.details.noiseReduction')}
         >
+          {/* 5-Mode Denoise Selector & Pre-Tone Noise Gate Status */}
+          <div className="mb-2 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between text-[10px] px-1.5 py-0.5 rounded bg-surface border border-border-color/40">
+              <span className="text-text-secondary">Pre-Tone Noise Gate:</span>
+              <span className={(adjustments.lumaNoiseReduction || 0) > 0 ? 'text-amber-300 font-medium' : 'text-emerald-300 font-medium'}>
+                {(adjustments.lumaNoiseReduction || 0) > 0
+                  ? `Noise Detected (${adjustments.lumaNoiseReduction}%)`
+                  : 'No Noise Detected (Auto-Bypassed)'}
+              </span>
+            </div>
+            <div className="grid grid-cols-5 gap-1 text-[10px]">
+              {(
+                [
+                  { id: 'auto', label: 'Auto', luma: 25, color: 35, thresh: 15 },
+                  { id: 'portrait', label: 'Portrait', luma: 75, color: 45, thresh: 4 },
+                  { id: 'night', label: 'Night', luma: 60, color: 60, thresh: 10 },
+                  { id: 'phone', label: 'Phone', luma: 50, color: 70, thresh: 7 },
+                  { id: 'strong', label: 'Strongest', luma: 90, color: 85, thresh: 15 },
+                ] as const
+              ).map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() =>
+                    setAdjustments((prev: Partial<Adjustments>) => ({
+                      ...prev,
+                      lumaNoiseReduction: preset.luma,
+                      colorNoiseReduction: preset.color,
+                      sharpnessThreshold: preset.thresh,
+                    }))
+                  }
+                  className="py-1 px-1 rounded bg-surface hover:bg-surface-secondary border border-border-color/40 text-text-secondary hover:text-text-primary truncate transition-colors"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <Slider
             label={t('adjustments.details.luminance')}
             max={100}

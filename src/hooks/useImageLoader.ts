@@ -22,12 +22,37 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const resetHistory = useEditorStore((s) => s.resetHistory);
   const setLibrary = useLibraryStore((s) => s.setLibrary);
   const appSettings = useSettingsStore((s) => s.appSettings);
+  const osPlatform = useSettingsStore((s) => s.osPlatform);
 
-  const isWgpuActive = appSettings?.useWgpuRenderer !== false && selectedImage?.isReady && hasRenderedFirstFrame;
+  const isWgpuActive =
+    osPlatform !== 'windows' &&
+    appSettings?.useWgpuRenderer === true &&
+    selectedImage?.isReady &&
+    hasRenderedFirstFrame;
 
   useEffect(() => {
     if (selectedImage && !selectedImage.isReady && selectedImage.path) {
       let isEffectActive = true;
+      let fullImageReady = false;
+      let prefetchTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const loadFastEmbeddedPreview = async () => {
+        try {
+          const previewDataUrl = await invoke<string>('extract_embedded_raw_preview', {
+            path: selectedImage.path,
+          });
+          if (!isEffectActive || fullImageReady || !previewDataUrl) return;
+          // Only paint embedded camera JPEG if full 32-bit RAW decode hasn't finished yet
+          useEditorStore.getState().setEditor((state) => {
+            if (state.selectedImage?.path === selectedImage.path && !state.selectedImage.isReady) {
+              return { finalPreviewUrl: previewDataUrl };
+            }
+            return state;
+          });
+        } catch {
+          // Non-fatal: full LoadImage will populate canvas momentarily
+        }
+      };
 
       const loadMetadataEarly = async () => {
         try {
@@ -55,6 +80,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
         try {
           const loadImageResult: any = await invoke(Invokes.LoadImage, { path: selectedImage.path });
           if (!isEffectActive) return;
+          fullImageReady = true;
 
           const { width, height } = loadImageResult;
           setEditor({ originalSize: { width, height } });
@@ -93,6 +119,72 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
             }
             return state;
           });
+
+          const existingAdj = loadImageResult.metadata?.adjustments;
+          const hasSavedEdits = Boolean(
+            existingAdj &&
+              !existingAdj.is_null &&
+              typeof existingAdj === 'object' &&
+              Object.keys(existingAdj).length > 0,
+          );
+
+          if (appSettings?.autoAnalyzeOnOpen !== false && !hasSavedEdits) {
+            try {
+              const polishRes: any = await invoke('analyze_and_polish_active_image', {
+                intensity: 100,
+                autoStraighten: true,
+                toneStyle: 'filmic',
+                skinProtection: true,
+              });
+              if (polishRes?.adjustments && isEffectActive) {
+                setEditor((state) => ({
+                  adjustments: {
+                    ...state.adjustments,
+                    ...polishRes.adjustments,
+                  },
+                }));
+                window.dispatchEvent(
+                  new CustomEvent('rapidraw-smart-diag', {
+                    detail: {
+                      sceneName: polishRes.sceneName || 'Universal',
+                      adjustments: polishRes.adjustments,
+                    },
+                  }),
+                );
+              }
+            } catch (_polishErr) {
+              try {
+                const currentAdj = useEditorStore.getState().adjustments;
+                const autoAdjusts: any = await invoke(Invokes.CalculateAutoAdjustments, {
+                  jsAdjustments: currentAdj,
+                });
+                if (autoAdjusts && isEffectActive) {
+                  setEditor((state) => ({
+                    adjustments: {
+                      ...state.adjustments,
+                      ...autoAdjusts,
+                    },
+                  }));
+                }
+              } catch (autoErr) {
+                console.warn('Auto analyze on open skipped or failed:', autoErr);
+              }
+            }
+          }
+
+          if (isEffectActive) {
+            prefetchTimer = setTimeout(() => {
+              if (!isEffectActive) return;
+              const imageList = useLibraryStore.getState().imageList;
+              const idx = imageList.findIndex((img) => img.path === selectedImage.path);
+              if (idx !== -1 && idx + 1 < imageList.length) {
+                const nextImage = imageList[idx + 1];
+                if (nextImage?.path) {
+                  invoke('prefetch_adjacent_image', { path: nextImage.path }).catch(() => {});
+                }
+              }
+            }, 450);
+          }
         } catch (err) {
           if (isEffectActive) {
             console.error('Failed to load image:', err);
@@ -107,6 +199,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
       };
 
       const loadAll = async () => {
+        loadFastEmbeddedPreview();
         await loadMetadataEarly();
         if (isEffectActive) {
           await loadFullImageData();
@@ -117,11 +210,13 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
 
       return () => {
         isEffectActive = false;
+        if (prefetchTimer) {
+          clearTimeout(prefetchTimer);
+        }
       };
     }
   }, [
     selectedImage?.path,
-    selectedImage?.isReady,
     appSettings?.editorPreviewResolution,
     resetHistory,
     setEditor,

@@ -99,8 +99,15 @@ export function useAiMasking() {
             ? 'generate_retouch_patch'
             : 'generate_manual_cleanup_patch';
 
+        const editorState = useEditorStore.getState();
+        const fullAdjustments = {
+          ...adjustments,
+          isophoteGuides: editorState.isophoteGuides,
+          shieldRegions: editorState.shieldRegions,
+        };
+
         const newPatchDataJson: any = await invoke(command, {
-          currentAdjustments: adjustments,
+          currentAdjustments: fullAdjustments,
           patchDefinition: patchDefinitionForBackend,
           sourcePoint: [sourceX, sourceY],
         });
@@ -150,21 +157,28 @@ export function useAiMasking() {
         const hasRetouch = patchDefinitionForBackend?.subMasks?.some((sm: SubMask) => sm.type === Mask.Retouch);
         const hasLiquify = patchDefinitionForBackend?.subMasks?.some((sm: SubMask) => sm.type === Mask.Liquify);
 
+        const editorState = useEditorStore.getState();
+        const fullAdjustments = {
+          ...adjustments,
+          isophoteGuides: editorState.isophoteGuides,
+          shieldRegions: editorState.shieldRegions,
+        };
+
         let newPatchDataJson: any;
         if (hasRetouch) {
           newPatchDataJson = await invoke('generate_retouch_patch', {
             patchDefinition: patchDefinitionForBackend,
-            currentAdjustments: adjustments,
+            currentAdjustments: fullAdjustments,
           });
         } else if (hasLiquify) {
           newPatchDataJson = await invoke('generate_liquify_patch', {
             patchDefinition: patchDefinitionForBackend,
-            currentAdjustments: adjustments,
+            currentAdjustments: fullAdjustments,
             sourcePoint: [sourceX, sourceY],
           });
         } else {
           newPatchDataJson = await invoke('generate_manual_cleanup_patch', {
-            currentAdjustments: adjustments,
+            currentAdjustments: fullAdjustments,
             patchDefinition: patchDefinitionForBackend,
             sourcePoint: [sourceX, sourceY],
           });

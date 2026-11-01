@@ -16,8 +16,10 @@ import {
 } from '@dnd-kit/core';
 import clsx from 'clsx';
 
+import { Folder, Sparkles } from 'lucide-react';
 import TitleBar from './window/TitleBar';
 import FolderTree from './components/panel/right/FolderTree';
+import TonesPanel from './components/panel/left/TonesPanel';
 import SettingsPanel from './components/panel/SettingsPanel';
 import ExportPanel from './components/panel/right/ExportPanel';
 import GlobalTooltip from './components/ui/GlobalTooltip';
@@ -151,6 +153,7 @@ function App() {
     })),
   );
 
+  const [leftEditorTab, setLeftEditorTab] = useState<'folders' | 'tones'>('folders');
   const {
     activeView,
     isFullScreen,
@@ -713,8 +716,8 @@ function App() {
   const renderAppPanel = useCallback(
     (panelId: Panel) => {
       switch (panelId) {
-        case Panel.FolderTree:
-          return (
+        case Panel.FolderTree: {
+          const folderTreeComponent = (
             <FolderTree
               isResizing={isResizing}
               onContextMenu={handleFolderTreeContextMenu}
@@ -731,6 +734,44 @@ function App() {
               isInstantTransition={isInstantTransition}
             />
           );
+
+          if (activeView === 'editor') {
+            return (
+              <div className="flex flex-col h-full w-full bg-surface select-none overflow-hidden">
+                <div className="flex items-center gap-1 p-1.5 border-b border-border-color/30 bg-bg-secondary/60 shrink-0">
+                  <button
+                    onClick={() => setLeftEditorTab('folders')}
+                    className={clsx(
+                      "flex-1 flex items-center justify-center gap-1.5 py-1 px-2 rounded text-xs font-medium transition-all cursor-pointer",
+                      leftEditorTab === 'folders'
+                        ? "bg-surface shadow-xs text-text-primary border border-border-color/50"
+                        : "text-text-secondary hover:text-text-primary hover:bg-surface/40"
+                    )}
+                  >
+                    <Folder className="w-3.5 h-3.5" />
+                    <span>Folders & Sources</span>
+                  </button>
+                  <button
+                    onClick={() => setLeftEditorTab('tones')}
+                    className={clsx(
+                      "flex-1 flex items-center justify-center gap-1.5 py-1 px-2 rounded text-xs font-medium transition-all cursor-pointer",
+                      leftEditorTab === 'tones'
+                        ? "bg-surface shadow-xs text-accent border border-accent/30"
+                        : "text-text-secondary hover:text-text-primary hover:bg-surface/40"
+                    )}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>HDR & Looks</span>
+                  </button>
+                </div>
+                <div className="flex-1 overflow-hidden relative">
+                  {leftEditorTab === 'folders' ? folderTreeComponent : <TonesPanel />}
+                </div>
+              </div>
+            );
+          }
+          return folderTreeComponent;
+        }
         case Panel.Export:
           return (
             <ExportPanel
@@ -788,8 +829,9 @@ function App() {
 
   const shouldHideFolderTree = useCompactPanels || useWidePanels;
   const isWgpuActive =
+    osPlatform !== 'windows' &&
     activeView === 'editor' &&
-    appSettings?.useWgpuRenderer !== false &&
+    appSettings?.useWgpuRenderer === true &&
     selectedImage?.isReady &&
     hasRenderedFirstFrame;
   const useMacWindowShell = osPlatform === 'macos' && !appSettings?.decorations && !isWindowFullScreen && !isFullScreen;

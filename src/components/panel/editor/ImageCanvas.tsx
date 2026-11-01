@@ -26,6 +26,7 @@ import type { OverlayMode } from '../right/CropPanel';
 import CompositionOverlays from './overlays/CompositionOverlays';
 import RelightLightShape, { RelightBasis } from './overlays/RelightLightShape';
 import CenterMarkerShape, { CENTER_MARKERS } from './overlays/CenterMarkerShape';
+import InpaintGuideOverlay from './overlays/InpaintGuideOverlay';
 import SplitCompareOverlay from './SplitCompareOverlay';
 import VariantMatrix4Way from './VariantMatrix4Way';
 import { calculateStraightenAngle, resolveAspectRatio } from '../../../utils/cropUtils';
@@ -1350,6 +1351,10 @@ const ImageCanvas = memo(
       (state) => isPanelVisible(state, Panel.Adjustments) && state.collapsibleSectionsState.effects,
     );
     const setEditor = useEditorStore((state) => state.setEditor);
+    const inpaintGuideMode = useEditorStore((state) => state.inpaintGuideMode);
+    const isophoteGuides = useEditorStore((state) => state.isophoteGuides);
+    const shieldRegions = useEditorStore((state) => state.shieldRegions);
+    const activeInpaintGuideId = useEditorStore((state) => state.activeInpaintGuideId);
     const [draftGuideLine, setDraftGuideLine] = useState<{ p1: Coord; p2: Coord } | null>(null);
     const [localDragLines, setLocalDragLines] = useState<any[] | null>(null);
 
@@ -1399,9 +1404,13 @@ const ImageCanvas = memo(
     const [isCtrlPressed, setIsCtrlPressed] = useState(false);
     const retainedPatchRef = useRef<typeof interactivePatch>(null);
 
-    const isWgpuActive = appSettings?.useWgpuRenderer !== false && selectedImage?.isReady && hasRenderedFirstFrame;
     const { t } = useTranslation();
     const osPlatform = useOsPlatform();
+    const isWgpuActive =
+      osPlatform !== 'windows' &&
+      appSettings?.useWgpuRenderer === true &&
+      selectedImage?.isReady &&
+      hasRenderedFirstFrame;
     const modifierKey = osPlatform === 'macos' ? 'Cmd' : 'Ctrl';
 
     const manualCleanupStateRef = useRef({
@@ -2368,14 +2377,13 @@ const ImageCanvas = memo(
           if (state.generation === generation) {
             setWbSample(sample);
           }
-          if (asShotWhiteBalance) {
-            const picked = { temperature: sample.temperature, tint: sample.tint };
-            setAdjustments((prev: Adjustments) =>
-              isKelvinWhiteBalance
-                ? withKelvinWhiteBalance(prev, picked)
-                : withRelativeWhiteBalance(prev, toRelativeWhiteBalance(asShotWhiteBalance, picked)),
-            );
-          }
+          const effectiveAsShot = asShotWhiteBalance || { temperature: 5500, tint: 0 };
+          const picked = { temperature: sample.temperature, tint: sample.tint };
+          setAdjustments((prev: Adjustments) =>
+            isKelvinWhiteBalance
+              ? withKelvinWhiteBalance(prev, picked)
+              : withRelativeWhiteBalance(prev, toRelativeWhiteBalance(effectiveAsShot, picked)),
+          );
           onWbPicked?.();
         } catch (err) {
           console.error('Failed to pick white balance:', err);
@@ -3306,7 +3314,12 @@ const ImageCanvas = memo(
     };
 
     const cropPreviewUrl = uncroppedAdjustedPreviewUrl || selectedImage?.thumbnailUrl || null;
-    const originalSrc = transformedOriginalUrl;
+    const originalSrc =
+      transformedOriginalUrl ||
+      selectedImage?.originalUrl ||
+      selectedImage?.thumbnailUrl ||
+      uncroppedAdjustedPreviewUrl ||
+      null;
     const isShowingOriginal = showOriginal && !!originalSrc;
 
     useEffect(() => {
@@ -3689,7 +3702,7 @@ const ImageCanvas = memo(
             </div>
           )}
 
-          {(isMasking || isAiEditing || isWbPickerActive || isRelightPickerActive || isTatActive || showRelightLights || showCenterMarker) &&
+          {(isMasking || isAiEditing || isWbPickerActive || isRelightPickerActive || isTatActive || showRelightLights || showCenterMarker || inpaintGuideMode !== 'none') &&
             stageWidth > 0 &&
             stageHeight > 0 && (
               <div
@@ -3858,6 +3871,38 @@ const ImageCanvas = memo(
                             onDragStateChange={(isDragging) => setEditor({ isSliderDragging: isDragging })}
                             onHoverChange={setIsMaskHovered}
                             onTouchInteraction={() => setIsMaskTouchInteracting(true)}
+                          />
+                        )}
+                        {inpaintGuideMode !== 'none' && (
+                          <InpaintGuideOverlay
+                            guideMode={inpaintGuideMode}
+                            isophoteGuides={isophoteGuides}
+                            shieldRegions={shieldRegions}
+                            zoomScale={effectiveZoomScale}
+                            activeGuideId={activeInpaintGuideId}
+                            onSelectGuide={(id) => setEditor({ activeInpaintGuideId: id })}
+                            onUpdateGuide={(g) =>
+                              setEditor((s) => ({
+                                isophoteGuides: s.isophoteGuides.map((x) => (x.id === g.id ? g : x)),
+                              }))
+                            }
+                            onRemoveGuide={(id) =>
+                              setEditor((s) => ({
+                                isophoteGuides: s.isophoteGuides.filter((x) => x.id !== id),
+                              }))
+                            }
+                            onUpdateShield={(sh) =>
+                              setEditor((s) => ({
+                                shieldRegions: s.shieldRegions.map((x) => (x.id === sh.id ? sh : x)),
+                              }))
+                            }
+                            onRemoveShield={(id) =>
+                              setEditor((s) => ({
+                                shieldRegions: s.shieldRegions.filter((x) => x.id !== id),
+                              }))
+                            }
+                            onDragStateChange={(isDragging) => setEditor({ isSliderDragging: isDragging })}
+                            onHoverChange={setIsMaskHovered}
                           />
                         )}
                         {isBrushActive &&

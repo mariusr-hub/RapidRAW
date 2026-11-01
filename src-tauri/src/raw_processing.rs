@@ -7,8 +7,9 @@ use rawler::{
     decoders::{Decoder, Orientation, RawDecodeParams},
     imgop::{
         develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
-        xyz::Illuminant,
+        xyz::{FlatColorMatrix, Illuminant},
     },
+    pixarray::Color2D,
     rawimage::{RawImage, RawPhotometricInterpretation},
     rawsource::RawSource,
 };
@@ -17,7 +18,17 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use rayon::prelude::*;
+
+pub trait CfaExt {
+    fn is_bayer(&self) -> bool;
+}
+
+impl CfaExt for rawler::cfa::CFA {
+    #[inline]
+    fn is_bayer(&self) -> bool {
+        self.width == 2 && self.height == 2
+    }
+}
 
 pub fn develop_raw_image(
     file_bytes: &[u8],
@@ -64,12 +75,28 @@ fn is_linear_raw_format(raw_image: &RawImage) -> bool {
 }
 
 #[inline]
-fn srgb_to_linear(value: f32) -> f32 {
+pub fn srgb_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
-        ((value + 0.055) / 1.055).powf(3.0)
+        ((value + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Standard CCT-based dual-illuminant matrix interpolation between Illuminant A (2856K) and Illuminant D65 (6504K)
+pub fn interpolate_dual_illuminant_matrix(matrix_a: &[f32], matrix_d65: &[f32], cct: f32) -> Vec<f32> {
+    if matrix_a.len() != matrix_d65.len() || matrix_a.is_empty() {
+        return matrix_d65.to_vec();
+    }
+    let mired_a = 1.0 / 2856.0f32;
+    let mired_d65 = 1.0 / 6504.0f32;
+    let mired_shot = 1.0 / cct.clamp(2000.0, 12000.0);
+    let weight_a = ((mired_shot - mired_d65) / (mired_a - mired_d65)).clamp(0.0, 1.0);
+    matrix_a
+        .iter()
+        .zip(matrix_d65.iter())
+        .map(|(&a, &d65)| weight_a * a + (1.0 - weight_a) * d65)
+        .collect()
 }
 
 #[inline]
@@ -85,7 +112,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 #[inline]
-fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+pub fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let max_c = r.max(g).max(b);
 
     if max_c <= 0.50 {
@@ -95,6 +122,51 @@ fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let mut cur_r = r;
     let mut cur_g = g;
     let mut cur_b = b;
+
+    // Sensel inpainting via Laplacian gradient propagation from unclipped channels (G, R, B)
+    let clip_thresh = 0.92f32;
+    let is_r_clipped = cur_r >= clip_thresh;
+    let is_g_clipped = cur_g >= clip_thresh;
+    let is_b_clipped = cur_b >= clip_thresh;
+    let num_clipped = (is_r_clipped as u8) + (is_g_clipped as u8) + (is_b_clipped as u8);
+
+    if num_clipped == 1 || num_clipped == 2 {
+        let mut unclipped_energy = 0.0f32;
+        let mut unclipped_weight = 0.0f32;
+
+        if !is_g_clipped {
+            unclipped_energy += cur_g * 1.5;
+            unclipped_weight += 1.5;
+        }
+        if !is_r_clipped {
+            unclipped_energy += cur_r * 1.0;
+            unclipped_weight += 1.0;
+        }
+        if !is_b_clipped {
+            unclipped_energy += cur_b * 0.8;
+            unclipped_weight += 0.8;
+        }
+
+        if unclipped_weight > 0.0 {
+            let guide_lum = unclipped_energy / unclipped_weight;
+            let onset = 0.45f32;
+            let excess = (guide_lum - onset).max(0.0) / (clip_thresh - onset);
+            let gradient_boost = excess * 0.85;
+
+            if is_r_clipped {
+                let r_target = clip_thresh * 1.05 + gradient_boost;
+                cur_r = cur_r.max(r_target);
+            }
+            if is_g_clipped {
+                let g_target = clip_thresh * 0.98 + gradient_boost;
+                cur_g = cur_g.max(g_target);
+            }
+            if is_b_clipped {
+                let b_target = clip_thresh * 1.02 + gradient_boost;
+                cur_b = cur_b.max(b_target);
+            }
+        }
+    }
 
     let outer_blend = smootherstep(0.50, 1.5, max_c);
 
@@ -112,19 +184,19 @@ fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     }
 
     let new_max = cur_r.max(cur_g).max(cur_b);
-    let min_c = cur_r.min(cur_g).min(cur_b);
+    let new_min = cur_r.min(cur_g).min(cur_b);
 
-    let knee = smoothstep(0.50, 1.5, new_max);
+    let knee = smoothstep(0.70, 2.0, new_max);
 
     if knee > 0.0 {
-        let neutrality = (min_c / new_max.max(1e-5)).clamp(0.0, 1.0);
+        let neutrality = (new_min / new_max.max(1e-5)).clamp(0.0, 1.0);
+        let core_burn = smoothstep(0.85, 3.5, new_max);
 
-        let core_burn = smoothstep(0.60, 3.0, new_max);
-
-        let desat = (knee * (neutrality * 0.85 + core_burn * 0.15)).clamp(0.0, 1.0);
+        // Retain unclipped textural detail rather than flat uniform desaturation
+        let desat = (knee * (neutrality * 0.70 + core_burn * 0.30)).clamp(0.0, 1.0);
         let smooth_desat = desat * desat * (3.0 - 2.0 * desat);
 
-        let neutral_value = min_c + (new_max - min_c) * 1.0;
+        let neutral_value = new_min + (new_max - new_min) * 0.95;
 
         cur_r = cur_r * (1.0 - smooth_desat) + neutral_value * smooth_desat;
         cur_g = cur_g * (1.0 - smooth_desat) + neutral_value * smooth_desat;
@@ -133,10 +205,147 @@ fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 
     (cur_r, cur_g, cur_b)
 }
+
+fn primary_color_matrix(raw_image: &RawImage) -> Option<&FlatColorMatrix> {
+    let matrices = &raw_image.color_matrix;
+    matrices
+        .get(&Illuminant::D65)
+        .or_else(|| matrices.values().next())
+}
+
+struct GamutCompression {
+    threshold: f32,
+    scale: f32,
+}
+
+impl GamutCompression {
+    const THRESHOLD: f32 = 0.8;
+    const POWER: f32 = 1.2;
+
+    fn new(limit: f32) -> Option<Self> {
+        if limit <= 1.0 {
+            return None;
+        }
+        let threshold = Self::THRESHOLD;
+        let span = limit - threshold;
+        let scale =
+            span / (((1.0 - threshold) / span).powf(-Self::POWER) - 1.0).powf(1.0 / Self::POWER);
+        Some(Self { threshold, scale })
+    }
+
+    #[inline]
+    fn compress(&self, distance: f32) -> f32 {
+        if distance <= self.threshold {
+            return distance;
+        }
+        let excess = distance - self.threshold;
+        self.threshold
+            + excess / (1.0 + (excess / self.scale).powf(Self::POWER)).powf(1.0 / Self::POWER)
+    }
+}
+
+struct CameraToSrgb {
+    matrix: [[f32; 4]; 3],
+    compression: [Option<GamutCompression>; 3],
+}
+
+impl CameraToSrgb {
+    fn new(raw_image: &RawImage) -> Option<Self> {
+        let color_matrix = as_shot_color(raw_image)
+            .map(|(_, color_matrix)| color_matrix)
+            .or_else(|| primary_color_matrix(raw_image).cloned())?;
+        if color_matrix.len() % 3 != 0 || color_matrix.len() > 12 {
+            return None;
+        }
+        let primaries =
+            crate::white_balance::camera_to_srgb(&color_matrix, &camera_neutral(raw_image))?;
+
+        let mut matrix = [[0.0f32; 4]; 3];
+        let mut limits = [0.0f32; 3];
+        for (channel, primary) in primaries.iter().enumerate() {
+            for (row, value) in matrix.iter_mut().zip(primary) {
+                row[channel] = *value;
+            }
+            let peak = primary[0].max(primary[1]).max(primary[2]);
+            if peak > 0.0 {
+                for (limit, value) in limits.iter_mut().zip(primary) {
+                    *limit = limit.max((peak - value) / peak);
+                }
+            }
+        }
+
+        Some(Self {
+            matrix,
+            compression: limits.map(GamutCompression::new),
+        })
+    }
+
+    #[inline]
+    fn pixel<const N: usize>(&self, camera: &[f32; N]) -> [f32; 3] {
+        let mut rgb = self
+            .matrix
+            .map(|row| row.iter().zip(camera).map(|(m, c)| m * c).sum::<f32>());
+        let achromatic = rgb[0].max(rgb[1]).max(rgb[2]);
+        if achromatic <= 0.0 {
+            return [0.0; 3];
+        }
+        for (value, compression) in rgb.iter_mut().zip(&self.compression) {
+            if let Some(compression) = compression {
+                let distance = (achromatic - *value) / achromatic;
+                *value = achromatic - compression.compress(distance) * achromatic;
+            }
+        }
+        rgb
+    }
+
+    fn convert_pixels<const N: usize>(&self, pixels: &Color2D<f32, N>) -> Color2D<f32, 3> {
+        Color2D::new_with(
+            pixels.data.par_iter().map(|p| self.pixel(p)).collect(),
+            pixels.width,
+            pixels.height,
+        )
+    }
+
+    fn apply(&self, intermediate: Intermediate) -> Intermediate {
+        match intermediate {
+            Intermediate::ThreeColor(pixels) => {
+                Intermediate::ThreeColor(self.convert_pixels(&pixels))
+            }
+            Intermediate::FourColor(pixels) => {
+                Intermediate::ThreeColor(self.convert_pixels(&pixels))
+            }
+            monochrome => monochrome,
+        }
+    }
+}
+
+fn camera_neutral(raw_image: &RawImage) -> [f32; 4] {
+    if raw_image.wb_coeffs[0].is_nan() {
+        [1.0; 4]
+    } else {
+        raw_image.wb_coeffs.map(|c| 1.0 / c)
+    }
+}
+
+fn as_shot_color(raw_image: &RawImage) -> Option<(WhiteBalance, FlatColorMatrix)> {
+    let neutral = camera_neutral(raw_image);
+
+    let matrices = &raw_image.color_matrix;
+    if let (Some(matrix_a), Some(matrix_d65)) =
+        (matrices.get(&Illuminant::A), matrices.get(&Illuminant::D65))
+    {
+        return WhiteBalance::from_dual_illuminant_camera_neutral(matrix_a, matrix_d65, &neutral);
+    }
+
+    let color_matrix = primary_color_matrix(raw_image)?;
+    WhiteBalance::from_camera_neutral(color_matrix, &neutral)
+        .map(|white_balance| (white_balance, color_matrix.clone()))
+}
+
 fn develop_internal(
     file_bytes: &[u8],
     fast_demosaic: bool,
-    highlight_compression: f32,
+    _highlight_compression: f32,
     linear_mode: String,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<(DynamicImage, Orientation)> {
@@ -150,6 +359,11 @@ fn develop_internal(
     };
 
     check_cancel()?;
+
+    if crate::image_loader::is_linear_dng_probe(file_bytes) {
+        let dyn_img = crate::image_loader::load_linear_dng(file_bytes, cancel_token)?;
+        return Ok((dyn_img, Orientation::Normal));
+    }
 
     let source = RawSource::new_from_slice(file_bytes);
     let decoder = rawler::get_decoder(&source)?;
@@ -176,7 +390,9 @@ fn develop_internal(
     if let Ok(metadata) = decoder.raw_metadata(&source, &RawDecodeParams::default()) {
         let iso = metadata.exif.iso_speed.unwrap_or(100) as f32;
         // Sensor physics conditioning: OB row drift subtraction + 3x3 Bayer hot-pixel filter
-        condition_raw_bayer_sensor(&mut raw_image, iso);
+        if raw_image.camera.cfa.is_bayer() {
+            condition_raw_bayer_sensor(&mut raw_image, iso);
+        }
     }
 
     let is_linear_format = is_linear_raw_format(&raw_image);
@@ -206,27 +422,34 @@ fn develop_internal(
     }
 
     let mut developer = RawDevelop::default();
+    developer
+        .steps
+        .retain(|&step| step != ProcessingStep::SRgb && step != ProcessingStep::Calibrate);
 
     if is_linear_format {
-        developer.steps.retain(|&step| {
-            step != ProcessingStep::SRgb
-                && step != ProcessingStep::Demosaic
-                && (apply_calibration || step != ProcessingStep::Calibrate)
-        });
+        developer
+            .steps
+            .retain(|&step| step != ProcessingStep::Demosaic);
     } else if fast_demosaic {
         developer.demosaic_algorithm = DemosaicAlgorithm::Speed;
-        developer.steps.retain(|&step| step != ProcessingStep::SRgb);
-    } else {
-        developer.steps.retain(|&step| step != ProcessingStep::SRgb);
     }
 
     raw_image.wb_coeffs =
         crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
 
+    let camera_to_srgb = (apply_calibration || !is_linear_format)
+        .then(|| CameraToSrgb::new(&raw_image))
+        .flatten();
+
     check_cancel()?;
     let mut developed_intermediate = developer.develop_intermediate(&raw_image)?;
 
     drop(raw_image);
+
+    if let Some(ref camera_to_srgb) = camera_to_srgb {
+        check_cancel()?;
+        developed_intermediate = camera_to_srgb.apply(developed_intermediate);
+    }
 
     let denominator = (original_white_level - original_black_level).max(1.0);
     let rescale_factor = (u32::MAX as f32 - original_black_level) / denominator;
@@ -319,13 +542,67 @@ pub enum ProDemosaicMethod {
 }
 
 /// Ratio-Corrected Demosaicing (RCD) implementation for Bayer CFA arrays (RGGB / BGGR)
+/// with pre-demosaic Lateral Chromatic Aberration photosite coordinate warping.
 pub fn demosaic_rcd_bayer(
     cfa: &[f32],
     width: usize,
     height: usize,
     cfa_pattern: [u8; 4], // e.g. [0, 1, 1, 2] for RGGB (0=R, 1=G1, 2=G2, 3=B)
 ) -> Vec<[f32; 3]> {
+    demosaic_rcd_bayer_with_ca(cfa, width, height, cfa_pattern, None, None)
+}
+
+/// Ratio-Corrected Demosaicing with pre-demosaic sub-lattice lateral CA warping.
+/// Red and Blue sensel coordinates are warped before directional green and color ratio interpolation,
+/// using the 6th-order radial polynomial: r_warped = r * (1 + a1*r^2 + a2*r^4 + a3*r^6).
+pub fn demosaic_rcd_bayer_with_ca(
+    cfa: &[f32],
+    width: usize,
+    height: usize,
+    cfa_pattern: [u8; 4],
+    ca_red_coeffs: Option<[f32; 3]>,
+    ca_blue_coeffs: Option<[f32; 3]>,
+) -> Vec<[f32; 3]> {
     let mut rgb = vec![[0.0f32; 3]; width * height];
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+    let r_max = (cx * cx + cy * cy).sqrt().max(1.0);
+
+    let warp_offset = |x: usize, y: usize, coeffs: [f32; 3]| -> (f32, f32) {
+        let dx = x as f32 - cx;
+        let dy = y as f32 - cy;
+        let r = (dx * dx + dy * dy).sqrt() / r_max;
+        let r2 = r * r;
+        let r4 = r2 * r2;
+        let r6 = r4 * r2;
+        let scale = 1.0 + coeffs[0] * r2 + coeffs[1] * r4 + coeffs[2] * r6;
+        ((scale - 1.0) * dx, (scale - 1.0) * dy)
+    };
+
+    let sample_sensel = |x: i32, y: i32| -> f32 {
+        let scx = x.clamp(0, width as i32 - 1) as usize;
+        let scy = y.clamp(0, height as i32 - 1) as usize;
+        cfa[scy * width + scx]
+    };
+
+    // Sub-pixel continuous bilinear sampler on the 2x2 Bayer channel sub-lattice
+    let sample_sublattice_bilinear = |base_x: i32, base_y: i32, ox: f32, oy: f32| -> f32 {
+        let u = ox * 0.5;
+        let v = oy * 0.5;
+        let u0 = u.floor() as i32;
+        let v0 = v.floor() as i32;
+        let fu = u - u.floor();
+        let fv = v - v.floor();
+
+        let s00 = sample_sensel(base_x + 2 * u0, base_y + 2 * v0);
+        let s10 = sample_sensel(base_x + 2 * (u0 + 1), base_y + 2 * v0);
+        let s01 = sample_sensel(base_x + 2 * u0, base_y + 2 * (v0 + 1));
+        let s11 = sample_sensel(base_x + 2 * (u0 + 1), base_y + 2 * (v0 + 1));
+
+        let top = s00 * (1.0 - fu) + s10 * fu;
+        let bottom = s01 * (1.0 - fu) + s11 * fu;
+        top * (1.0 - fv) + bottom * fv
+    };
 
     // 1. Reconstruct Green channel using directional color ratio gradients
     for y in 2..(height - 2) {
@@ -335,7 +612,7 @@ pub fn demosaic_rcd_bayer(
             let p_type = cfa_pattern[(y % 2) * 2 + (x % 2)];
 
             if p_type == 1 || p_type == 2 {
-                // Already green pixel
+                // Already green pixel (reference optical axis, zero warp)
                 rgb[idx][1] = c;
             } else {
                 // Red or Blue site: compute horizontal vs vertical color ratios
@@ -362,32 +639,36 @@ pub fn demosaic_rcd_bayer(
     }
 
     // 2. Reconstruct Red and Blue using color ratio interpolation (R/G and B/G)
+    // with sub-pixel sub-lattice optical coordinate warping
     for y in 2..(height - 2) {
         for x in 2..(width - 2) {
             let idx = y * width + x;
             let g = rgb[idx][1].max(1e-5);
             let p_type = cfa_pattern[(y % 2) * 2 + (x % 2)];
 
+            let (r_ox, r_oy) = ca_red_coeffs.map(|c| warp_offset(x, y, c)).unwrap_or((0.0, 0.0));
+            let (b_ox, b_oy) = ca_blue_coeffs.map(|c| warp_offset(x, y, c)).unwrap_or((0.0, 0.0));
+
             if p_type == 0 {
                 // Red site
                 rgb[idx][0] = cfa[idx];
-                // Blue from 4 diagonal neighbors
+                // Blue from 4 diagonal neighbors with continuous blue CA sub-lattice offset
                 let b_ratio = 0.25 * (
-                    cfa[(y - 1) * width + (x - 1)] / rgb[(y - 1) * width + (x - 1)][1].max(1e-5)
-                    + cfa[(y - 1) * width + (x + 1)] / rgb[(y - 1) * width + (x + 1)][1].max(1e-5)
-                    + cfa[(y + 1) * width + (x - 1)] / rgb[(y + 1) * width + (x - 1)][1].max(1e-5)
-                    + cfa[(y + 1) * width + (x + 1)] / rgb[(y + 1) * width + (x + 1)][1].max(1e-5)
+                    sample_sublattice_bilinear(x as i32 - 1, y as i32 - 1, b_ox, b_oy) / rgb[((y - 1).clamp(0, height - 1)) * width + (x - 1).clamp(0, width - 1)][1].max(1e-5)
+                    + sample_sublattice_bilinear(x as i32 + 1, y as i32 - 1, b_ox, b_oy) / rgb[((y - 1).clamp(0, height - 1)) * width + (x + 1).clamp(0, width - 1)][1].max(1e-5)
+                    + sample_sublattice_bilinear(x as i32 - 1, y as i32 + 1, b_ox, b_oy) / rgb[((y + 1).clamp(0, height - 1)) * width + (x - 1).clamp(0, width - 1)][1].max(1e-5)
+                    + sample_sublattice_bilinear(x as i32 + 1, y as i32 + 1, b_ox, b_oy) / rgb[((y + 1).clamp(0, height - 1)) * width + (x + 1).clamp(0, width - 1)][1].max(1e-5)
                 );
                 rgb[idx][2] = (b_ratio * g).max(0.0);
             } else if p_type == 3 {
                 // Blue site
                 rgb[idx][2] = cfa[idx];
-                // Red from 4 diagonal neighbors
+                // Red from 4 diagonal neighbors with continuous red CA sub-lattice offset
                 let r_ratio = 0.25 * (
-                    cfa[(y - 1) * width + (x - 1)] / rgb[(y - 1) * width + (x - 1)][1].max(1e-5)
-                    + cfa[(y - 1) * width + (x + 1)] / rgb[(y - 1) * width + (x + 1)][1].max(1e-5)
-                    + cfa[(y + 1) * width + (x - 1)] / rgb[(y + 1) * width + (x - 1)][1].max(1e-5)
-                    + cfa[(y + 1) * width + (x + 1)] / rgb[(y + 1) * width + (x + 1)][1].max(1e-5)
+                    sample_sublattice_bilinear(x as i32 - 1, y as i32 - 1, r_ox, r_oy) / rgb[((y - 1).clamp(0, height - 1)) * width + (x - 1).clamp(0, width - 1)][1].max(1e-5)
+                    + sample_sublattice_bilinear(x as i32 + 1, y as i32 - 1, r_ox, r_oy) / rgb[((y - 1).clamp(0, height - 1)) * width + (x + 1).clamp(0, width - 1)][1].max(1e-5)
+                    + sample_sublattice_bilinear(x as i32 - 1, y as i32 + 1, r_ox, r_oy) / rgb[((y + 1).clamp(0, height - 1)) * width + (x - 1).clamp(0, width - 1)][1].max(1e-5)
+                    + sample_sublattice_bilinear(x as i32 + 1, y as i32 + 1, r_ox, r_oy) / rgb[((y + 1).clamp(0, height - 1)) * width + (x + 1).clamp(0, width - 1)][1].max(1e-5)
                 );
                 rgb[idx][0] = (r_ratio * g).max(0.0);
             } else {
@@ -395,24 +676,24 @@ pub fn demosaic_rcd_bayer(
                 if y % 2 == 0 && x % 2 == 1 {
                     // Green on Red row: Red is Left/Right, Blue is Top/Bottom
                     let r_ratio = 0.5 * (
-                        cfa[y * width + (x - 1)] / rgb[y * width + (x - 1)][1].max(1e-5)
-                        + cfa[y * width + (x + 1)] / rgb[y * width + (x + 1)][1].max(1e-5)
+                        sample_sublattice_bilinear(x as i32 - 1, y as i32, r_ox, r_oy) / rgb[y * width + (x - 1).clamp(0, width - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32, r_ox, r_oy) / rgb[y * width + (x + 1).clamp(0, width - 1)][1].max(1e-5)
                     );
                     let b_ratio = 0.5 * (
-                        cfa[(y - 1) * width + x] / rgb[(y - 1) * width + x][1].max(1e-5)
-                        + cfa[(y + 1) * width + x] / rgb[(y + 1) * width + x][1].max(1e-5)
+                        sample_sublattice_bilinear(x as i32, y as i32 - 1, b_ox, b_oy) / rgb[((y - 1).clamp(0, height - 1)) * width + x][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32, y as i32 + 1, b_ox, b_oy) / rgb[((y + 1).clamp(0, height - 1)) * width + x][1].max(1e-5)
                     );
                     rgb[idx][0] = (r_ratio * g).max(0.0);
                     rgb[idx][2] = (b_ratio * g).max(0.0);
                 } else {
                     // Green on Blue row: Blue is Left/Right, Red is Top/Bottom
                     let b_ratio = 0.5 * (
-                        cfa[y * width + (x - 1)] / rgb[y * width + (x - 1)][1].max(1e-5)
-                        + cfa[y * width + (x + 1)] / rgb[y * width + (x + 1)][1].max(1e-5)
+                        sample_sublattice_bilinear(x as i32 - 1, y as i32, b_ox, b_oy) / rgb[y * width + (x - 1).clamp(0, width - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32, b_ox, b_oy) / rgb[y * width + (x + 1).clamp(0, width - 1)][1].max(1e-5)
                     );
                     let r_ratio = 0.5 * (
-                        cfa[(y - 1) * width + x] / rgb[(y - 1) * width + x][1].max(1e-5)
-                        + cfa[(y + 1) * width + x] / rgb[(y + 1) * width + x][1].max(1e-5)
+                        sample_sublattice_bilinear(x as i32, y as i32 - 1, r_ox, r_oy) / rgb[((y - 1).clamp(0, height - 1)) * width + x][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32, y as i32 + 1, r_ox, r_oy) / rgb[((y + 1).clamp(0, height - 1)) * width + x][1].max(1e-5)
                     );
                     rgb[idx][0] = (r_ratio * g).max(0.0);
                     rgb[idx][2] = (b_ratio * g).max(0.0);
@@ -510,43 +791,38 @@ pub fn read_as_shot_white_balance(file_bytes: &[u8]) -> Option<WhiteBalance> {
 }
 
 pub fn read_as_shot(file_bytes: &[u8]) -> Option<AsShot> {
-    let source = RawSource::new_from_slice(file_bytes);
-    let decoder = rawler::get_decoder(&source).ok()?;
-    let raw_image = decoder
-        .raw_image(&source, &RawDecodeParams::default(), true)
-        .ok()?;
-    let is_monochrome = raw_image.cpp == 1
-        && !matches!(raw_image.photometric, RawPhotometricInterpretation::Cfa(_));
+    if crate::image_loader::is_linear_dng_probe(file_bytes) {
+        return Some(AsShot::reference());
+    }
+    std::panic::catch_unwind(|| {
+        let source = RawSource::new_from_slice(file_bytes);
+        let decoder = rawler::get_decoder(&source).ok()?;
+        let mut raw_image = decoder
+            .raw_image(&source, &RawDecodeParams::default(), true)
+            .ok()?;
+        raw_image.wb_coeffs =
+            crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
+        let is_monochrome = raw_image.cpp == 1
+            && !matches!(raw_image.photometric, RawPhotometricInterpretation::Cfa(_));
 
-    Some(AsShot {
-        white_balance: (!is_monochrome)
-            .then(|| as_shot_white_balance(&raw_image, file_bytes))
-            .flatten()
-            .unwrap_or_else(WhiteBalance::reference),
-        exposure: crate::baseline_exposure::read(decoder.as_ref(), file_bytes, is_monochrome),
+        Some(AsShot {
+            white_balance: (!is_monochrome)
+                .then(|| as_shot_color(&raw_image))
+                .flatten()
+                .map(|(white_balance, _)| white_balance)
+                .unwrap_or_else(WhiteBalance::reference),
+            exposure: crate::baseline_exposure::read(decoder.as_ref(), file_bytes, is_monochrome),
+        })
     })
+    .ok()
+    .flatten()
 }
 
 fn as_shot_white_balance(raw_image: &RawImage, file_bytes: &[u8]) -> Option<WhiteBalance> {
-    let wb_coeffs =
+    let mut raw_image = raw_image.clone();
+    raw_image.wb_coeffs =
         crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
-    let neutral = if wb_coeffs[0].is_nan() {
-        [1.0; 4]
-    } else {
-        wb_coeffs.map(|c| 1.0 / c)
-    };
-
-    let matrices = &raw_image.color_matrix;
-    if let (Some(matrix_a), Some(matrix_d65)) =
-        (matrices.get(&Illuminant::A), matrices.get(&Illuminant::D65))
-    {
-        return WhiteBalance::from_dual_illuminant_camera_neutral(matrix_a, matrix_d65, &neutral);
-    }
-
-    let color_matrix = matrices
-        .get(&Illuminant::D65)
-        .or_else(|| matrices.values().next())?;
-    WhiteBalance::from_camera_neutral(color_matrix, &neutral)
+    as_shot_color(&raw_image).map(|(white_balance, _)| white_balance)
 }
 
 fn rgb_pixels_to_rgba(
@@ -580,22 +856,28 @@ pub fn get_fast_demosaic_scale_factor(
     decoded_width: u32,
     decoded_height: u32,
 ) -> f32 {
-    let source = RawSource::new_from_slice(file_bytes);
-    if let Ok(decoder) = rawler::get_decoder(&source)
-        && let Ok(raw_img) = decoder.raw_image(&source, &RawDecodeParams::default(), true)
-    {
-        let max_orig = (raw_img.width as f32).max(raw_img.height as f32);
-        let max_comp = (decoded_width as f32).max(decoded_height as f32);
-        if max_orig > 0.0 {
-            let ratio = max_comp / max_orig;
-            if ratio > 0.1 && ratio < 0.35 {
-                return 0.25;
-            } else if (0.35..0.75).contains(&ratio) {
-                return 0.5;
+    if crate::image_loader::is_linear_dng_probe(file_bytes) {
+        return 1.0;
+    }
+    std::panic::catch_unwind(|| {
+        let source = RawSource::new_from_slice(file_bytes);
+        if let Ok(decoder) = rawler::get_decoder(&source)
+            && let Ok(raw_img) = decoder.raw_image(&source, &RawDecodeParams::default(), true)
+        {
+            let max_orig = (raw_img.width as f32).max(raw_img.height as f32);
+            let max_comp = (decoded_width as f32).max(decoded_height as f32);
+            if max_orig > 0.0 {
+                let ratio = max_comp / max_orig;
+                if ratio > 0.1 && ratio < 0.35 {
+                    return 0.25;
+                } else if (0.35..0.75).contains(&ratio) {
+                    return 0.5;
+                }
             }
         }
-    }
-    1.0
+        1.0
+    })
+    .unwrap_or(1.0)
 }
 
 /// High-speed embedded camera RAW preview extractor for RapidRAW.
@@ -613,30 +895,29 @@ pub fn extract_embedded_raw_preview(path: String, app_handle: tauri::AppHandle) 
     let (source_path, _) = parse_virtual_path(&path);
     let path_str = source_path.to_string_lossy().to_string();
 
-    let bytes = read_file_mapped(Path::new(&path_str))
-        .map_err(|e| format!("Failed to read file for preview '{}': {}", path, e))?;
-
     if !is_raw_file(&path_str) {
         // For non-raw formats (JPEG, PNG, WebP), return direct asset file path URL
         return Ok(format!("asset://localhost/{}", path_str.replace('\\', "/")));
     }
 
-    // Try fast embedded preview extraction
-    let settings = crate::app_settings::load_settings(app_handle).unwrap_or_default();
-    let img: DynamicImage = match load_base_image_from_bytes(&bytes, &path_str, false, &settings, None) {
-        Ok(loaded) => loaded,
-        Err(e) => return Err(format!("Could not extract preview for '{}': {}", path, e)),
+    // Fast path: extract embedded camera JPEG preview via seek (~10-15ms) before falling back to full RAW decode
+    let img: DynamicImage = if let Some(embedded) =
+        crate::file_management::try_load_embedded_raw_preview(Path::new(&path_str), 1600)
+            .or_else(|| crate::file_management::try_load_embedded_raw_preview(Path::new(&path_str), 512))
+    {
+        embedded
+    } else {
+        let bytes = read_file_mapped(Path::new(&path_str))
+            .map_err(|e| format!("Failed to read file for preview '{}': {}", path, e))?;
+        let settings = crate::app_settings::load_settings(app_handle).unwrap_or_default();
+        load_base_image_from_bytes(&bytes, &path_str, true, &settings, None)
+            .map_err(|e| format!("Could not extract preview for '{}': {}", path, e))?
     };
 
     // Encode to fast JPEG buffer (quality 85)
     let (w, h) = (img.width(), img.height());
-    let resized = if w > 2560 || h > 2560 {
-        let (new_w, new_h) = if w > h {
-            (2560, (2560.0 * h as f32 / w as f32).round() as u32)
-        } else {
-            ((2560.0 * w as f32 / h as f32).round() as u32, 2560)
-        };
-        img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle)
+    let resized = if w.max(h) > 2048 {
+        crate::fast_resizer::fast_downscale_dynamic(&img, 2048, 2048)
     } else {
         img
     };
@@ -737,6 +1018,9 @@ pub fn reconstruct_directional_clipped_highlights(img: &mut image::Rgb32FImage) 
 /// 1. Optical Black (OB) row drift subtraction to eliminate horizontal read noise banding
 /// 2. Raw-level 3x3 same-channel Bayer median hot-pixel filter to prevent colored demosaic crosses
 pub fn condition_raw_bayer_sensor(raw_image: &mut rawler::rawimage::RawImage, iso: f32) {
+    if !raw_image.camera.cfa.is_bayer() {
+        return;
+    }
     let w = raw_image.width;
     let h = raw_image.height;
     if w < 10 || h < 10 {
@@ -826,11 +1110,93 @@ pub fn condition_raw_bayer_sensor(raw_image: &mut rawler::rawimage::RawImage, is
 
                             let max_neighbor = p00.max(p01).max(p02).max(p10).max(p12).max(p20).max(p21).max(p22);
                             if val > max_neighbor.saturating_add(spike_thresh) {
-                                let mut neighbors = [p00, p01, p02, p10, p12, p20, p21, p22];
-                                neighbors.sort_unstable();
-                                let median = (neighbors[3] as u32 + neighbors[4] as u32) / 2;
-                                row[x] = median as u16;
+                                // Optical Point Spread Function (PSF) gradient check:
+                                // Real celestial stars are focused through the lens and form an optical Airy disk
+                                // spanning 2x2 to 3x3 photosites, illuminating adjacent cross-channel sensels.
+                                // Thermal defects / hot pixels have near-infinite gradient (isolated 1-sensel Dirac spike).
+                                let y_prev1 = (y - 1) * w;
+                                let y_next1 = (y + 1) * w;
+                                let adj_up = data_snapshot[y_prev1 + x];
+                                let adj_down = data_snapshot[y_next1 + x];
+                                let adj_left = data_snapshot[y_curr + x - 1];
+                                let adj_right = data_snapshot[y_curr + x + 1];
+                                let max_adjacent = adj_up.max(adj_down).max(adj_left).max(adj_right);
+
+                                let star_support_thresh = max_neighbor.saturating_add(spike_thresh / 4);
+                                let is_celestial_star = max_adjacent > star_support_thresh;
+
+                                if !is_celestial_star {
+                                    let mut neighbors = [p00, p01, p02, p10, p12, p20, p21, p22];
+                                    neighbors.sort_unstable();
+                                    let median = (neighbors[3] as u32 + neighbors[4] as u32) / 2;
+                                    row[x] = median as u16;
+                                }
                             }
+                        }
+                    }
+                });
+        }
+
+        // 3. Bayer Gr / Gb Nyquist Cross-Talk Equilibration:
+        // Eliminates checkerboard/maze artifacts before demosaicing by equilibrating Gr and Gb in smooth regions.
+        if crop_x1 > crop_x0 + 2 && crop_y1 > crop_y0 + 2 {
+            let data_snapshot2 = data.clone();
+            // Determine green parity dynamically for any 2x2 Bayer CFA (RGGB, BGGR, GRBG, GBRG):
+            // In RGGB/BGGR, green sensels satisfy (x + y) % 2 == 1.
+            // In GRBG/GBRG, green sensels satisfy (x + y) % 2 == 0.
+            let green_parity = if raw_image.camera.cfa.width == 2 && raw_image.camera.cfa.height == 2 {
+                if raw_image.camera.cfa.color_at(0, 0) == rawler::cfa::CFA_COLOR_G { 0 } else { 1 }
+            } else {
+                1
+            };
+
+            data.par_chunks_mut(w)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    if y >= crop_y0 + 1 && y < crop_y1 - 1 {
+                        let y_prev1 = (y - 1) * w;
+                        let y_next1 = (y + 1) * w;
+
+                        for x in (crop_x0 + 1)..(crop_x1 - 1) {
+                            if (x + y) % 2 == green_parity {
+                                let g_val = row[x] as f32;
+                                // 4 diagonal opposite-parity Green neighbors: (x-1, y-1), (x+1, y-1), (x-1, y+1), (x+1, y+1)
+                                let d0 = data_snapshot2[y_prev1 + x - 1] as f32;
+                                let d1 = data_snapshot2[y_prev1 + x + 1] as f32;
+                                let d2 = data_snapshot2[y_next1 + x - 1] as f32;
+                                let d3 = data_snapshot2[y_next1 + x + 1] as f32;
+                                let opp_mean = (d0 + d1 + d2 + d3) * 0.25;
+
+                                let max_opp = d0.max(d1).max(d2).max(d3);
+                                let min_opp = d0.min(d1).min(d2).min(d3);
+                                let local_contrast = max_opp - min_opp;
+
+                                if local_contrast < 60.0 {
+                                    let diff = g_val - opp_mean;
+                                    if diff.abs() < 40.0 {
+                                        row[x] = (g_val - diff * 0.35).clamp(0.0, 65535.0).round() as u16;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+        }
+
+        // 4. Zero-Clipped Black Pedestal Reconstruction:
+        // When samples approach the black floor, prevent positive pedestal bias from hard zero-clamping
+        let black_floor = nominal_black;
+        if black_floor > 10.0 {
+            data.par_chunks_mut(w)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    for x in 0..w {
+                        let val = row[x] as f32;
+                        if val <= black_floor + 8.0 && val >= black_floor - 8.0 {
+                            let h = ((x as u32).wrapping_mul(0x1e35a7bd) ^ (y as u32).wrapping_mul(0x9e3779b9)) & 0xff;
+                            let dither = (h as f32 / 255.0 - 0.5) * 2.0;
+                            let adjusted = val + dither;
+                            row[x] = adjusted.clamp(0.0, 65535.0).round() as u16;
                         }
                     }
                 });
@@ -865,5 +1231,95 @@ mod tests {
         condition_raw_bayer_sensor(&mut raw_image, 1600.0);
         println!("Sensor conditioning passed successfully!");
     }
+
+    #[test]
+    fn test_recover_clipped_pixel_inpainting() {
+        // Unclipped pixel (< 0.50): unchanged
+        let (r0, g0, b0) = recover_clipped_pixel(0.40, 0.40, 0.40);
+        assert_eq!((r0, g0, b0), (0.40, 0.40, 0.40));
+
+        // Clipped Red with unclipped Green and Blue
+        let (r1, g1, b1) = recover_clipped_pixel(0.95, 0.70, 0.50);
+        assert!(r1 > 0.95, "Clipped red channel must be inpainted with gradient from intact channels: got {}", r1);
+        assert!(g1.is_finite() && b1.is_finite());
+
+        // Monotonic gradient propagation: higher guide lum produces higher reconstructed red
+        let (r2, _, _) = recover_clipped_pixel(0.95, 0.85, 0.50);
+        assert!(r2 > r1, "Higher intact green energy must propagate higher infilled red: {} vs {}", r2, r1);
+    }
+
+    #[test]
+    fn test_dual_illuminant_interpolation() {
+        let mat_a = vec![1.0, 2.0, 3.0];
+        let mat_d65 = vec![4.0, 5.0, 6.0];
+
+        // Exact Illuminant A (2856K)
+        let res_a = interpolate_dual_illuminant_matrix(&mat_a, &mat_d65, 2856.0);
+        assert!((res_a[0] - 1.0).abs() < 1e-4);
+
+        // Exact Illuminant D65 (6504K)
+        let res_d65 = interpolate_dual_illuminant_matrix(&mat_a, &mat_d65, 6504.0);
+        assert!((res_d65[0] - 4.0).abs() < 1e-4);
+
+        // Interpolated (e.g. 4000K)
+        let res_mid = interpolate_dual_illuminant_matrix(&mat_a, &mat_d65, 4000.0);
+        assert!(res_mid[0] > 1.0 && res_mid[0] < 4.0);
+    }
+
+    #[test]
+    fn test_demosaic_rcd_bayer_with_ca() {
+        let width = 16;
+        let height = 16;
+        let cfa = vec![0.5f32; width * height];
+        let rgb = demosaic_rcd_bayer_with_ca(
+            &cfa,
+            width,
+            height,
+            [0, 1, 1, 2],
+            Some([0.001, 0.0, 0.0]),
+            Some([-0.001, 0.0, 0.0]),
+        );
+        assert_eq!(rgb.len(), width * height);
+        assert!(rgb[width * 8 + 8][0] > 0.0);
+        assert!(rgb[width * 8 + 8][1] > 0.0);
+        assert!(rgb[width * 8 + 8][2] > 0.0);
+    }
+
+    #[test]
+    fn test_condition_raw_bayer_sensor_cfa_parities() {
+        use rawler::cfa::CFA;
+        use rawler::decoders::Camera;
+        use rawler::pixarray::PixU16;
+        use rawler::rawimage::{BlackLevel, WhiteLevel, RawPhotometricInterpretation, RawImageData};
+
+        let width = 32;
+        let height = 32;
+
+        let mut cam = Camera::default();
+        cam.cfa = CFA::new("GRBG");
+
+        let mut pix = PixU16::new(width, height);
+        for val in pix.data.iter_mut() {
+            *val = 2048;
+        }
+        pix.data[10 * width + 10] = 2060;
+
+        let cfa_cfg = rawler::rawimage::CFAConfig::new_from_camera(&cam);
+        let black = BlackLevel::new(&[2048.0], 1, 1, 1);
+        let mut raw_grbg = RawImage::new(
+            cam,
+            pix,
+            1,
+            [1.0, 1.0, 1.0, 1.0],
+            RawPhotometricInterpretation::Cfa(cfa_cfg),
+            Some(black),
+            Some(WhiteLevel(vec![16383])),
+            false,
+        );
+
+        condition_raw_bayer_sensor(&mut raw_grbg, 800.0);
+        assert_eq!(raw_grbg.width, width);
+    }
 }
+
 

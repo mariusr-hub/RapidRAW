@@ -299,6 +299,31 @@ pub fn apply_ai_denoise<'a>(
     Cow::Owned(DynamicImage::ImageRgb32F(out))
 }
 
+const BLUE_NOISE_16X16: [u8; 256] = [
+    128,  34, 194,  84, 153,  58, 218, 108, 137,  43, 203,  93, 146,  51, 211, 101,
+     10, 169,  59, 234,  26, 179,  76, 251,  19, 172,  68, 243,  12, 165,  61, 236,
+    220, 110, 140,  46, 205,  95, 148,  53, 213, 103, 131,  36, 196,  86, 155,  48,
+     78, 253,  21, 174,  70, 245,  14, 167,  63, 238,  28, 181,  74, 249,  23, 176,
+    150,  55, 215, 105, 133,  38, 198,  88, 157,  41, 201,  91, 144,  49, 209,  99,
+     16, 162,  65, 240,  30, 183,  72, 247,  25, 178,  66, 241,  17, 170,  67, 244,
+    207,  97, 142,  44, 200,  90, 145,  50, 210, 100, 139,  35, 195,  85, 154,  57,
+     64, 239,  29, 182,  73, 248,  24, 177,  60, 235,  27, 180,  75, 250,  20, 173,
+    135,  40, 199,  89, 158,  56, 216, 106, 132,  37, 197,  87, 156,  39, 193,  83,
+     32, 185,  71, 246,  18, 171,  69, 242,  11, 164,  62, 237,  31, 184,  77, 252,
+    212, 102, 138,  42, 202,  92, 147,  52, 221, 111, 141,  47, 206,  96, 149,  54,
+     62, 237,  27, 180,  75, 250,  20, 173,  79, 254,  22, 175,  71, 246,  15, 168,
+    159,  57, 217, 107, 136,  39, 192,  82, 151,  56, 214, 104, 134,  38, 204,  94,
+     13, 166,  64, 239,  33, 186,  80, 255,  15, 163,  66, 242,  29, 182,  73, 248,
+    219, 109, 134,  37, 208,  98, 143,  45, 218, 108, 130,  33, 191,  81, 152,  50,
+     80, 255,  19, 172,  67, 244,  16, 169,  83, 252,  18, 171,  69, 245,  13, 166,
+];
+
+#[inline]
+fn void_and_cluster_blue_noise(x: u32, y: u32) -> f32 {
+    let val = BLUE_NOISE_16X16[((y & 15) * 16 + (x & 15)) as usize];
+    (val as f32 / 255.0 - 0.5) / 256.0
+}
+
 fn restore_low_frequencies(denoised: &mut Rgb32FImage, source: &Rgb32FImage) {
     const FACTOR: usize = 64;
     let (w, h) = (source.width() as usize, source.height() as usize);
@@ -309,43 +334,56 @@ fn restore_low_frequencies(denoised: &mut Rgb32FImage, source: &Rgb32FImage) {
 
     let src = source.as_raw();
     let dn = denoised.as_raw();
-    let planes: Vec<Vec<f32>> = (0..3)
-        .map(|c| {
-            let mut plane = vec![0.0f32; sw * sh];
-            plane
-                .par_chunks_exact_mut(sw)
-                .enumerate()
-                .for_each(|(sy, row)| {
-                    let y_range = sy * FACTOR..((sy + 1) * FACTOR).min(h);
-                    for (sx, out) in row.iter_mut().enumerate() {
-                        let x_range = sx * FACTOR..((sx + 1) * FACTOR).min(w);
-                        let mut acc = 0.0f32;
-                        for y in y_range.clone() {
-                            for x in x_range.clone() {
-                                let i = (y * w + x) * 3 + c;
-                                acc += src[i] - dn[i];
-                            }
-                        }
-                        *out = acc / (y_range.len() * x_range.len()) as f32;
+
+    let mut luma_plane = vec![0.0f32; sw * sh];
+    luma_plane
+        .par_chunks_exact_mut(sw)
+        .enumerate()
+        .for_each(|(sy, row)| {
+            let y_range = sy * FACTOR..((sy + 1) * FACTOR).min(h);
+            for (sx, out) in row.iter_mut().enumerate() {
+                let x_range = sx * FACTOR..((sx + 1) * FACTOR).min(w);
+                let mut acc = 0.0f32;
+                for y in y_range.clone() {
+                    let y_offset = y * w * 3;
+                    for x in x_range.clone() {
+                        let i = y_offset + x * 3;
+                        let (src_i, _, _) = rapidraw_dsp::rgb_to_iqbqr(src[i], src[i + 1], src[i + 2]);
+                        let (dn_i, _, _) = rapidraw_dsp::rgb_to_iqbqr(dn[i], dn[i + 1], dn[i + 2]);
+                        acc += src_i - dn_i;
                     }
-                });
-            for _ in 0..3 {
-                crate::lens_blur::dof_box_filter(&mut plane, sw, sh, 1, 3);
+                }
+                *out = acc / (y_range.len() * x_range.len()) as f32;
             }
-            plane
-        })
-        .collect();
+        });
+
+    for _ in 0..3 {
+        crate::lens_blur::dof_box_filter(&mut luma_plane, sw, sh, 1, 3);
+    }
 
     denoised
         .par_chunks_exact_mut(w * 3)
         .enumerate()
         .for_each(|(y, row)| {
             let v = (y as f32 + 0.5) / h as f32;
+            let y_u32 = y as u32;
             for x in 0..w {
                 let tap = RelightTap::new((x as f32 + 0.5) / w as f32, v, sw, sh);
-                for (c, plane) in planes.iter().enumerate() {
-                    row[x * 3 + c] += tap.sample(plane);
+                let delta_i = tap.sample(&luma_plane);
+                let px = &mut row[x * 3..x * 3 + 3];
+                let (i, qb, qr) = rapidraw_dsp::rgb_to_iqbqr(px[0], px[1], px[2]);
+                let mut restored_i = i + delta_i;
+
+                if restored_i < 0.08 {
+                    let dither = void_and_cluster_blue_noise(x as u32, y_u32);
+                    let shadow_weight = (1.0 - (restored_i / 0.08).max(0.0)).clamp(0.0, 1.0);
+                    restored_i += dither * shadow_weight;
                 }
+
+                let (r, g, b) = rapidraw_dsp::iqbqr_to_rgb(restored_i, qb, qr);
+                px[0] = r;
+                px[1] = g;
+                px[2] = b;
             }
         });
 }

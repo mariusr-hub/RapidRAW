@@ -1,0 +1,2114 @@
+﻿{
+    "MIPLDenoiseAIEffect":  [
+                                {
+                                    "Name":  "Level",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "0"
+                                },
+                                {
+                                    "Name":  "Luminosity Denoise",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "100"
+                                },
+                                {
+                                    "Name":  "Color Denoise",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "50"
+                                },
+                                {
+                                    "Name":  "Details",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "50"
+                                },
+                                {
+                                    "Name":  "Sharpness",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "50"
+                                },
+                                {
+                                    "Name":  "Luminosity",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "50"
+                                },
+                                {
+                                    "Name":  "PostFilter",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "50"
+                                },
+                                {
+                                    "Name":  "Color",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "50"
+                                }
+                            ],
+    "MIPLSplitToningEffect":  [
+                                  {
+                                      "Name":  "ShadowsSaturation",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "ShadowsHue",
+                                      "Min":  "0",
+                                      "Max":  "360",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "HighlightsSaturation",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "HighlightsHue",
+                                      "Min":  "0",
+                                      "Max":  "360",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "Balance",
+                                      "Min":  "-100",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "Amount",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "50"
+                                  }
+                              ],
+    "MIPLBWChannels_v1_Effect":  [
+                                     {
+                                         "Name":  "sYellow",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "sViolet",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "sGreen",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "sCyan",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "sBlue",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "lYellow",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "lRed",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "lViolet",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "lCyan",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "lGreen",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "sRed",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "lBlue",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Apply",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     }
+                                 ],
+    "MIPLLUTMappingEffect":  [
+                                 {
+                                     "Name":  "Saturation",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Texture",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "50"
+                                 },
+                                 {
+                                     "Name":  "Contrast",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Amount",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "30"
+                                 }
+                             ],
+    "MIPLHueShiftEffect":  [
+                               {
+                                   "Name":  "Hue",
+                                   "Min":  "-180",
+                                   "Max":  "180",
+                                   "Default":  "0"
+                               }
+                           ],
+    "MIPLVibranceEffect":  [
+
+                           ],
+    "MIPLAIStructureEffect":  [
+                                  {
+                                      "Name":  "Boost",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "Amount",
+                                      "Min":  "-100",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  }
+                              ],
+    "MIPLVignetteEffect":  [
+                               {
+                                   "Name":  "Vignette Size",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "50"
+                               },
+                               {
+                                   "Name":  "Roundness",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "Offset Y",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "DarkMode",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "Inner Light",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "Offset X",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "Feather",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "CropMode",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "10"
+                               },
+                               {
+                                   "Name":  "Amount",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               }
+                           ],
+    "MIPLDodgeAndBurnEffect":  [
+                                   {
+                                       "Name":  "Amount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   }
+                               ],
+    "MIPLWaterAIEffect":  [
+                              {
+                                  "Name":  "Amount",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              },
+                              {
+                                  "Name":  "Blue",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "50"
+                              },
+                              {
+                                  "Name":  "Green",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              },
+                              {
+                                  "Name":  "OriginalColor",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "20"
+                              },
+                              {
+                                  "Name":  "Brightness",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              },
+                              {
+                                  "Name":  "Contrast",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "20"
+                              },
+                              {
+                                  "Name":  "Depth",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "-30"
+                              },
+                              {
+                                  "Name":  "Mask Feather",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "50"
+                              }
+                          ],
+    "MIPLDehazeEffect":  [
+                             {
+                                 "Name":  "Amount",
+                                 "Min":  "0",
+                                 "Max":  "100",
+                                 "Default":  "0"
+                             }
+                         ],
+    "MIPLRawDevelopEffect":  [
+                                 {
+                                     "Name":  "Texture",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "50"
+                                 },
+                                 {
+                                     "Name":  "Highlights",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Temperature",
+                                     "Min":  "2000",
+                                     "Max":  "25000",
+                                     "Default":  "5000"
+                                 },
+                                 {
+                                     "Name":  "Shadows",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Denoise_Boost",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "50"
+                                 },
+                                 {
+                                     "Name":  "Exposure",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Denoise_Luminosity",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Denoise_Color",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Denoise_Denoise",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "16"
+                                 },
+                                 {
+                                     "Name":  "Tint",
+                                     "Min":  "-150",
+                                     "Max":  "150",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Contrast",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Brightness",
+                                     "Min":  "0",
+                                     "Max":  "100",
+                                     "Default":  "100"
+                                 }
+                             ],
+    "MIPLFoliageEnhanceEffect":  [
+                                     {
+                                         "Name":  "Shift",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Amount",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     }
+                                 ],
+    "MIPLFaceEnhancer_vn0_Effect":  [
+                                        {
+                                            "Name":  "Slim Face",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Red Eye Removal",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Lips Saturation",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Lips Redness",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "TextureIris",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Eyebrow Improve",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Iris Visibility",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "80"
+                                        },
+                                        {
+                                            "Name":  "Lips Darkening",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Iris Flare",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Iris Amount",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "100"
+                                        },
+                                        {
+                                            "Name":  "Enlarge Eyes",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Eye Whitening",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Teeth whitening",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Face Light",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Eye Enhancer",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Dark Circles Removal",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        }
+                                    ],
+    "MIPLDenoiseLaplacianEffect":  [
+
+                                   ],
+    "MIPLFadeEffect":  [
+                           {
+                               "Name":  "ToningSaturation",
+                               "Min":  "0",
+                               "Max":  "100",
+                               "Default":  "50"
+                           },
+                           {
+                               "Name":  "ToningRange",
+                               "Min":  "0",
+                               "Max":  "100",
+                               "Default":  "0"
+                           },
+                           {
+                               "Name":  "Saturation",
+                               "Min":  "-100",
+                               "Max":  "100",
+                               "Default":  "-20"
+                           },
+                           {
+                               "Name":  "Fade",
+                               "Min":  "0",
+                               "Max":  "100",
+                               "Default":  "0"
+                           },
+                           {
+                               "Name":  "ToningHue",
+                               "Min":  "0",
+                               "Max":  "360",
+                               "Default":  "0"
+                           },
+                           {
+                               "Name":  "Contrast",
+                               "Min":  "-100",
+                               "Max":  "100",
+                               "Default":  "20"
+                           },
+                           {
+                               "Name":  "Amount",
+                               "Min":  "0",
+                               "Max":  "100",
+                               "Default":  "0"
+                           }
+                       ],
+    "MIPLMagicLightsEffect":  [
+                                  {
+                                      "Name":  "Amount",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "Size",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "30"
+                                  },
+                                  {
+                                      "Name":  "Beam Width",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "30"
+                                  },
+                                  {
+                                      "Name":  "Glow",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "30"
+                                  },
+                                  {
+                                      "Name":  "Number of Beams",
+                                      "Min":  "2",
+                                      "Max":  "24",
+                                      "Default":  "7"
+                                  },
+                                  {
+                                      "Name":  "Clearness",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "30"
+                                  },
+                                  {
+                                      "Name":  "Brightness",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "50"
+                                  },
+                                  {
+                                      "Name":  "Rotation",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "50"
+                                  }
+                              ],
+    "MIPLComplexBleachEffect":  [
+                                    {
+                                        "Name":  "Saturation",
+                                        "Min":  "-100",
+                                        "Max":  "100",
+                                        "Default":  "-25"
+                                    },
+                                    {
+                                        "Name":  "Contrast",
+                                        "Min":  "0",
+                                        "Max":  "100",
+                                        "Default":  "50"
+                                    },
+                                    {
+                                        "Name":  "Brightness",
+                                        "Min":  "-100",
+                                        "Max":  "100",
+                                        "Default":  "30"
+                                    },
+                                    {
+                                        "Name":  "Local Contrast",
+                                        "Min":  "0",
+                                        "Max":  "100",
+                                        "Default":  "60"
+                                    },
+                                    {
+                                        "Name":  "Amount",
+                                        "Min":  "0",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    }
+                                ],
+    "MIPLChannelsEffect":  [
+                               {
+                                   "Name":  "sYellow",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sGreen",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lPurple",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sOrange",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sBlue",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lYellow",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sPurple",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sMagenta",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hPurple",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lRed",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lOrange",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sAqua",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lMagenta",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hAqua",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lBlue",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hOrange",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hBlue",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hRed",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lAqua",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hMagenta",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "lGreen",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "sRed",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hYellow",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               },
+                               {
+                                   "Name":  "hGreen",
+                                   "Min":  "-100",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               }
+                           ],
+    "MIPLOrtonGlowEffect":  [
+                                {
+                                    "Name":  "Type",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "0"
+                                },
+                                {
+                                    "Name":  "Brightness",
+                                    "Min":  "-100",
+                                    "Max":  "100",
+                                    "Default":  "0"
+                                },
+                                {
+                                    "Name":  "Softness",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "15"
+                                },
+                                {
+                                    "Name":  "Contrast",
+                                    "Min":  "-100",
+                                    "Max":  "100",
+                                    "Default":  "15"
+                                },
+                                {
+                                    "Name":  "Warmth",
+                                    "Min":  "-100",
+                                    "Max":  "100",
+                                    "Default":  "0"
+                                },
+                                {
+                                    "Name":  "Amount",
+                                    "Min":  "0",
+                                    "Max":  "100",
+                                    "Default":  "0"
+                                }
+                            ],
+    "MIPLGrainNewEffect":  [
+                               {
+                                   "Name":  "Roughness",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "30"
+                               },
+                               {
+                                   "Name":  "Size",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "20"
+                               },
+                               {
+                                   "Name":  "Amount",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               }
+                           ],
+    "MIPLDepthEffect":  [
+                            {
+                                "Name":  "Amount",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "0"
+                            },
+                            {
+                                "Name":  "Smoothness",
+                                "Min":  "-100",
+                                "Max":  "100",
+                                "Default":  "0"
+                            },
+                            {
+                                "Name":  "Brightness",
+                                "Min":  "-100",
+                                "Max":  "100",
+                                "Default":  "0"
+                            },
+                            {
+                                "Name":  "Shadows Repair",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "25"
+                            },
+                            {
+                                "Name":  "Vividness",
+                                "Min":  "-100",
+                                "Max":  "100",
+                                "Default":  "0"
+                            },
+                            {
+                                "Name":  "Warmth",
+                                "Min":  "-100",
+                                "Max":  "100",
+                                "Default":  "0"
+                            }
+                        ],
+    "MIPLVirtualFlashLightEffect":  [
+                                        {
+                                            "Name":  "Amount",
+                                            "Min":  "-100",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Amount Far",
+                                            "Min":  "-100",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Exposure",
+                                            "Min":  "-100",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Contrast",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Shadows",
+                                            "Min":  "-100",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Highlights",
+                                            "Min":  "-100",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Mask Transition",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "15"
+                                        },
+                                        {
+                                            "Name":  "Dehalo",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Persons",
+                                            "Min":  "0",
+                                            "Max":  "30",
+                                            "Default":  "10"
+                                        },
+                                        {
+                                            "Name":  "AlphaMattingType",
+                                            "Min":  "0",
+                                            "Max":  "30",
+                                            "Default":  "20"
+                                        },
+                                        {
+                                            "Name":  "Depth",
+                                            "Min":  "0",
+                                            "Max":  "100",
+                                            "Default":  "50"
+                                        },
+                                        {
+                                            "Name":  "Warmth",
+                                            "Min":  "-50",
+                                            "Max":  "50",
+                                            "Default":  "0"
+                                        },
+                                        {
+                                            "Name":  "Warmth Far Plane",
+                                            "Min":  "-50",
+                                            "Max":  "50",
+                                            "Default":  "0"
+                                        }
+                                    ],
+    "MIPLSkyReplacementEffect":  [
+                                     {
+                                         "Name":  "Texture",
+                                         "Min":  "0",
+                                         "Max":  "129",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Temperature",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Smooth",
+                                         "Min":  "0",
+                                         "Max":  "200",
+                                         "Default":  "100"
+                                     },
+                                     {
+                                         "Name":  "SkyExposure",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "SkyBlur",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "SkyLocal",
+                                         "Min":  "0",
+                                         "Max":  "200",
+                                         "Default":  "25"
+                                     },
+                                     {
+                                         "Name":  "SkyFlip",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "PreserveColor",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "100"
+                                     },
+                                     {
+                                         "Name":  "GlobalEps",
+                                         "Min":  "0",
+                                         "Max":  "200",
+                                         "Default":  "100"
+                                     },
+                                     {
+                                         "Name":  "Horizon",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "White",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "SkyGlobal",
+                                         "Min":  "4",
+                                         "Max":  "100",
+                                         "Default":  "30"
+                                     },
+                                     {
+                                         "Name":  "HorizonSmooth",
+                                         "Min":  "0",
+                                         "Max":  "200",
+                                         "Default":  "50"
+                                     },
+                                     {
+                                         "Name":  "FixGaps",
+                                         "Min":  "2",
+                                         "Max":  "40",
+                                         "Default":  "10"
+                                     },
+                                     {
+                                         "Name":  "AlphaMattingEps",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "20"
+                                     },
+                                     {
+                                         "Name":  "FixClouds",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "20"
+                                     },
+                                     {
+                                         "Name":  "Feathering",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "50"
+                                     },
+                                     {
+                                         "Name":  "Relighting",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "20"
+                                     },
+                                     {
+                                         "Name":  "Amount",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     }
+                                 ],
+    "MIPLWarmSkylight_v1_Effect":  [
+                                       {
+                                           "Name":  "Color correction",
+                                           "Min":  "-100",
+                                           "Max":  "100",
+                                           "Default":  "-40"
+                                       },
+                                       {
+                                           "Name":  "Amount",
+                                           "Min":  "0",
+                                           "Max":  "100",
+                                           "Default":  "0"
+                                       }
+                                   ],
+    "MIPLSkinDefectsEffect":  [
+                                  {
+                                      "Name":  "RemoveDefects",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  }
+                              ],
+    "MIPLHighKeyEffect":  [
+                              {
+                                  "Name":  "Standard High Key",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "50"
+                              },
+                              {
+                                  "Name":  "Saturation",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "50"
+                              },
+                              {
+                                  "Name":  "GlowContrast",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "-60"
+                              },
+                              {
+                                  "Name":  "GlowBlur",
+                                  "Min":  "0",
+                                  "Max":  "300",
+                                  "Default":  "230"
+                              },
+                              {
+                                  "Name":  "Rad",
+                                  "Min":  "0",
+                                  "Max":  "200",
+                                  "Default":  "140"
+                              },
+                              {
+                                  "Name":  "Dynamic High Key",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "25"
+                              },
+                              {
+                                  "Name":  "Contrast",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "30"
+                              },
+                              {
+                                  "Name":  "Glow",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "25"
+                              },
+                              {
+                                  "Name":  "Blacks",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "40"
+                              },
+                              {
+                                  "Name":  "Eps",
+                                  "Min":  "0",
+                                  "Max":  "200",
+                                  "Default":  "138"
+                              },
+                              {
+                                  "Name":  "Amount",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              }
+                          ],
+    "MIPLDenoiseAIRawEffect":  [
+                                   {
+                                       "Name":  "Level",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "Luminosity Denoise",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "Color Denoise",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "Details",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "Sharpness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "30"
+                                   },
+                                   {
+                                       "Name":  "Luminosity",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "PostFilter",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "Color",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   }
+                               ],
+    "MIPLLensCorrectionEffect":  [
+                                     {
+                                         "Name":  "Vignette Midpoint",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Vertical",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Slim Face",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Horizontal",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Fisheye2",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Fisheye1",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Enlarge Eyes",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "ChromaticAberrationR",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "ChromaticAberrationB",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Vignette",
+                                         "Min":  "0",
+                                         "Max":  "200",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Aspect",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "ChromaticAberrationOn",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Shape",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Distortion",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Rotate",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "OffsetY",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "DefringeOn",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Fisheye",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "AutoCameraTransformCorrectionOn",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "OffsetX",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "AutoLensCorrectionOn",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Scale",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Abdomen",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     }
+                                 ],
+    "MIPLNewNeonLightEffect":  [
+                                   {
+                                       "Name":  "Amount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "100"
+                                   },
+                                   {
+                                       "Name":  "Background",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "NeonAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "NeonThickness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "100"
+                                   },
+                                   {
+                                       "Name":  "NeonGlow",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "60"
+                                   },
+                                   {
+                                       "Name":  "NeonIndent",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "15"
+                                   },
+                                   {
+                                       "Name":  "NeonHue",
+                                       "Min":  "0",
+                                       "Max":  "360",
+                                       "Default":  "270"
+                                   },
+                                   {
+                                       "Name":  "NeonWhiteness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "30"
+                                   },
+                                   {
+                                       "Name":  "CloudsAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "60"
+                                   },
+                                   {
+                                       "Name":  "CloudsIndent",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "5"
+                                   },
+                                   {
+                                       "Name":  "NeonOpacity",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonThickness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "100"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonGlow",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "60"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonIndent",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "-10"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonHue",
+                                       "Min":  "0",
+                                       "Max":  "360",
+                                       "Default":  "270"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonWhiteness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "30"
+                                   },
+                                   {
+                                       "Name":  "FreeCloudsAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "60"
+                                   },
+                                   {
+                                       "Name":  "FreeCloudsIndent",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "5"
+                                   },
+                                   {
+                                       "Name":  "FreeNeonOpacity",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "100"
+                                   },
+                                   {
+                                       "Name":  "GlowAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "GlowSize",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "25"
+                                   },
+                                   {
+                                       "Name":  "GlowHue",
+                                       "Min":  "0",
+                                       "Max":  "360",
+                                       "Default":  "56"
+                                   },
+                                   {
+                                       "Name":  "GlowWhiteness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "ObjectAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "ObjectHue",
+                                       "Min":  "0",
+                                       "Max":  "360",
+                                       "Default":  "56"
+                                   },
+                                   {
+                                       "Name":  "ObjectWhiteness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "ObjectExposure",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "ObjectContrast",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "ObjectDnB",
+                                       "Min":  "0",
+                                       "Max":  "200",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "ObjectDnBRadius",
+                                       "Min":  "0",
+                                       "Max":  "200",
+                                       "Default":  "100"
+                                   },
+                                   {
+                                       "Name":  "ObjectDnBContrast",
+                                       "Min":  "0",
+                                       "Max":  "200",
+                                       "Default":  "200"
+                                   },
+                                   {
+                                       "Name":  "StarsAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "StarsOnObjectAmount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "30"
+                                   },
+                                   {
+                                       "Name":  "StarsSoftness",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "StarsHue",
+                                       "Min":  "0",
+                                       "Max":  "360",
+                                       "Default":  "250"
+                                   },
+                                   {
+                                       "Name":  "StarsIndent",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "30"
+                                   }
+                               ],
+    "MIPLBlackWhiteEffect":  [
+                                 {
+                                     "Name":  "Whites",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 },
+                                 {
+                                     "Name":  "Blacks",
+                                     "Min":  "-100",
+                                     "Max":  "100",
+                                     "Default":  "0"
+                                 }
+                             ],
+    "MIPLDeblurAIEffect":  [
+                               {
+                                   "Name":  "DeblurType",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "10"
+                               },
+                               {
+                                   "Name":  "Level",
+                                   "Min":  "0",
+                                   "Max":  "100",
+                                   "Default":  "0"
+                               }
+                           ],
+    "MIPLRemoveColorCastEffect":  [
+                                      {
+                                          "Name":  "Color",
+                                          "Min":  "0",
+                                          "Max":  "360",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "RemovalMethod",
+                                          "Min":  "0",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Amount",
+                                          "Min":  "0",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      }
+                                  ],
+    "MIPLContrastColorRangeEffect":  [
+                                         {
+                                             "Name":  "Hue",
+                                             "Min":  "0",
+                                             "Max":  "360",
+                                             "Default":  "0"
+                                         },
+                                         {
+                                             "Name":  "Contrast",
+                                             "Min":  "-100",
+                                             "Max":  "100",
+                                             "Default":  "0"
+                                         },
+                                         {
+                                             "Name":  "Color Contrast",
+                                             "Min":  "0",
+                                             "Max":  "100",
+                                             "Default":  "0"
+                                         },
+                                         {
+                                             "Name":  "Brightness",
+                                             "Min":  "-100",
+                                             "Max":  "100",
+                                             "Default":  "0"
+                                         }
+                                     ],
+    "MIPLSlimPeople_vn0_Effect":  [
+                                      {
+                                          "Name":  "Shape",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Abdomen",
+                                          "Min":  "0",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      }
+                                  ],
+    "MIPLColorBalanceEffect":  [
+                                   {
+                                       "Name":  "SRed",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "SGreen",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "SBlue",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "MRed",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "HBlue",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "MGreen",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "MBlue",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "HRed",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "HGreen",
+                                       "Min":  "-100",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   }
+                               ],
+    "MIPLBrillianceWarmthEffect":  [
+                                       {
+                                           "Name":  "Warmth",
+                                           "Min":  "-100",
+                                           "Max":  "100",
+                                           "Default":  "0"
+                                       },
+                                       {
+                                           "Name":  "Vividness",
+                                           "Min":  "-100",
+                                           "Max":  "100",
+                                           "Default":  "0"
+                                       }
+                                   ],
+    "MIPLDetailsEffect":  [
+                              {
+                                  "Name":  "Overall_Small_Detail",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              },
+                              {
+                                  "Name":  "Overall_Medium_Detail",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              },
+                              {
+                                  "Name":  "Masking",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "50"
+                              },
+                              {
+                                  "Name":  "Overall_Large_Detail",
+                                  "Min":  "-100",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              },
+                              {
+                                  "Name":  "HighlightsProtection",
+                                  "Min":  "0",
+                                  "Max":  "100",
+                                  "Default":  "0"
+                              }
+                          ],
+    "MIPLSmartContrastEffect":  [
+                                    {
+                                        "Name":  "Shadows",
+                                        "Min":  "0",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    },
+                                    {
+                                        "Name":  "MiddleS",
+                                        "Min":  "-100",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    },
+                                    {
+                                        "Name":  "Midtones",
+                                        "Min":  "0",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    },
+                                    {
+                                        "Name":  "MiddleM",
+                                        "Min":  "-100",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    },
+                                    {
+                                        "Name":  "MiddleH",
+                                        "Min":  "-100",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    },
+                                    {
+                                        "Name":  "Highlights",
+                                        "Min":  "0",
+                                        "Max":  "100",
+                                        "Default":  "0"
+                                    }
+                                ],
+    "MIPLCurveEffect":  [
+                            {
+                                "Name":  "RGB",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "50"
+                            },
+                            {
+                                "Name":  "G",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "50"
+                            },
+                            {
+                                "Name":  "R",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "50"
+                            },
+                            {
+                                "Name":  "B",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "50"
+                            }
+                        ],
+    "MIPLSkyEnhancerEffect":  [
+                                  {
+                                      "Name":  "Amount",
+                                      "Min":  "0",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  }
+                              ],
+    "MIPLDevelopCommonEffectID":  [
+                                      {
+                                          "Name":  "Temperature",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Exposure",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Shadows",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Tint",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Highlights",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Smart Tone",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      },
+                                      {
+                                          "Name":  "Contrast",
+                                          "Min":  "-100",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      }
+                                  ],
+    "MIPLDynamicContrastEffect":  [
+                                      {
+                                          "Name":  "Boost",
+                                          "Min":  "0",
+                                          "Max":  "100",
+                                          "Default":  "0"
+                                      }
+                                  ],
+    "MIPLSharpenEffect":  [
+
+                          ],
+    "MIPLSkinSoftenerNNEffect":  [
+                                     {
+                                         "Name":  "SigmaFine",
+                                         "Min":  "0.1",
+                                         "Max":  "100",
+                                         "Default":  "10"
+                                     },
+                                     {
+                                         "Name":  "Softness",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "60"
+                                     },
+                                     {
+                                         "Name":  "ShineRemoval",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Amount",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     },
+                                     {
+                                         "Name":  "Medium",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "90"
+                                     },
+                                     {
+                                         "Name":  "Noise",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "28"
+                                     },
+                                     {
+                                         "Name":  "SigmaMedium",
+                                         "Min":  "0.1",
+                                         "Max":  "100",
+                                         "Default":  "20"
+                                     },
+                                     {
+                                         "Name":  "Boost",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "90"
+                                     },
+                                     {
+                                         "Name":  "Large",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "30"
+                                     },
+                                     {
+                                         "Name":  "SigmaLarge",
+                                         "Min":  "0.1",
+                                         "Max":  "100",
+                                         "Default":  "100"
+                                     },
+                                     {
+                                         "Name":  "Fine",
+                                         "Min":  "-100",
+                                         "Max":  "100",
+                                         "Default":  "-20"
+                                     },
+                                     {
+                                         "Name":  "Mask",
+                                         "Min":  "0",
+                                         "Max":  "100",
+                                         "Default":  "0"
+                                     }
+                                 ],
+    "MIPLSaturationEffect":  [
+
+                             ],
+    "MIPLSunLightRaysEffect":  [
+                                   {
+                                       "Name":  "X",
+                                       "Min":  "-50",
+                                       "Max":  "150",
+                                       "Default":  "30"
+                                   },
+                                   {
+                                       "Name":  "Y",
+                                       "Min":  "-50",
+                                       "Max":  "150",
+                                       "Default":  "20"
+                                   },
+                                   {
+                                       "Name":  "Rays Length",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "65"
+                                   },
+                                   {
+                                       "Name":  "Rays Number",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   },
+                                   {
+                                       "Name":  "Rays Opacity",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "Rays Warmth",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "40"
+                                   },
+                                   {
+                                       "Name":  "Sun Warmth",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "30"
+                                   },
+                                   {
+                                       "Name":  "Sun Radius",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "40"
+                                   },
+                                   {
+                                       "Name":  "Sun Penetration",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "40"
+                                   },
+                                   {
+                                       "Name":  "Sun Glow Amount",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "60"
+                                   },
+                                   {
+                                       "Name":  "Sun Glow Radius",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "70"
+                                   },
+                                   {
+                                       "Name":  "Randomize",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "0"
+                                   },
+                                   {
+                                       "Name":  "Look",
+                                       "Min":  "0",
+                                       "Max":  "100",
+                                       "Default":  "50"
+                                   }
+                               ],
+    "MIPLAIFogEffect":  [
+                            {
+                                "Name":  "Mode",
+                                "Min":  "0",
+                                "Max":  "40",
+                                "Default":  "0"
+                            },
+                            {
+                                "Name":  "Lightness",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "100"
+                            },
+                            {
+                                "Name":  "Depth",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "20"
+                            },
+                            {
+                                "Name":  "Amount",
+                                "Min":  "0",
+                                "Max":  "100",
+                                "Default":  "0"
+                            }
+                        ],
+    "MIPLSplitWarmthEffect":  [
+                                  {
+                                      "Name":  "Warm Colors",
+                                      "Min":  "-100",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  },
+                                  {
+                                      "Name":  "Cool Colors",
+                                      "Min":  "-100",
+                                      "Max":  "100",
+                                      "Default":  "0"
+                                  }
+                              ]
+}

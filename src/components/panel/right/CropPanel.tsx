@@ -26,7 +26,9 @@ import {
   Ban,
   Save,
   Wand2,
+  Sparkles,
 } from 'lucide-react';
+import { toast } from 'react-toastify';
 import { useTranslation, Trans } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { Adjustments, INITIAL_ADJUSTMENTS } from '../../../utils/adjustments';
@@ -243,6 +245,66 @@ export default function CropPanel() {
     selectedImage?.width && selectedImage?.height
       ? getOrientedDimensions(selectedImage.width, selectedImage.height, orientationSteps)
       : null;
+
+  const [isAnalyzingComposition, setIsAnalyzingComposition] = useState(false);
+
+  const handleCompositionAi = useCallback(async () => {
+    if (!selectedImage?.path) return;
+    setIsAnalyzingComposition(true);
+    try {
+      const [res, detectedAngle] = await Promise.all([
+        invoke<any>('get_saliency_crop_recommendation', {
+          aspectRatio: (aspectRatio !== null && !isNaN(aspectRatio)) ? aspectRatio : 0.0,
+          orientationSteps: orientationSteps ?? 0,
+          flipHorizontal: flipHorizontal ?? false,
+          flipVertical: flipVertical ?? false,
+        }).catch(() => null),
+        invoke<number | null>('calculate_auto_straighten', { jsAdjustments: adjustments }).catch(() => null),
+      ]);
+
+      const hasStraighten = detectedAngle !== null && Number.isFinite(detectedAngle);
+
+      if (res && res.width > 0 && res.height > 0) {
+        const baseW = originalDimensions?.width || selectedImage?.width || 1000;
+        const baseH = originalDimensions?.height || selectedImage?.height || 1000;
+        const newCrop: Crop = {
+          unit: 'px',
+          x: Math.round((res.x * baseW) / 100),
+          y: Math.round((res.y * baseH) / 100),
+          width: Math.round((res.width * baseW) / 100),
+          height: Math.round((res.height * baseH) / 100),
+        };
+        setAdjustments((prev: Adjustments) => ({
+          ...prev,
+          crop: newCrop,
+          ...(hasStraighten ? { rotation: detectedAngle } : {}),
+        }));
+        toast.success(t('editor.crop.smartAutoCropSuccess', 'Smart Auto-Crop & Level applied'));
+      } else if (hasStraighten) {
+        setAdjustments((prev: Adjustments) => ({
+          ...prev,
+          rotation: detectedAngle,
+        }));
+        toast.success(t('editor.crop.smartAutoCropSuccess', 'Smart Auto-Crop & Level applied'));
+      }
+    } catch (err) {
+      toast.error(`Smart Auto-Crop & Level failed: ${err}`);
+    } finally {
+      setIsAnalyzingComposition(false);
+    }
+  }, [
+    selectedImage?.path,
+    aspectRatio,
+    orientationSteps,
+    flipHorizontal,
+    flipVertical,
+    originalDimensions,
+    selectedImage?.width,
+    selectedImage?.height,
+    adjustments,
+    setAdjustments,
+    t,
+  ]);
 
   useEffect(() => {
     invoke('get_lensfun_makers')
@@ -842,6 +904,37 @@ export default function CropPanel() {
       <div className="grow overflow-y-auto p-3 space-y-6 custom-scrollbar">
         {selectedImage ? (
           <>
+            {/* Smart Composition 1-Click Recommendation */}
+            <div className="bg-surface/50 border border-accent/30 rounded-lg p-2.5 flex items-center justify-between shadow-xs">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 rounded-md bg-accent/15 text-accent">
+                  <Wand2 size={16} />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-text-primary">
+                    Smart Auto-Crop & Level
+                  </div>
+                  <div className="text-[10px] text-text-secondary leading-tight">
+                    Smart saliency framing & horizon straighten
+                  </div>
+                </div>
+              </div>
+              <Button
+                variant="primary"
+                size="sm"
+                className="text-xs px-2.5 py-1 flex items-center gap-1.5"
+                disabled={isAnalyzingComposition}
+                onClick={handleCompositionAi}
+              >
+                {isAnalyzingComposition ? (
+                  <Loader size={12} className="animate-spin" />
+                ) : (
+                  <Sparkles size={12} />
+                )}
+                <span>Auto Crop & Level</span>
+              </Button>
+            </div>
+
             <div className="space-y-4">
               <Text variant={TextVariants.heading} className="mb-2 flex items-center justify-between">
                 {t('editor.crop.aspectRatioHeading')}

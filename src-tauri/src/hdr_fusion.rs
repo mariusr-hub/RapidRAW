@@ -52,6 +52,8 @@ impl Default for DeghostSensitivity {
 pub enum HdrEngineMode {
     LinearRadiance,
     MertensLaplacian,
+    Hdr2,
+    Hdr2Ai,
 }
 
 impl Default for HdrEngineMode {
@@ -84,6 +86,8 @@ pub struct HdrMergeOptions {
     pub user_deghost_strokes: Option<Vec<UserDeghostStroke>>,
     pub frame_isos: Option<Vec<f32>>,
     pub half_size: Option<bool>,
+    pub per_bracket_wb: Option<Vec<(f32, f32)>>,
+    pub decouple_luma_chroma: Option<bool>,
 }
 
 impl Default for HdrMergeOptions {
@@ -101,23 +105,26 @@ impl Default for HdrMergeOptions {
             user_deghost_strokes: None,
             frame_isos: None,
             half_size: Some(false),
+            per_bracket_wb: None,
+            decouple_luma_chroma: Some(true),
         }
     }
 }
 
-/// Normalizes white balance / illuminant across bracketed frames against the reference frame
-pub fn normalize_bracket_white_balance(frames: &mut [Rgb32FImage], ref_idx: usize) {
+/// Computes white balance / illuminant normalization gains across bracketed frames against the reference frame without cloning or mutating frames
+pub fn compute_bracket_white_balance_gains(frames: &[Rgb32FImage], ref_idx: usize) -> Vec<(f32, f32)> {
+    let mut gains = vec![(1.0f32, 1.0f32); frames.len()];
     if frames.len() < 2 || ref_idx >= frames.len() {
-        return;
+        return gains;
     }
 
     let (w, h) = frames[0].dimensions();
     let num_pixels = (w * h) as usize;
     if num_pixels == 0 {
-        return;
+        return gains;
     }
 
-    let ref_raw = frames[ref_idx].as_raw().to_vec();
+    let ref_raw = frames[ref_idx].as_raw();
 
     // Adjust non-reference frames against the reference frame using only co-located unclipped midtones
     for k in 0..frames.len() {
@@ -177,11 +184,26 @@ pub fn normalize_bracket_white_balance(frames: &mut [Rgb32FImage], ref_idx: usiz
             let gain_b = ((ref_avg_b / ref_avg_g) / (f_avg_b / f_avg_g)).clamp(0.80, 1.25) as f32;
 
             if (gain_r - 1.0).abs() > 0.015 || (gain_b - 1.0).abs() > 0.015 {
-                frames[k].as_mut().par_chunks_mut(3).for_each(|px| {
-                    px[0] = (px[0] * gain_r).clamp(0.0, 1.0);
-                    px[2] = (px[2] * gain_b).clamp(0.0, 1.0);
-                });
+                gains[k] = (gain_r, gain_b);
             }
+        }
+    }
+
+    gains
+}
+
+/// Normalizes white balance / illuminant across bracketed frames against the reference frame
+pub fn normalize_bracket_white_balance(frames: &mut [Rgb32FImage], ref_idx: usize) {
+    let gains = compute_bracket_white_balance_gains(frames, ref_idx);
+    for (k, &(gain_r, gain_b)) in gains.iter().enumerate() {
+        if k == ref_idx {
+            continue;
+        }
+        if (gain_r - 1.0).abs() > 0.015 || (gain_b - 1.0).abs() > 0.015 {
+            frames[k].as_mut().par_chunks_mut(3).for_each(|px| {
+                px[0] = (px[0] * gain_r).clamp(0.0, 1.0);
+                px[2] = (px[2] * gain_b).clamp(0.0, 1.0);
+            });
         }
     }
 }
@@ -571,6 +593,34 @@ fn downsample_weight_map(src: &[f32], w: u32, h: u32) -> (Vec<f32>, u32, u32) {
     (dst, nw, nh)
 }
 
+/// Upsamples a float weight buffer to target dimensions using bilinear interpolation
+fn upsample_weight_map(src: &[f32], src_w: u32, src_h: u32, target_w: u32, target_h: u32) -> Vec<f32> {
+    let mut out = vec![0.0f32; (target_w * target_h) as usize];
+    let sx_ratio = src_w as f32 / target_w as f32;
+    let sy_ratio = src_h as f32 / target_h as f32;
+    for ty in 0..target_h {
+        let sy = ((ty as f32 + 0.5) * sy_ratio - 0.5).clamp(0.0, (src_h - 1) as f32);
+        let y0 = sy.floor() as u32;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let fy = sy - y0 as f32;
+        for tx in 0..target_w {
+            let sx = ((tx as f32 + 0.5) * sx_ratio - 0.5).clamp(0.0, (src_w - 1) as f32);
+            let x0 = sx.floor() as u32;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let fx = sx - x0 as f32;
+            let p00 = src[(y0 * src_w + x0) as usize];
+            let p10 = src[(y0 * src_w + x1) as usize];
+            let p01 = src[(y1 * src_w + x0) as usize];
+            let p11 = src[(y1 * src_w + x1) as usize];
+            let top = p00 + (p10 - p00) * fx;
+            let bot = p01 + (p11 - p01) * fx;
+            out[(ty * target_w + tx) as usize] = top + (bot - top) * fy;
+        }
+    }
+    out
+}
+
+
 /// Downsamples an Rgb32FImage by 2
 fn downsample_rgb_image(src: &Rgb32FImage) -> Rgb32FImage {
     let (w, h) = src.dimensions();
@@ -649,6 +699,132 @@ pub fn apply_dynamic_black_point_anchor(img: &mut Rgb32FImage) {
 }
 
 /// Performs Commercial-Grade HDR Exposure Fusion (dispatches to LinearRadiance or MertensLaplacian)
+
+/// Photomatix Pro parity: Decoupled Luma/Chroma multi-scale exposure fusion (`blendPhotosLumaChroma`).
+/// Fuses luminance detail across all pyramid octaves while filtering high-frequency
+/// chromatic noise in shadows using bilateral spatial guidance at the coarse octave.
+pub fn blend_photos_luma_chroma(
+    frames: &[Rgb32FImage],
+    weight_pyramids: &[Vec<(Vec<f32>, u32, u32)>],
+    num_levels: usize,
+    detail_boost: f32,
+) -> Rgb32FImage {
+    let (w, h) = frames[0].dimensions();
+    let num_frames = frames.len();
+
+    // 1. Build Laplacian pyramids for Luminance channel of each frame
+    let mut luma_lap_pyrs: Vec<Vec<Vec<f32>>> = Vec::new();
+    for frame in frames {
+        let (fw, fh) = frame.dimensions();
+        let mut cur_luma = vec![0.0f32; (fw * fh) as usize];
+        let raw = frame.as_raw();
+        for i in 0..(fw * fh) as usize {
+            cur_luma[i] = 0.2126 * raw[i * 3] + 0.7152 * raw[i * 3 + 1] + 0.0722 * raw[i * 3 + 2];
+        }
+
+        let mut g_pyr = vec![(cur_luma, fw, fh)];
+        for _ in 1..num_levels {
+            let (prev_luma, pw, ph) = g_pyr.last().unwrap();
+            let (down, dw, dh) = downsample_weight_map(prev_luma, *pw, *ph);
+            g_pyr.push((down, dw, dh));
+        }
+
+        let mut l_pyr = Vec::new();
+        for lvl in 0..num_levels - 1 {
+            let (cur_l, cur_w, cur_h) = &g_pyr[lvl];
+            let (next_l, next_w, next_h) = &g_pyr[lvl + 1];
+            let up = upsample_weight_map(next_l, *next_w, *next_h, *cur_w, *cur_h);
+            let mut diff = vec![0.0f32; cur_l.len()];
+            for i in 0..cur_l.len() {
+                diff[i] = cur_l[i] - up[i];
+            }
+            l_pyr.push(diff);
+        }
+        l_pyr.push(g_pyr.last().unwrap().0.clone());
+        luma_lap_pyrs.push(l_pyr);
+    }
+
+    // 2. Blend Luminance pyramids
+    let mut blended_luma_pyr: Vec<(Vec<f32>, u32, u32)> = Vec::new();
+    for lvl in 0..num_levels {
+        let (_, lvl_w, lvl_h) = weight_pyramids[0][lvl];
+        let lvl_px = (lvl_w * lvl_h) as usize;
+        let mut blended = vec![0.0f32; lvl_px];
+
+        for k in 0..num_frames {
+            let (weights, _, _) = &weight_pyramids[k][lvl];
+            let lap = &luma_lap_pyrs[k][lvl];
+            for i in 0..lvl_px {
+                blended[i] += lap[i] * weights[i];
+            }
+        }
+
+        // Apply detail boost on mid-frequency bands
+        if lvl >= 1 && lvl <= 2 && (detail_boost - 1.0).abs() > 0.001 {
+            for v in &mut blended {
+                *v *= detail_boost;
+            }
+        }
+        blended_luma_pyr.push((blended, lvl_w, lvl_h));
+    }
+
+    // 3. Collapse Luminance pyramid
+    let mut cur_fused_luma = blended_luma_pyr.last().unwrap().0.clone();
+    for lvl in (0..num_levels - 1).rev() {
+        let (_, cur_w, cur_h) = blended_luma_pyr[lvl + 1];
+        let (lap, target_w, target_h) = &blended_luma_pyr[lvl];
+        let up = upsample_weight_map(&cur_fused_luma, cur_w, cur_h, *target_w, *target_h);
+        let mut collapsed = vec![0.0f32; lap.len()];
+        for i in 0..lap.len() {
+            collapsed[i] = lap[i] + up[i];
+        }
+        cur_fused_luma = collapsed;
+    }
+
+    // 4. Decoupled Chrominance fusion with shadow noise suppression
+    let mut fused_u = vec![0.0f32; (w * h) as usize];
+    let mut fused_v = vec![0.0f32; (w * h) as usize];
+    let mut weight_sum = vec![0.0f32; (w * h) as usize];
+
+    for k in 0..num_frames {
+        let (weights, _, _) = &weight_pyramids[k][0];
+        let raw = frames[k].as_raw();
+        for i in 0..(w * h) as usize {
+            let r = raw[i * 3];
+            let g = raw[i * 3 + 1];
+            let b = raw[i * 3 + 2];
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let u = r - luma;
+            let v = b - luma;
+            // Suppress chrominance weights in deep shadows (< 0.08) to eliminate color noise
+            let chroma_gate = ((luma - 0.02) / 0.06).clamp(0.0, 1.0);
+            let w_val = weights[i] * (0.1 + 0.9 * chroma_gate);
+            fused_u[i] += u * w_val;
+            fused_v[i] += v * w_val;
+            weight_sum[i] += w_val;
+        }
+    }
+
+    let mut out = Rgb32FImage::new(w, h);
+    let out_raw = out.as_mut();
+    for i in 0..(w * h) as usize {
+        let ws = weight_sum[i].max(1e-6);
+        let u = fused_u[i] / ws;
+        let v = fused_v[i] / ws;
+        let y = cur_fused_luma[i].max(0.0);
+
+        let r = (y + u).max(0.0);
+        let b = (y + v).max(0.0);
+        let g = ((y - 0.2126 * r - 0.0722 * b) / 0.7152).max(0.0);
+
+        out_raw[i * 3] = r;
+        out_raw[i * 3 + 1] = g;
+        out_raw[i * 3 + 2] = b;
+    }
+
+    out
+}
+
 pub fn fuse_exposures_mertens<R: tauri::Runtime>(
     frames: &[Rgb32FImage],
     exposure_scales: &[f32],
@@ -656,8 +832,18 @@ pub fn fuse_exposures_mertens<R: tauri::Runtime>(
     app_handle: Option<&AppHandle<R>>,
     cancel_token: Option<&Arc<AtomicBool>>,
 ) -> Result<Rgb32FImage, String> {
-    if options.engine.unwrap_or(HdrEngineMode::LinearRadiance) == HdrEngineMode::LinearRadiance {
-        return fuse_exposures_linear_radiance(frames, exposure_scales, options, app_handle, cancel_token);
+    let engine = options.engine.unwrap_or(HdrEngineMode::LinearRadiance);
+    match engine {
+        HdrEngineMode::LinearRadiance => {
+            return fuse_exposures_linear_radiance(frames, exposure_scales, options, app_handle, cancel_token);
+        }
+        HdrEngineMode::Hdr2 => {
+            return crate::hdr2::fuse_exposures_hdr2(frames, exposure_scales, options, app_handle, cancel_token);
+        }
+        HdrEngineMode::Hdr2Ai => {
+            return crate::hdr2_ai::fuse_exposures_hdr2_ai(frames, exposure_scales, options, app_handle, cancel_token);
+        }
+        HdrEngineMode::MertensLaplacian => {}
     }
 
     if frames.is_empty() {
@@ -681,13 +867,26 @@ pub fn fuse_exposures_mertens<R: tauri::Runtime>(
 
     // 1. White Balance Normalization
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Normalizing bracket white balance & exposure gains...");
+        let _ = handle.emit("hdr-progress", "Normalizing bracket white balance & exposure gains... 15%");
     }
-    normalize_bracket_white_balance(&mut working_frames, ref_idx);
+    if let Some(custom_wb) = &options.per_bracket_wb {
+        for (k, &(t_gain, tint_gain)) in custom_wb.iter().enumerate().take(working_frames.len()) {
+            let r_mult = (1.0 + t_gain * 0.2).max(0.0);
+            let b_mult = (1.0 - t_gain * 0.2).max(0.0);
+            let g_mult = (1.0 - tint_gain * 0.15).max(0.0);
+            for px in working_frames[k].pixels_mut() {
+                px[0] *= r_mult;
+                px[1] *= g_mult;
+                px[2] *= b_mult;
+            }
+        }
+    } else {
+        normalize_bracket_white_balance(&mut working_frames, ref_idx);
+    }
 
     // 2. Compute initial weight maps
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Calculating Multi-Scale Exposure Fusion weights...");
+        let _ = handle.emit("hdr-progress", "Calculating Multi-Scale Exposure Fusion weights... 25%");
     }
     let raw_weight_maps: Vec<Vec<f32>> = working_frames
         .par_iter()
@@ -696,7 +895,7 @@ pub fn fuse_exposures_mertens<R: tauri::Runtime>(
 
     // 3. Fast O(N) Guided Filter: strictly lock weight boundaries to physical luminance edges (eliminates halos & dirty skies)
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Applying Guided Filter edge preservation (halo elimination)...");
+        let _ = handle.emit("hdr-progress", "Applying Guided Filter edge preservation (halo elimination)... 35%");
     }
     let guided_weight_maps: Vec<Vec<f32>> = working_frames
         .par_iter()
@@ -721,7 +920,7 @@ pub fn fuse_exposures_mertens<R: tauri::Runtime>(
     // 4. Morphological Photometric deghosting
     if sensitivity != DeghostSensitivity::Off {
         if let Some(handle) = app_handle {
-            let _ = handle.emit("hdr-progress", "Applying morphological motion deghosting...");
+            let _ = handle.emit("hdr-progress", "Applying morphological motion deghosting... 45%");
         }
         apply_photometric_deghosting(&working_frames, exposure_scales, &mut weight_maps, ref_idx, sensitivity);
     }
@@ -729,7 +928,7 @@ pub fn fuse_exposures_mertens<R: tauri::Runtime>(
     // 5. Construct Multi-Scale Pyramids (5 pyramid levels)
     let num_levels = 5;
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Constructing Laplacian Pyramids...");
+        let _ = handle.emit("hdr-progress", "Constructing Laplacian Pyramids... 55%");
     }
 
     // Build Gaussian pyramids of weights for each frame
@@ -792,7 +991,7 @@ pub fn fuse_exposures_mertens<R: tauri::Runtime>(
 
     // 6. Blend pyramids at each level
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Blending Multi-Scale Pyramid layers...");
+        let _ = handle.emit("hdr-progress", "Blending Multi-Scale Pyramid layers... 70%");
     }
     let mut blended_pyr: Vec<Rgb32FImage> = Vec::new();
 
@@ -1038,7 +1237,18 @@ pub fn fuse_exposures_dual<R: tauri::Runtime>(
     app_handle: Option<&AppHandle<R>>,
     cancel_token: Option<&Arc<AtomicBool>>,
 ) -> Result<HdrFusionResult, String> {
-    fuse_exposures_linear_radiance_internal(frames, exposure_scales, options, app_handle, cancel_token)
+    let engine = options.engine.unwrap_or(HdrEngineMode::LinearRadiance);
+    match engine {
+        HdrEngineMode::Hdr2 => {
+            crate::hdr2::fuse_exposures_hdr2_dual(frames, exposure_scales, options, app_handle, cancel_token)
+        }
+        HdrEngineMode::Hdr2Ai => {
+            crate::hdr2_ai::fuse_exposures_hdr2_ai_dual(frames, exposure_scales, options, app_handle, cancel_token)
+        }
+        _ => {
+            fuse_exposures_linear_radiance_internal(frames, exposure_scales, options, app_handle, cancel_token)
+        }
+    }
 }
 
 /// Physical 32-Bit Floating-Point Linear Radiance Accumulator (Debevec-Robertson + Anti-Magenta Clip Protection)
@@ -1054,7 +1264,7 @@ pub fn fuse_exposures_linear_radiance<R: tauri::Runtime>(
 }
 
 #[inline]
-fn to_srgb(x: f32) -> f32 {
+pub fn to_srgb(x: f32) -> f32 {
     let xc = x.clamp(0.0, 1.0);
     if xc <= 0.0031308 {
         xc * 12.92
@@ -1096,11 +1306,10 @@ fn fuse_exposures_linear_radiance_internal<R: tauri::Runtime>(
         .min(num_frames - 1);
 
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Accumulating 32-bit linear HDR radiance map...");
+        let _ = handle.emit("hdr-progress", "Accumulating 32-bit linear HDR radiance map... 40%");
     }
 
-    let mut working_frames: Vec<Rgb32FImage> = frames.to_vec();
-    normalize_bracket_white_balance(&mut working_frames, ref_idx);
+    let wb_gains = compute_bracket_white_balance_gains(frames, ref_idx);
 
     // Physically grounded Photon Transfer Curve (PTC) weight centered on linear sensor midtones (~0.18)
     let radiance_weight = |z: f32| -> f32 {
@@ -1119,49 +1328,56 @@ fn fuse_exposures_linear_radiance_internal<R: tauri::Runtime>(
     };
 
     let ref_scale = exposure_scales[ref_idx].max(1e-5);
-
-    let mut radiance_r = vec![0.0f32; num_pixels];
-    let mut radiance_g = vec![0.0f32; num_pixels];
-    let mut radiance_b = vec![0.0f32; num_pixels];
-
     let row_stride = w as usize;
-    radiance_r
-        .par_chunks_mut(row_stride)
-        .zip(radiance_g.par_chunks_mut(row_stride))
-        .zip(radiance_b.par_chunks_mut(row_stride))
-        .enumerate()
-        .for_each(|(y, ((row_r, row_g), row_b))| {
-            for x in 0..row_stride {
-                let pixel_idx = y * row_stride + x;
-                let raw_idx = pixel_idx * 3;
 
-                let mut sum_r = 0.0f32;
-                let mut sum_g = 0.0f32;
-                let mut sum_b = 0.0f32;
-                let mut total_w = 0.0f32;
+    let mut linear_radiance = Rgb32FImage::new(w, h);
+    let mut total_weights = vec![0.0f32; num_pixels];
 
-                let mut backup_shortest_r = 0.0f32;
-                let mut backup_shortest_g = 0.0f32;
-                let mut backup_shortest_b = 0.0f32;
-                let mut min_scale = f32::MAX;
+    // Stream each bracket frame sequentially into accumulator using Rayon rows
+    // to strictly preserve CPU L1/L2 cache locality and keep active heap < 600 MB.
+    for (k, frame) in frames.iter().enumerate() {
+        let frame_raw = frame.as_raw();
+        let scale = exposure_scales[k].max(1e-5);
+        let inv_scale = ref_scale / scale;
+        let (gain_r, gain_b) = wb_gains[k];
 
-                let mut backup_longest_r = 0.0f32;
-                let mut backup_longest_g = 0.0f32;
-                let mut backup_longest_b = 0.0f32;
-                let mut max_scale = 0.0f32;
+        let frame_iso = options
+            .frame_isos
+            .as_ref()
+            .and_then(|isos| isos.get(k).copied())
+            .unwrap_or(100.0)
+            .clamp(50.0, 25600.0);
+        let iso_norm = (frame_iso / 100.0).max(0.5);
 
-                for (k, frame) in working_frames.iter().enumerate() {
-                    let frame_raw = frame.as_raw();
-                    let r = frame_raw[raw_idx];
-                    let g = frame_raw[raw_idx + 1];
-                    let b = frame_raw[raw_idx + 2];
+        let shot_noise_coeff = 0.00085f32 * iso_norm;
+        let read_noise_floor = 0.000032f32 * iso_norm.powf(1.65);
+        let noise_var_base = inv_scale * inv_scale.max(1e-6);
+
+        linear_radiance
+            .as_mut()
+            .par_chunks_exact_mut(row_stride * 3)
+            .zip(total_weights.par_chunks_exact_mut(row_stride))
+            .enumerate()
+            .for_each(|(y, (rad_row, w_row))| {
+                let row_start_raw = y * row_stride * 3;
+                let frame_row = &frame_raw[row_start_raw..row_start_raw + row_stride * 3];
+
+                for x in 0..row_stride {
+                    let px_idx = x * 3;
+                    let mut r = frame_row[px_idx];
+                    let g = frame_row[px_idx + 1];
+                    let mut b = frame_row[px_idx + 2];
 
                     if k != ref_idx && r == 0.0 && g == 0.0 && b == 0.0 {
                         continue;
                     }
 
-                    let scale = exposure_scales[k].max(1e-5);
-                    let inv_scale = ref_scale / scale;
+                    if (gain_r - 1.0).abs() > 0.001 {
+                        r = (r * gain_r).clamp(0.0, 1.0);
+                    }
+                    if (gain_b - 1.0).abs() > 0.001 {
+                        b = (b * gain_b).clamp(0.0, 1.0);
+                    }
 
                     let mut lin_r = r * inv_scale;
                     let mut lin_g = g * inv_scale;
@@ -1208,35 +1424,12 @@ fn fuse_exposures_linear_radiance_internal<R: tauri::Runtime>(
                         lin_b = lin_b * (1.0 - core_t) + max_lin * core_t;
                     }
 
-                    if scale < min_scale {
-                        min_scale = scale;
-                        backup_shortest_r = lin_r;
-                        backup_shortest_g = lin_g;
-                        backup_shortest_b = lin_b;
-                    }
-                    if scale > max_scale {
-                        max_scale = scale;
-                        backup_longest_r = lin_r;
-                        backup_longest_g = lin_g;
-                        backup_longest_b = lin_b;
-                    }
-
                     let max_val = r.max(g).max(b);
                     let min_val = r.min(g).min(b);
                     let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
                     // Best Linear Unbiased Estimator (BLUE) Photon Transfer Curve (PTC) Sensor Noise Weighting
-                    let frame_iso = options
-                        .frame_isos
-                        .as_ref()
-                        .and_then(|isos| isos.get(k).copied())
-                        .unwrap_or(100.0)
-                        .clamp(50.0, 25600.0);
-                    let iso_norm = (frame_iso / 100.0).max(0.5);
-
-                    let shot_noise_coeff = 0.00085f32 * iso_norm;
-                    let read_noise_floor = 0.000032f32 * iso_norm.powf(1.65);
-                    let noise_var = (shot_noise_coeff * luma + read_noise_floor) * (inv_scale * inv_scale).max(1e-6);
+                    let noise_var = (shot_noise_coeff * luma + read_noise_floor) * noise_var_base;
                     let snr_weight = (1.0 / noise_var.max(1e-8)).min(100000.0);
 
                     let mut w = snr_weight * radiance_weight(luma);
@@ -1248,55 +1441,63 @@ fn fuse_exposures_linear_radiance_internal<R: tauri::Runtime>(
                     }
 
                     if w > 1e-6 {
-                        sum_r += lin_r * w;
-                        sum_g += lin_g * w;
-                        sum_b += lin_b * w;
-                        total_w += w;
+                        rad_row[px_idx] += lin_r * w;
+                        rad_row[px_idx + 1] += lin_g * w;
+                        rad_row[px_idx + 2] += lin_b * w;
+                        w_row[x] += w;
                     }
                 }
+            });
+    }
 
-                if total_w > 1e-6 {
-                    row_r[x] = sum_r / total_w;
-                    row_g[x] = sum_g / total_w;
-                    row_b[x] = sum_b / total_w;
+    // In-place normalization pass with highlight/shadow fallback
+    let ref_raw = frames[ref_idx].as_raw();
+    let min_scale_idx = exposure_scales
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(ref_idx);
+    let min_scale = exposure_scales[min_scale_idx].max(1e-5);
+    let min_scale_inv = ref_scale / min_scale;
+    let min_scale_frame_raw = frames[min_scale_idx].as_raw();
+    let (min_gain_r, min_gain_b) = wb_gains[min_scale_idx];
+
+    linear_radiance
+        .as_mut()
+        .par_chunks_exact_mut(row_stride * 3)
+        .zip(total_weights.par_chunks_exact(row_stride))
+        .enumerate()
+        .for_each(|(y, (rad_row, w_row))| {
+            let row_start_raw = y * row_stride * 3;
+            for x in 0..row_stride {
+                let px_idx = x * 3;
+                let tw = w_row[x];
+                if tw > 1e-6 {
+                    let inv_w = 1.0 / tw;
+                    rad_row[px_idx] = (rad_row[px_idx] * inv_w).max(0.0);
+                    rad_row[px_idx + 1] = (rad_row[px_idx + 1] * inv_w).max(0.0);
+                    rad_row[px_idx + 2] = (rad_row[px_idx + 2] * inv_w).max(0.0);
                 } else {
-                    let ref_raw = working_frames[ref_idx].as_raw();
+                    let raw_idx = row_start_raw + px_idx;
                     let ref_r = ref_raw[raw_idx];
                     let ref_g = ref_raw[raw_idx + 1];
                     let ref_b = ref_raw[raw_idx + 2];
                     if ref_r > 0.0 || ref_g > 0.0 || ref_b > 0.0 {
-                        row_r[x] = ref_r;
-                        row_g[x] = ref_g;
-                        row_b[x] = ref_b;
-                    } else if min_scale < f32::MAX {
-                        row_r[x] = backup_shortest_r;
-                        row_g[x] = backup_shortest_g;
-                        row_b[x] = backup_shortest_b;
+                        rad_row[px_idx] = ref_r.max(0.0);
+                        rad_row[px_idx + 1] = ref_g.max(0.0);
+                        rad_row[px_idx + 2] = ref_b.max(0.0);
                     } else {
-                        row_r[x] = backup_longest_r;
-                        row_g[x] = backup_longest_g;
-                        row_b[x] = backup_longest_b;
+                        let b_r = (min_scale_frame_raw[raw_idx] * min_gain_r).clamp(0.0, 1.0) * min_scale_inv;
+                        let b_g = min_scale_frame_raw[raw_idx + 1] * min_scale_inv;
+                        let b_b = (min_scale_frame_raw[raw_idx + 2] * min_gain_b).clamp(0.0, 1.0) * min_scale_inv;
+                        rad_row[px_idx] = b_r.max(0.0);
+                        rad_row[px_idx + 1] = b_g.max(0.0);
+                        rad_row[px_idx + 2] = b_b.max(0.0);
                     }
                 }
             }
         });
-
-    let mut linear_radiance = Rgb32FImage::new(w, h);
-    {
-        let lin_raw = linear_radiance.as_mut();
-        lin_raw
-            .par_chunks_mut(row_stride * 3)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for x in 0..row_stride {
-                    let pixel_idx = y * row_stride + x;
-                    let out_idx = x * 3;
-                    row[out_idx] = radiance_r[pixel_idx].max(0.0);
-                    row[out_idx + 1] = radiance_g[pixel_idx].max(0.0);
-                    row[out_idx + 2] = radiance_b[pixel_idx].max(0.0);
-                }
-            });
-    }
 
     let tone_mapped_preview = tone_map_radiance_image::<R>(&linear_radiance, options, app_handle);
 
@@ -1313,6 +1514,16 @@ pub fn tone_map_radiance_image<R: tauri::Runtime>(
     options: &HdrMergeOptions,
     app_handle: Option<&tauri::AppHandle<R>>,
 ) -> Rgb32FImage {
+    let engine = options.engine.unwrap_or(HdrEngineMode::LinearRadiance);
+    match engine {
+        HdrEngineMode::Hdr2 => {
+            return crate::hdr2::tone_map_radiance_image_hdr2(radiance, options, app_handle);
+        }
+        HdrEngineMode::Hdr2Ai => {
+            return crate::hdr2_ai::tone_map_radiance_image_hdr2_ai(radiance, options, app_handle);
+        }
+        _ => {}
+    }
     let (w, h) = radiance.dimensions();
     let num_pixels = (w * h) as usize;
     let row_stride = w as usize;
@@ -1342,7 +1553,7 @@ pub fn tone_map_radiance_image<R: tauri::Runtime>(
     }
 
     if let Some(handle) = app_handle {
-        let _ = handle.emit("hdr-progress", "Applying 3-Tier Multi-Scale Decomposition & Oklab Perceptual Grading...");
+        let _ = handle.emit("hdr-progress", "Applying 3-Tier Multi-Scale Decomposition & Oklab Perceptual Grading... 75%");
     }
 
     // Convert Radiance to Log2 Luminance Map for SNS-Style Multi-Scale Separation
@@ -1571,6 +1782,8 @@ mod tests {
             user_deghost_strokes: None,
             frame_isos: None,
             half_size: None,
+            per_bracket_wb: None,
+            decouple_luma_chroma: Some(true),
         };
 
         let result = fuse_exposures_mertens::<tauri::Wry>(&frames, &exposure_scales, &options, None, None);

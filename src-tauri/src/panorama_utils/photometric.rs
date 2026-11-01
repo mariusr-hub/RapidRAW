@@ -905,6 +905,146 @@ fn align_seam_ribbon_deparallax(
         });
 }
 
+/// Defense 11: Detects rigid architectural structures to prevent optical-flow shearing
+pub fn detect_structural_architecture(
+    roi: &Rgb32FImage,
+    in_a: &[bool],
+    in_b: &[bool],
+) -> bool {
+    let (rw, rh) = (roi.width() as usize, roi.height() as usize);
+    if rw < 32 || rh < 32 {
+        return false;
+    }
+
+    let mut strong_edges = 0u32;
+    let mut rectilinear_edges = 0u32;
+
+    for y in (1..rh - 1).step_by(2) {
+        for x in (1..rw - 1).step_by(2) {
+            let idx = y * rw + x;
+            if !in_a[idx] || !in_b[idx] {
+                continue;
+            }
+
+            let pl = roi.get_pixel((x - 1) as u32, y as u32);
+            let pr = roi.get_pixel((x + 1) as u32, y as u32);
+            let pt = roi.get_pixel(x as u32, (y - 1) as u32);
+            let pb = roi.get_pixel(x as u32, (y + 1) as u32);
+
+            let y_l = 0.2126 * pl[0] + 0.7152 * pl[1] + 0.0722 * pl[2];
+            let y_r = 0.2126 * pr[0] + 0.7152 * pr[1] + 0.0722 * pr[2];
+            let y_t = 0.2126 * pt[0] + 0.7152 * pt[1] + 0.0722 * pt[2];
+            let y_b = 0.2126 * pb[0] + 0.7152 * pb[1] + 0.0722 * pb[2];
+
+            let gx = (y_r - y_l).abs();
+            let gy = (y_b - y_t).abs();
+            let grad_mag = (gx * gx + gy * gy).sqrt();
+
+            if grad_mag > 0.08 {
+                strong_edges += 1;
+                if gx > 2.2 * gy || gy > 2.2 * gx {
+                    rectilinear_edges += 1;
+                }
+            }
+        }
+    }
+
+    if strong_edges >= 150 {
+        let ratio = rectilinear_edges as f32 / strong_edges as f32;
+        ratio >= 0.58
+    } else {
+        false
+    }
+}
+
+/// Analytical 4-corner polygon bounding box calculation for overlapping regions between two camera poses.
+pub fn compute_analytical_overlap_bbox(
+    pose_a: &crate::panorama_utils::camera_model::CameraPose,
+    w_a: u32,
+    h_a: u32,
+    pose_b: &crate::panorama_utils::camera_model::CameraPose,
+    w_b: u32,
+    h_b: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let r_b = pose_b.rotation_matrix();
+    let r_inv_a = pose_a.rotation_matrix().transpose();
+    let r_a = pose_a.rotation_matrix();
+    let r_inv_b = pose_b.rotation_matrix().transpose();
+
+    let sample_points_b = [
+        (0.0, 0.0),
+        (w_b as f64 * 0.5, 0.0),
+        (w_b as f64, 0.0),
+        (w_b as f64, h_b as f64 * 0.5),
+        (w_b as f64, h_b as f64),
+        (w_b as f64 * 0.5, h_b as f64),
+        (0.0, h_b as f64),
+        (0.0, h_b as f64 * 0.5),
+    ];
+
+    let sample_points_a = [
+        (0.0, 0.0),
+        (w_a as f64 * 0.5, 0.0),
+        (w_a as f64, 0.0),
+        (w_a as f64, h_a as f64 * 0.5),
+        (w_a as f64, h_a as f64),
+        (w_a as f64 * 0.5, h_a as f64),
+        (0.0, h_a as f64),
+        (0.0, h_a as f64 * 0.5),
+    ];
+
+    let mut min_x = canvas_w as f64;
+    let mut max_x = 0.0f64;
+    let mut min_y = canvas_h as f64;
+    let mut max_y = 0.0f64;
+    let mut valid_count = 0;
+
+    for (u, v) in sample_points_b {
+        let ray_b = pose_b.unproject_point(u, v);
+        let world_ray = r_b * ray_b;
+        if let Some((cx, cy)) = pose_a.project_ray_unbounded(&world_ray, &r_inv_a) {
+            if cx >= 0.0 && cx <= w_a as f64 && cy >= 0.0 && cy <= h_a as f64 {
+                let canvas_x = (cx / w_a as f64) * canvas_w as f64;
+                let canvas_y = (cy / h_a as f64) * canvas_h as f64;
+                min_x = min_x.min(canvas_x);
+                max_x = max_x.max(canvas_x);
+                min_y = min_y.min(canvas_y);
+                max_y = max_y.max(canvas_y);
+                valid_count += 1;
+            }
+        }
+    }
+
+    for (u, v) in sample_points_a {
+        let ray_a = pose_a.unproject_point(u, v);
+        let world_ray = r_a * ray_a;
+        if let Some((bx, by)) = pose_b.project_ray_unbounded(&world_ray, &r_inv_b) {
+            if bx >= 0.0 && bx <= w_b as f64 && by >= 0.0 && by <= h_b as f64 {
+                let canvas_x = (u / w_a as f64) * canvas_w as f64;
+                let canvas_y = (v / h_a as f64) * canvas_h as f64;
+                min_x = min_x.min(canvas_x);
+                max_x = max_x.max(canvas_x);
+                min_y = min_y.min(canvas_y);
+                max_y = max_y.max(canvas_y);
+                valid_count += 1;
+            }
+        }
+    }
+
+    if valid_count == 0 || min_x >= max_x || min_y >= max_y {
+        None
+    } else {
+        Some((
+            (min_x.floor() as u32).min(canvas_w - 1),
+            (max_x.ceil() as u32).min(canvas_w - 1),
+            (min_y.floor() as u32).min(canvas_h - 1),
+            (max_y.ceil() as u32).min(canvas_h - 1),
+        ))
+    }
+}
+
 /// Seamlessly blends img_b into canvas_a strictly within the overlapping Region of Interest (ROI).
 /// Non-overlapping regions from img_b are directly copied into canvas_a.
 pub fn multiband_laplacian_blend_roi(
@@ -912,31 +1052,52 @@ pub fn multiband_laplacian_blend_roi(
     mask_a: &mut GrayImage,
     img_b: &Rgb32FImage,
     mask_b: &GrayImage,
-    seam_weight_mask: &[f32],
+    seam_weight_mask: &crate::panorama_utils::graph_cut::SeamWeightMask,
     num_levels: usize,
 ) {
     let (w, h) = canvas_a.dimensions();
 
-    // 1. Find overlapping bounding box
-    let mut min_x = w;
-    let mut max_x = 0;
-    let mut min_y = h;
-    let mut max_y = 0;
-    let mut has_overlap = false;
+    // 1. Parallel row scan to find overlapping bounding box across CPU cores
+    let (min_x, max_x, min_y, max_y, has_overlap) = {
+        let row_ranges: Vec<(u32, u32, u32)> = mask_a
+            .par_chunks(w as usize)
+            .zip(mask_b.par_chunks(w as usize))
+            .enumerate()
+            .filter_map(|(y, (row_a, row_b))| {
+                let mut rx_min = u32::MAX;
+                let mut rx_max = 0u32;
+                let mut row_has_overlap = false;
+                for x in 0..w as usize {
+                    if row_a[x] > 0 && row_b[x] > 0 {
+                        rx_min = rx_min.min(x as u32);
+                        rx_max = rx_max.max(x as u32);
+                        row_has_overlap = true;
+                    }
+                }
+                if row_has_overlap {
+                    Some((rx_min, rx_max, y as u32))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-    for y in 0..h {
-        for x in 0..w {
-            let in_a = mask_a.get_pixel(x, y)[0] > 0;
-            let in_b = mask_b.get_pixel(x, y)[0] > 0;
-            if in_a && in_b {
-                has_overlap = true;
-                min_x = min_x.min(x);
-                max_x = max_x.max(x);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y);
+        if row_ranges.is_empty() {
+            (w, 0, h, 0, false)
+        } else {
+            let mut mx = w;
+            let mut xx = 0;
+            let mut my = h;
+            let mut xy = 0;
+            for (rx_min, rx_max, y) in row_ranges {
+                mx = mx.min(rx_min);
+                xx = xx.max(rx_max);
+                my = my.min(y);
+                xy = xy.max(y);
             }
+            (mx, xx, my, xy, true)
         }
-    }
+    };
 
     if !has_overlap || min_x >= max_x || min_y >= max_y {
         canvas_a
@@ -1006,8 +1167,7 @@ pub fn multiband_laplacian_blend_roi(
 
             roi_a.put_pixel(rx, ry, px_a);
             roi_b.put_pixel(rx, ry, px_b);
-            let full_idx = (cy * w + cx) as usize;
-            roi_weight[r_idx] = seam_weight_mask[full_idx];
+            roi_weight[r_idx] = seam_weight_mask.get_weight(cx, cy);
         }
     }
 
@@ -1149,19 +1309,31 @@ pub fn multiband_laplacian_blend_roi(
         }
     }
 
-    // 4. Seam-Ribbon Local Optical-Flow De-Parallax Warping
-    align_seam_ribbon_deparallax(
-        &mut roi_a,
-        &mut roi_b,
-        &in_a_mask,
-        &in_b_mask,
-        &dist_a,
-        &dist_b,
-        &roi_weight,
-    );
+    // 4. Seam-Ribbon Local Optical-Flow De-Parallax Warping (Defense 11: Rigid Architecture Mode)
+    let is_rigid_env = std::env::var("RAPIDRAW_RIGID_ARCHITECTURE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let is_structural = is_rigid_env || detect_structural_architecture(&roi_a, &in_a_mask, &in_b_mask);
 
-    // 5. Run Multi-Band Laplacian Pyramid blend on the harmonized & de-parallaxed ROI patch
-    let active_levels = num_levels.clamp(4, 5);
+    if !is_structural {
+        align_seam_ribbon_deparallax(
+            &mut roi_a,
+            &mut roi_b,
+            &in_a_mask,
+            &in_b_mask,
+            &dist_a,
+            &dist_b,
+            &roi_weight,
+        );
+    } else {
+        println!("  [Photometric] Rigid architectural scene detected: bypassing seam-ribbon optical-flow shear warping (D11).");
+    }
+
+    // 5. Run Multi-Band Laplacian Pyramid blend on the harmonized ROI patch (Defense 5: Adaptive Pyramid Depth)
+    let overlap_span = (roi_max_x.saturating_sub(roi_min_x)).min(roi_max_y.saturating_sub(roi_min_y));
+    let max_levels = 5usize;
+    let adaptive_levels = ((overlap_span as f32 / 16.0).log2().floor() as usize).clamp(1, max_levels);
+    let active_levels = adaptive_levels.min(num_levels);
     let blended_roi = multiband_laplacian_blend(&roi_a, &roi_b, &roi_weight, active_levels);
 
     // 6. Paste blended ROI with wide C1 smoothstep feathering at `mask_a` / `mask_b` borders

@@ -344,79 +344,104 @@ pub fn ray_traced_multiband_stitcher(
         let gain = global_gains.get(k).copied().unwrap_or([1.0, 1.0, 1.0]);
         let mesh_warp = mesh_warps.get(k);
 
-        let num_pixels_per_row = out_width as usize * 3;
-        panel_img
-            .par_chunks_mut(num_pixels_per_row)
-            .zip(panel_mask.par_chunks_mut(out_width as usize))
-            .enumerate()
-            .for_each(|(y, (row_slice, mask_row))| {
-                for x in 0..out_width {
-                    let d_theta = (x as f64 - canvas_cx) / canvas_f + mid_theta;
-                    let h_cyl = (y as f64 - canvas_cy) / canvas_f;
+        // Tiled GPU backward projection with automatic CPU fallback
+        let gpu_ctx: Option<crate::image_processing::GpuContext> = app_handle.and_then(|h| {
+            use tauri::Manager;
+            let state = h.try_state::<crate::AppState>()?;
+            let guard = state.gpu_context.lock().ok()?;
+            guard.clone()
+        });
+        let device_pair = gpu_ctx.as_ref().map(|ctx| (&*ctx.device, &*ctx.queue));
 
-                    let world_ray = match active_projection {
-                        PanoramaProjection::Cylindrical => {
-                            let sin_t = d_theta.sin();
-                            let cos_t = d_theta.cos();
-                            // Exact 3D pitch rotation around world X-axis by mid_phi preserves straight horizons
-                            let cos_pitch = mid_phi.cos();
-                            let sin_pitch = mid_phi.sin();
-                            let ray_x = sin_t;
-                            let ray_y = h_cyl * cos_pitch + cos_t * sin_pitch;
-                            let ray_z = -h_cyl * sin_pitch + cos_t * cos_pitch;
-                            Vector3::new(ray_x, ray_y, ray_z).normalize()
-                        }
-                        PanoramaProjection::Spherical => {
-                            let phi_rad = (y as f64 - canvas_cy) / canvas_f + mid_phi;
-                            let cos_p = phi_rad.cos();
-                            Vector3::new(cos_p * d_theta.sin(), phi_rad.sin(), cos_p * d_theta.cos())
-                        }
-                        PanoramaProjection::Planar => {
-                            let phi = (y as f64 - canvas_cy) / canvas_f + mid_phi;
-                            let len = (d_theta * d_theta + phi * phi + 1.0).sqrt();
-                            Vector3::new(d_theta / len, phi / len, 1.0 / len)
-                        }
-                        PanoramaProjection::Panini => {
-                            let theta = d_theta;
-                            let phi = (y as f64 - canvas_cy) / canvas_f + mid_phi;
-                            let d = 1.0;
-                            let scale_v = (d + 1.0) / (d + theta.cos().max(1e-4));
-                            let ray_x = theta.sin();
-                            let ray_y = phi / scale_v;
-                            let ray_z = theta.cos();
-                            Vector3::new(ray_x, ray_y, ray_z).normalize()
-                        }
-                        PanoramaProjection::Stereographic => {
-                            let theta = d_theta;
-                            let phi = (y as f64 - canvas_cy) / canvas_f + mid_phi;
-                            let r = (theta * theta + phi * phi).sqrt();
-                            if r < 1e-6 {
-                                Vector3::new(0.0, 0.0, 1.0)
-                            } else {
-                                let ang: f64 = 2.0 * (r / 2.0).atan();
-                                let sin_a = ang.sin();
-                                let cos_a = ang.cos();
-                                Vector3::new(sin_a * (theta / r), sin_a * (phi / r), cos_a).normalize()
+        if mesh_warp.is_none() {
+            crate::panorama_utils::gpu_warp::warp_panel_tiled(
+                device_pair,
+                src_img,
+                pose,
+                gain,
+                canvas_cx,
+                canvas_cy,
+                canvas_f,
+                mid_theta,
+                mid_phi,
+                active_projection,
+                &mut panel_img,
+                &mut panel_mask,
+            )?;
+        } else {
+            let num_pixels_per_row = out_width as usize * 3;
+            panel_img
+                .par_chunks_mut(num_pixels_per_row)
+                .zip(panel_mask.par_chunks_mut(out_width as usize))
+                .enumerate()
+                .for_each(|(y, (row_slice, mask_row))| {
+                    for x in 0..out_width {
+                        let d_theta = (x as f64 - canvas_cx) / canvas_f + mid_theta;
+                        let h_cyl = (y as f64 - canvas_cy) / canvas_f;
+
+                        let world_ray = match active_projection {
+                            PanoramaProjection::Cylindrical => {
+                                let sin_t = d_theta.sin();
+                                let cos_t = d_theta.cos();
+                                let cos_pitch = mid_phi.cos();
+                                let sin_pitch = mid_phi.sin();
+                                let ray_x = sin_t;
+                                let ray_y = h_cyl * cos_pitch + cos_t * sin_pitch;
+                                let ray_z = -h_cyl * sin_pitch + cos_t * cos_pitch;
+                                Vector3::new(ray_x, ray_y, ray_z).normalize()
                             }
-                        }
-                    };
-
-                    if let Some((u, v)) = pose.project_ray(&world_ray, r_inv) {
-                        let (u_w, v_w) = if let Some(warp) = mesh_warp {
-                            warp.warp_point(u, v)
-                        } else {
-                            (u, v)
+                            PanoramaProjection::Spherical => {
+                                let phi_rad = (y as f64 - canvas_cy) / canvas_f + mid_phi;
+                                let cos_p = phi_rad.cos();
+                                Vector3::new(cos_p * d_theta.sin(), phi_rad.sin(), cos_p * d_theta.cos())
+                            }
+                            PanoramaProjection::Planar => {
+                                let phi = (y as f64 - canvas_cy) / canvas_f + mid_phi;
+                                let len = (d_theta * d_theta + phi * phi + 1.0).sqrt();
+                                Vector3::new(d_theta / len, phi / len, 1.0 / len)
+                            }
+                            PanoramaProjection::Panini => {
+                                let theta = d_theta;
+                                let phi = (y as f64 - canvas_cy) / canvas_f + mid_phi;
+                                let d = 1.0;
+                                let scale_v = (d + 1.0) / (d + theta.cos().max(1e-4));
+                                let ray_x = theta.sin();
+                                let ray_y = phi / scale_v;
+                                let ray_z = theta.cos();
+                                Vector3::new(ray_x, ray_y, ray_z).normalize()
+                            }
+                            PanoramaProjection::Stereographic => {
+                                let theta = d_theta;
+                                let phi = (y as f64 - canvas_cy) / canvas_f + mid_phi;
+                                let r = (theta * theta + phi * phi).sqrt();
+                                if r < 1e-6 {
+                                    Vector3::new(0.0, 0.0, 1.0)
+                                } else {
+                                    let ang: f64 = 2.0 * (r / 2.0).atan();
+                                    let sin_a = ang.sin();
+                                    let cos_a = ang.cos();
+                                    Vector3::new(sin_a * (theta / r), sin_a * (phi / r), cos_a).normalize()
+                                }
+                            }
                         };
-                        let color = get_catmull_rom_bicubic_pixel(src_img, u_w, v_w);
-                        let vig = pose.vignetting_gain(u_w, v_w);
-                        let start = x as usize * 3;
-                        row_slice[start] = (color.0[0] * gain[0] * vig).max(0.0);
-                        row_slice[start + 1] = (color.0[1] * gain[1] * vig).max(0.0);
-                        row_slice[start + 2] = (color.0[2] * gain[2] * vig).max(0.0);
-                        mask_row[x as usize] = 255;
+
+                        if let Some((u, v)) = pose.project_ray(&world_ray, r_inv) {
+                            let (u_w, v_w) = if let Some(warp) = mesh_warp {
+                                warp.warp_point(u, v)
+                            } else {
+                                (u, v)
+                            };
+                            let color = get_catmull_rom_bicubic_pixel(src_img, u_w, v_w);
+                            let vig = pose.vignetting_gain(u_w, v_w);
+                            let start = x as usize * 3;
+                            row_slice[start] = (color.0[0] * gain[0] * vig).max(0.0);
+                            row_slice[start + 1] = (color.0[1] * gain[1] * vig).max(0.0);
+                            row_slice[start + 2] = (color.0[2] * gain[2] * vig).max(0.0);
+                            mask_row[x as usize] = 255;
+                        }
                     }
-                }
-            });
+                });
+        }
 
         let panel_non_zero = panel_mask.pixels().filter(|p| p[0] > 0).count();
         println!("  - Panel {} mapped pixels: {}", k + 1, panel_non_zero);
@@ -634,8 +659,8 @@ pub fn apply_boundary_mesh_warp(pano: &Rgb32FImage, mask: &GrayImage, strength: 
 
             // Constrain maximum boundary warp displacement so mild cylindrical bow is straightened
             // without taffy-stretching deep concave step notches (which are handled by inner rectangle crop).
-            let max_disp_x = (w as f64 * 0.022).clamp(4.0, 28.0);
-            let max_disp_y = (h as f64 * 0.022).clamp(4.0, 24.0);
+            let max_disp_x = (w as f64 * 0.15).clamp(12.0, 160.0);
+            let max_disp_y = (h as f64 * 0.15).clamp(12.0, 140.0);
 
             let disp_x = (curved_x - rect_x).clamp(-max_disp_x, max_disp_x);
             let disp_y = (curved_y - rect_y).clamp(-max_disp_y, max_disp_y);

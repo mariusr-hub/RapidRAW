@@ -1,6 +1,6 @@
 [package]
 name = "RapidRAW"
-version = "1.6.6"
+version = "1.6.8"
 description = "A blazingly-fast, non-destructive, and GPU-accelerated RAW image editor built with performance in mind."
 authors = ["Timon Käch"]
 edition = "2024"
@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 [[bin]]
 name = "RapidRAW"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "render_all"
@@ -95,6 +96,7 @@ fast_image_resize = "5.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tauri-plugin-http = "2.8.0"
 tauri-plugin-store = "2.5.0"
+rapidraw-dsp = { path = "crates/rapidraw-dsp" }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 trash = "5.2.6"
@@ -148,6 +150,10 @@ hex = "0.4"
 name = "test_batch_render_all_12"
 path = "tests/test_batch_render_all_12.rs"
 
+[[test]]
+name = "optical_quality_benchmarks"
+path = "tests/optical_quality_benchmarks.rs"
+
 [profile.dev]
 opt-level = 2
 debug = 1
@@ -164,10 +170,10 @@ opt-level = 3
 # Current settings: thin-lto + 4 codegen-units keeps peak per-unit memory
 # under 1 GB while producing nearly identical binary performance.
 [profile.release]
-codegen-units = 8
+codegen-units = 4
 lto = "off"
 strip = true
-opt-level = 3
+opt-level = 2
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

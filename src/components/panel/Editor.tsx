@@ -1446,9 +1446,10 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       const irs = imageRenderSizeRef.current;
 
       if (
+        osPlatform === 'windows' ||
         currentRect.width < 10 ||
         currentRect.height < 10 ||
-        state.useWgpuRenderer === false ||
+        state.useWgpuRenderer !== true ||
         !state.isReady ||
         !state.hasRenderedFirstFrame ||
         irs.width === 0 ||
@@ -2240,7 +2241,8 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     }
   }
 
-  const isWgpuActive = appSettings?.useWgpuRenderer !== false && hasRenderedFirstFrame;
+  const useNativeSwapchain = osPlatform !== 'windows' && appSettings?.useWgpuRenderer === true;
+  const isWgpuActive = useNativeSwapchain && hasRenderedFirstFrame;
   const hasRenderedAnyPreview = hasRenderedFirstFrame || !!finalPreviewUrl;
 
   return (
@@ -2250,7 +2252,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         !isInstantTransition && 'transition-all duration-300 ease-in-out',
         isFullScreen
           ? 'rounded-none p-0 gap-0'
-          : clsx('rounded-lg p-2 gap-2', appSettings?.useWgpuRenderer !== false ? 'bg-transparent' : 'bg-bg-secondary'),
+          : clsx('rounded-lg p-2 gap-2', isWgpuActive ? 'bg-transparent' : 'bg-bg-secondary'),
       )}
     >
       {hasRenderedAnyPreview && <div className="hidden" data-bench-id="editor-first-frame" />}
@@ -2287,7 +2289,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         className={clsx(
           'flex-1 relative overflow-hidden touch-none',
           isFullScreen ? 'rounded-none' : 'rounded-lg',
-          appSettings?.useWgpuRenderer !== false && !isFullScreen && 'ring-[9999px] ring-bg-secondary',
+          isWgpuActive && !isFullScreen && 'ring-[9999px] ring-bg-secondary',
           !isWgpuActive && ((appSettings as any)?.editorNeutralGreyBg ? 'bg-[#808080]' : 'bg-bg-secondary'),
         )}
         style={{ cursor: cursorStyle }}

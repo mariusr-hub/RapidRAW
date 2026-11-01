@@ -936,7 +936,7 @@ pub fn calculate_radial_vignette_scale(x: usize, y: usize, w: usize, h: usize) -
     1.0 + 0.35 * r2
 }
 
-/// Pre-demosaic Raw Bayer Joint Denoising Filter (DxO DeepPRIME inspired).
+/// Pre-demosaic Raw Bayer Joint Denoising Filter (Variance-Stabilized CFA Joint Filter).
 /// Operates on un-interpolated 14-bit CFA array (RGGB) before color demosaicing:
 /// 1. Stabilizes Poisson-Gaussian noise via Anscombe VST.
 /// 2. Performs dual-green joint consistency filtering (G1 vs G2) to eliminate sensor readout noise.

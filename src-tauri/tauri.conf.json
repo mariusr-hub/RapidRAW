@@ -18,16 +18,21 @@
         "height": 720,
         "minWidth": 800,
         "minHeight": 600,
-        "transparent": true,
+        "transparent": false,
         "decorations": false
       }
     ],
     "security": {
       "csp": null,
-      "capabilities": ["default", "desktop-cloud"],
+      "capabilities": [
+        "default",
+        "desktop-cloud"
+      ],
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPCACHE/thumbnails/*"]
+        "scope": [
+          "$APPCACHE/thumbnails/*"
+        ]
       }
     },
     "macOSPrivateApi": true
@@ -35,8 +40,17 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
-    "resources": ["resources", "lensfun_db"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources",
+      "lensfun_db"
+    ],
     "category": "Photography",
     "fileAssociations": [
       {
@@ -94,5 +108,5 @@
       }
     }
   },
-  "version": "1.6.6"
+  "version": "1.6.8"
 }

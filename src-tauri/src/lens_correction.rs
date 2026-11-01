@@ -148,18 +148,32 @@ pub struct MultiName {
     value: String,
 }
 
-#[derive(Serialize)]
+use image::{DynamicImage, ImageBuffer};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LensDistortionParams {
-    k1: f64,
-    k2: f64,
-    k3: f64,
-    model: u32,
-    tca_vr: f64,
-    tca_vb: f64,
-    vig_k1: f64,
-    vig_k2: f64,
-    vig_k3: f64,
+    pub k1: f64,
+    pub k2: f64,
+    pub k3: f64,
+    pub model: u32,
+    pub tca_vr: f64,
+    pub tca_vb: f64,
+    pub vig_k1: f64,
+    pub vig_k2: f64,
+    pub vig_k3: f64,
 }
+
+impl LensDistortionParams {
+    /// Wires Lensfun distortion coefficients into GPU render uniforms (k1, k2, k3, enabled)
+    pub fn to_gpu_render_uniforms(&self, enabled: bool) -> (f32, f32, f32, u32) {
+        if enabled && (self.k1.abs() > 1e-6 || self.k2.abs() > 1e-6 || self.k3.abs() > 1e-6) {
+            (self.k1 as f32, self.k2 as f32, self.k3 as f32, 1u32)
+        } else {
+            (0.0, 0.0, 0.0, 0u32)
+        }
+    }
+}
+
 
 fn strip_maker_prefix(name: &str, maker: &str) -> String {
     if name.to_lowercase().starts_with(&maker.to_lowercase())
@@ -1390,6 +1404,26 @@ pub fn auto_detect_transverse_chromatic_aberration(img: &image::Rgb32FImage) -> 
         let mut err_b = 0.0f32;
 
         for &(x, y, r_sq, dir_x, dir_y) in &edge_samples {
+            let x_step = (dir_x * 2.0).round() as i32;
+            let y_step = (dir_y * 2.0).round() as i32;
+
+            let g_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[1];
+            let g_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[1];
+            let g_span = g_next - g_prev;
+            if g_span.abs() < 0.04 {
+                continue;
+            }
+            let g_target = img.get_pixel(x, y)[1];
+            let t_g = (g_target - g_prev) / g_span;
+
+            let r_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[0];
+            let r_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[0];
+            let r_span = r_next - r_prev;
+
+            let b_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[2];
+            let b_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[2];
+            let b_span = b_next - b_prev;
+
             let offset = delta * r_sq * max_radius;
             let sx = (x as f32 + dir_x * offset).clamp(0.0, width as f32 - 1.001);
             let sy = (y as f32 + dir_y * offset).clamp(0.0, height as f32 - 1.001);
@@ -1408,10 +1442,20 @@ pub fn auto_detect_transverse_chromatic_aberration(img: &image::Rgb32FImage) -> 
 
             let r_interp = (p00[0] * (1.0 - fx) + p10[0] * fx) * (1.0 - fy) + (p01[0] * (1.0 - fx) + p11[0] * fx) * fy;
             let b_interp = (p00[2] * (1.0 - fx) + p10[2] * fx) * (1.0 - fy) + (p01[2] * (1.0 - fx) + p11[2] * fx) * fy;
-            let g_target = img.get_pixel(x, y)[1];
 
-            err_r += (r_interp - g_target).abs();
-            err_b += (b_interp - g_target).abs();
+            if r_span.abs() >= 0.04 {
+                let t_r = (r_interp - r_prev) / r_span;
+                err_r += (t_r - t_g).abs();
+            } else {
+                err_r += (r_interp - g_target).abs() * 0.2;
+            }
+
+            if b_span.abs() >= 0.04 {
+                let t_b = (b_interp - b_prev) / b_span;
+                err_b += (t_b - t_g).abs();
+            } else {
+                err_b += (b_interp - g_target).abs() * 0.2;
+            }
         }
 
         if err_r < min_err_r {
@@ -1484,6 +1528,121 @@ pub fn apply_radial_chromatic_aberration_correction(
             pixel[2] = b_interp;
         }
     });
+}
+
+/// Applies radial chromatic aberration correction to a DynamicImage (Rgb32F or Rgba32F)
+pub fn apply_radial_chromatic_aberration_correction_dynamic(
+    img: &mut DynamicImage,
+    red_scale: f32,
+    blue_scale: f32,
+) {
+    if (red_scale - 1.0).abs() < 1e-5 && (blue_scale - 1.0).abs() < 1e-5 {
+        return;
+    }
+    match img {
+        DynamicImage::ImageRgb32F(rgb32f) => {
+            apply_radial_chromatic_aberration_correction(rgb32f, red_scale, blue_scale);
+        }
+        DynamicImage::ImageRgba32F(rgba32f) => {
+            use rayon::prelude::*;
+            let (width, height) = rgba32f.dimensions();
+            let cx = width as f32 / 2.0;
+            let cy = height as f32 / 2.0;
+            let max_radius = (cx * cx + cy * cy).sqrt().max(1.0);
+
+            let src = rgba32f.clone();
+
+            rgba32f.enumerate_rows_mut().par_bridge().for_each(|(_, row)| {
+                for (x, y, pixel) in row {
+                    let dx = x as f32 - cx;
+                    let dy = y as f32 - cy;
+                    let r = (dx * dx + dy * dy).sqrt() / max_radius;
+
+                    // Bilinear sample red channel
+                    let r_factor = 1.0 + (red_scale - 1.0) * r * r;
+                    let rx = (cx + dx * r_factor).clamp(0.0, width as f32 - 1.001);
+                    let ry = (cy + dy * r_factor).clamp(0.0, height as f32 - 1.001);
+                    let rx0 = rx.floor() as u32;
+                    let ry0 = ry.floor() as u32;
+                    let rx1 = (rx0 + 1).min(width - 1);
+                    let ry1 = (ry0 + 1).min(height - 1);
+                    let r_fx = rx - rx0 as f32;
+                    let r_fy = ry - ry0 as f32;
+                    let r_interp = (1.0 - r_fx) * (1.0 - r_fy) * src.get_pixel(rx0, ry0)[0]
+                        + r_fx * (1.0 - r_fy) * src.get_pixel(rx1, ry0)[0]
+                        + (1.0 - r_fx) * r_fy * src.get_pixel(rx0, ry1)[0]
+                        + r_fx * r_fy * src.get_pixel(rx1, ry1)[0];
+
+                    // Bilinear sample blue channel
+                    let b_factor = 1.0 + (blue_scale - 1.0) * r * r;
+                    let bx = (cx + dx * b_factor).clamp(0.0, width as f32 - 1.001);
+                    let by = (cy + dy * b_factor).clamp(0.0, height as f32 - 1.001);
+                    let bx0 = bx.floor() as u32;
+                    let by0 = by.floor() as u32;
+                    let bx1 = (bx0 + 1).min(width - 1);
+                    let by1 = (by0 + 1).min(height - 1);
+                    let b_fx = bx - bx0 as f32;
+                    let b_fy = by - by0 as f32;
+                    let b_interp = (1.0 - b_fx) * (1.0 - b_fy) * src.get_pixel(bx0, by0)[2]
+                        + b_fx * (1.0 - b_fy) * src.get_pixel(bx1, by0)[2]
+                        + (1.0 - b_fx) * b_fy * src.get_pixel(bx0, by1)[2]
+                        + b_fx * b_fy * src.get_pixel(bx1, by1)[2];
+
+                    pixel[0] = r_interp;
+                    pixel[2] = b_interp;
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Auto-detects transverse chromatic aberration for any DynamicImage, falling back safely to (1.0, 1.0)
+pub fn auto_detect_transverse_chromatic_aberration_dynamic(img: &DynamicImage) -> (f32, f32) {
+    match img {
+        DynamicImage::ImageRgb32F(rgb) => auto_detect_transverse_chromatic_aberration(rgb),
+        DynamicImage::ImageRgba32F(rgba) => {
+            let (w, h) = rgba.dimensions();
+            let mut rgb = ImageBuffer::new(w, h);
+            for (p_out, p_in) in rgb.pixels_mut().zip(rgba.pixels()) {
+                *p_out = image::Rgb([p_in[0], p_in[1], p_in[2]]);
+            }
+            auto_detect_transverse_chromatic_aberration(&rgb)
+        }
+        _ => {
+            let rgb8 = img.to_rgb8();
+            let (w, h) = rgb8.dimensions();
+            let mut rgb = ImageBuffer::new(w, h);
+            for (p_out, p_in) in rgb.pixels_mut().zip(rgb8.pixels()) {
+                *p_out = image::Rgb([p_in[0] as f32 / 255.0, p_in[1] as f32 / 255.0, p_in[2] as f32 / 255.0]);
+            }
+            auto_detect_transverse_chromatic_aberration(&rgb)
+        }
+    }
+}
+
+/// Resolves TCA scale parameters from Lensfun database or automatically detects them from edge gradients.
+pub fn resolve_or_autodetect_tca(
+    db: Option<&LensDatabase>,
+    maker: &str,
+    model: &str,
+    focal_length: f32,
+    aperture: Option<f32>,
+    distance: Option<f32>,
+    img: &DynamicImage,
+) -> (f32, f32) {
+    if let Some(db) = db {
+        if let Some(params) = resolve_lens_params(db, maker, model, focal_length, aperture, distance) {
+            let vr = params.tca_vr as f32;
+            let vb = params.tca_vb as f32;
+            if (vr - 1.0).abs() > 1e-5 || (vb - 1.0).abs() > 1e-5 {
+                return (vr, vb);
+            }
+        }
+    }
+    // Automated fallback: when Lensfun XML database lacks camera/lens metadata,
+    // compute red/blue radial coefficients directly from high-contrast image edge gradients without panicking.
+    auto_detect_transverse_chromatic_aberration_dynamic(img)
 }
 
 /// Pre-Fusion Radial Vignette Equalization (cos^4 theta) for raw frames before panorama stitching or HDR

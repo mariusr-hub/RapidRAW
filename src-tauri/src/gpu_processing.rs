@@ -182,7 +182,7 @@ pub fn get_or_init_gpu_context(
 
     let instance = wgpu::Instance::new(instance_desc);
 
-    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "android", target_os = "linux")))]
     let surface_opt = {
         let settings = crate::app_settings::load_settings(app_handle.clone()).unwrap_or_default();
         let use_wgpu_renderer = settings.use_wgpu_renderer.unwrap_or(true);
@@ -210,7 +210,7 @@ pub fn get_or_init_gpu_context(
         }
     };
 
-    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
     let surface_opt: Option<wgpu::Surface> = None;
 
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2131,6 +2131,13 @@ impl GpuProcessor {
                         }
                     }
                 }
+
+                if !output_to_display {
+                    let _ = device.poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(std::time::Duration::from_millis(500)),
+                    });
+                }
             }
         }
 
@@ -2233,7 +2240,14 @@ fn process_and_get_dynamic_image_inner(
         return Ok(base_image.clone());
     }
 
-    let mut processor_lock = match state.gpu_processor.lock() {
+    let is_export = caller_id.contains("export") || caller_id.contains("Export");
+    let processor_mutex = if is_export {
+        &state.export_processor
+    } else {
+        &state.preview_processor
+    };
+
+    let mut processor_lock = match processor_mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             log::warn!("GPU processor lock was poisoned. Resetting to self-heal.");
@@ -2243,8 +2257,14 @@ fn process_and_get_dynamic_image_inner(
         }
     };
     let mut needs_new_processor = false;
-    let new_width = (width + 255) & !255;
-    let new_height = (height + 255) & !255;
+    let (target_w, target_h) = if is_export {
+        (width, height)
+    } else {
+        // Pre-allocate ceiling dimension to eliminate zoom/pan DX12 reallocation stalls
+        (width.max(2560), height.max(1440))
+    };
+    let new_width = (target_w + 255) & !255;
+    let new_height = (target_h + 255) & !255;
 
     if let Some(p) = processor_lock.as_ref() {
         if p.width < width || p.height < height {
@@ -2256,7 +2276,8 @@ fn process_and_get_dynamic_image_inner(
 
     if needs_new_processor {
         log::info!(
-            "Creating new GPU Processor for dimensions up to {}x{}",
+            "Creating new GPU Processor ({}) for dimensions up to {}x{}",
+            if is_export { "export" } else { "preview" },
             new_width,
             new_height
         );
@@ -2281,7 +2302,12 @@ fn process_and_get_dynamic_image_inner(
     let processor_state = processor_lock.as_ref().unwrap();
     let processor = &processor_state.processor;
 
-    let mut cache_lock = match state.gpu_image_cache.lock() {
+    let cache_mutex = if is_export {
+        &state.export_image_cache
+    } else {
+        &state.gpu_image_cache
+    };
+    let mut cache_lock = match cache_mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             log::warn!("GPU image cache lock was poisoned. Resetting to self-heal.");
@@ -2594,6 +2620,16 @@ fn process_and_get_dynamic_image_inner(
         duration,
         fps
     );
+
+    if is_export {
+        let _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(500)),
+        });
+        if let Ok(mut lock) = state.export_image_cache.lock() {
+            *lock = None;
+        }
+    }
 
     match processed_pixels {
         RenderedPixels::U8(pixels) => {

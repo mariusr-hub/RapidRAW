@@ -1,18 +1,55 @@
 import { motion } from 'framer-motion';
 import clsx from 'clsx';
-import { Sparkles, Heart, Flower2, ChevronDown, Check, Zap, Loader2, Sun } from 'lucide-react';
+import { Sparkles, Heart, Flower2, ChevronDown, Check, Zap, Loader2, Sun, Pipette } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import Slider from '../ui/Slider';
-import { Adjustments, BasicAdjustment } from '../../utils/adjustments';
+import Slider, { SliderChangeEvent } from '../ui/Slider';
+import LightsSubPipeline from './LightsSubPipeline';
+import AdjustmentSubSection from './AdjustmentSubSection';
+import { Adjustments, BasicAdjustment, getAdjustmentToolOrder, getHiddenAdjustmentTools } from '../../utils/adjustments';
 import { useEffect, useRef, useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useEditorStore } from '../../store/useEditorStore';
+import { useSettingsStore } from '../../store/useSettingsStore';
+import {
+  getRelativeWhiteBalance,
+  getWhiteBalanceMode,
+  kelvinSliderScale,
+  MAX_TEMPERATURE,
+  MAX_TINT,
+  MIN_TEMPERATURE,
+  RELATIVE_RANGE,
+  resolveWhiteBalance,
+  WhiteBalance,
+  WhiteBalanceMode,
+  withKelvinWhiteBalance,
+  withRelativeWhiteBalance,
+} from '../../utils/whiteBalance';
+
+// Piecewise Asymmetric Super-Slider Law (Dynamic Curve Modeling)
+function scaleSmartParam(nominal: number, minVal: number, maxCeiling: number, pct: number): number {
+  const s = Math.max(0, Math.min(200, pct));
+  const delta = (s - 100) / 100; // [-1.0, +1.0]
+  return delta <= 0
+    ? nominal + (nominal - minVal) * delta
+    : nominal + (maxCeiling - nominal) * delta;
+}
+
+interface SmartDiagnostics {
+  sceneName: string;
+  tintCastStatus: string;     // e.g. "Cast Removed (-8G)" or "Clean WB"
+  perPixelEvStatus: string;   // e.g. "+0.32 EV (HL Protected)"
+  noiseGateStatus: string;    // e.g. "Clean (Bypassed)" or "ISO Denoise Active"
+}
 
 interface BasicAdjustmentsProps {
   adjustments: Adjustments;
-  setAdjustments(adjustments: Partial<Adjustments>): any;
+  setAdjustments(adjustments: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)): any;
   isForMask?: boolean;
   onDragStateChange?: (isDragging: boolean) => void;
   appSettings?: any;
+  asShotWhiteBalance?: WhiteBalance;
+  isWbPickerActive?: boolean;
+  toggleWbPicker?: () => void;
 }
 
 interface ToneMapperSwitchProps {
@@ -171,6 +208,9 @@ export default function BasicAdjustments({
   isForMask = false,
   onDragStateChange,
   appSettings,
+  asShotWhiteBalance: asShotProp,
+  isWbPickerActive = false,
+  toggleWbPicker,
 }: BasicAdjustmentsProps) {
   const { t } = useTranslation();
   const [isWeddingMenuOpen, setIsWeddingMenuOpen] = useState(false);
@@ -210,7 +250,51 @@ export default function BasicAdjustments({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  const selectedImage = useEditorStore((state) => state.selectedImage);
+  const handleSettingsChange = useSettingsStore((state) => state.handleSettingsChange);
+  const autoAnalyzeOnOpen = appSettings?.autoAnalyzeOnOpen !== false;
+
+  const asShotWhiteBalance = asShotProp ?? selectedImage?.asShotWhiteBalance;
+  const hiddenTools = getHiddenAdjustmentTools(appSettings?.adjustmentLayout);
+  const toolOrder = getAdjustmentToolOrder('basic', appSettings?.adjustmentLayout?.toolOrder);
+
+  const kelvinAsShot =
+    !isForMask && getWhiteBalanceMode(appSettings) === WhiteBalanceMode.Kelvin ? asShotWhiteBalance : undefined;
+  const isKelvinMode = !!kelvinAsShot;
+  const displayedWhiteBalance = kelvinAsShot
+    ? resolveWhiteBalance(kelvinAsShot, adjustments)
+    : getRelativeWhiteBalance(asShotWhiteBalance, adjustments);
+  const tintRange = kelvinAsShot ? MAX_TINT : RELATIVE_RANGE;
+
+  const toggleWhiteBalanceMode = () => {
+    if (appSettings) {
+      handleSettingsChange({
+        ...appSettings,
+        whiteBalanceMode: isKelvinMode ? WhiteBalanceMode.Relative : WhiteBalanceMode.Kelvin,
+      });
+    }
+  };
+
+  const handleWhiteBalanceChange = (key: keyof WhiteBalance, value: number | string) => {
+    setAdjustments((prev: Adjustments) => {
+      if (kelvinAsShot) {
+        return withKelvinWhiteBalance(prev, { ...resolveWhiteBalance(kelvinAsShot, prev), [key]: Number(value) });
+      }
+      return prev.whiteBalance
+        ? withRelativeWhiteBalance(prev, {
+            ...getRelativeWhiteBalance(asShotWhiteBalance, prev),
+            [key]: Number(value),
+          })
+        : { ...prev, [key]: Number(value) };
+    });
+  };
   const [detectedSceneBadge, setDetectedSceneBadge] = useState<string | null>(null);
+  const [masterStrength, setMasterStrength] = useState<number>(100);
+  const [enhanceMacro, setEnhanceMacro] = useState<number>(100);
+  const [colorMacro, setColorMacro] = useState<number>(100);
+  const [skinMacro, setSkinMacro] = useState<number>(100);
+  const [smartDiag, setSmartDiag] = useState<SmartDiagnostics | null>(null);
+  const smartBaselineRef = useRef<Partial<Adjustments> | null>(null);
 
   const handleSkySculpt = async (preset: string = selectedSkyPreset) => {
     setSelectedSkyPreset(preset);
@@ -223,7 +307,6 @@ export default function BasicAdjustments({
           ...res.mask_adjustments,
         }));
         setDetectedSceneBadge(`🌅 Sky Sculpted: ${res.preset_name}`);
-        setTimeout(() => setDetectedSceneBadge(null), 5000);
       }
     } catch (err) {
       console.error('Sky sculpt error:', err);
@@ -242,11 +325,21 @@ export default function BasicAdjustments({
       if (res && res.adjustments) {
         setDetectedSceneBadge(res.sceneName || null);
         const adj = res.adjustments;
+        smartBaselineRef.current = adj;
+        setMasterStrength(100);
+        setEnhanceMacro(100);
+        setColorMacro(100);
+        setSkinMacro(100);
+        setSmartDiag({
+          sceneName: res.sceneName || 'Universal',
+          tintCastStatus: Math.abs(adj.tint || 0) > 2 || Math.abs(adj.temperature || 0) > 2 ? 'Tint Cast Removed' : 'Clean WB',
+          perPixelEvStatus: `${(adj.exposure || 0) >= 0 ? '+' : ''}${Number(adj.exposure || 0).toFixed(2)} EV`,
+          noiseGateStatus: (adj.lumaNoiseReduction || 0) > 0 ? `Denoise (${adj.lumaNoiseReduction}%)` : 'No Noise (Bypassed)',
+        });
         setAdjustments((prev: Partial<Adjustments>) => ({
           ...prev,
           ...adj,
         }));
-        setTimeout(() => setDetectedSceneBadge(null), 5000);
       }
     } catch (err) {
       console.error('Semantic AI polish error:', err);
@@ -274,6 +367,81 @@ export default function BasicAdjustments({
     } finally {
       setIsAutoAnalyzing(false);
     }
+  };
+
+  useEffect(() => {
+    const onSmartDiag = (evt: Event) => {
+      const detail = (evt as CustomEvent).detail;
+      if (!detail?.adjustments) return;
+      const adj = detail.adjustments;
+      smartBaselineRef.current = adj;
+      setDetectedSceneBadge(detail.sceneName || null);
+      setMasterStrength(100);
+      setEnhanceMacro(100);
+      setColorMacro(100);
+      setSkinMacro(100);
+      setSmartDiag({
+        sceneName: detail.sceneName || 'Universal',
+        tintCastStatus:
+          Math.abs(adj.tint || 0) > 2 || Math.abs(adj.temperature || 0) > 2 ? 'Tint Cast Removed' : 'Clean WB',
+        perPixelEvStatus: `${(adj.exposure || 0) >= 0 ? '+' : ''}${Number(adj.exposure || 0).toFixed(2)} EV`,
+        noiseGateStatus:
+          (adj.lumaNoiseReduction || 0) > 0 ? `Denoise (${adj.lumaNoiseReduction}%)` : 'No Noise (Bypassed)',
+      });
+    };
+    window.addEventListener('rapidraw-smart-diag', onSmartDiag);
+    return () => window.removeEventListener('rapidraw-smart-diag', onSmartDiag);
+  }, []);
+
+  const applyCoupledSmartSliders = (nextMaster: number, nextEnhance: number, nextColor: number, nextSkin: number) => {
+    if (!smartBaselineRef.current) {
+      smartBaselineRef.current = { ...adjustments };
+    }
+    const base = smartBaselineRef.current;
+    if (!base) return;
+    const toneScale = (nextMaster * nextEnhance) / 100;
+    const colScale = (nextMaster * nextColor) / 100;
+    const sknScale = (nextMaster * nextSkin) / 100;
+
+    setAdjustments((prev: Partial<Adjustments>) => ({
+      ...prev,
+      exposure: Number(scaleSmartParam(base.exposure ?? 0, 0, 1.25, toneScale).toFixed(2)),
+      contrast: Math.round(scaleSmartParam(base.contrast ?? 0, 0, 45, toneScale)),
+      highlights: Math.round(scaleSmartParam(base.highlights ?? 0, 0, -75, toneScale)),
+      shadows: Math.round(scaleSmartParam(base.shadows ?? 0, 0, 75, toneScale)),
+      whites: Math.round(scaleSmartParam(base.whites ?? 0, 0, 45, toneScale)),
+      blacks: Math.round(scaleSmartParam(base.blacks ?? 0, 0, -35, toneScale)),
+      clarity: Math.round(scaleSmartParam(base.clarity ?? 0, 0, 35, toneScale)),
+      dehaze: Math.round(scaleSmartParam(base.dehaze ?? 0, 0, 40, toneScale)),
+      vibrance: Math.round(scaleSmartParam(base.vibrance ?? 0, 0, 65, colScale)),
+      saturation: Math.round(scaleSmartParam(base.saturation ?? 0, 0, 30, colScale)),
+      temperature: Math.round(scaleSmartParam(base.temperature ?? 0, 0, 35, colScale)),
+      tint: Math.round(scaleSmartParam(base.tint ?? 0, 0, 35, colScale)),
+      hsl: base.hsl
+        ? {
+            ...(prev.hsl || ({} as any)),
+            ...base.hsl,
+            oranges: base.hsl.oranges
+              ? {
+                  hue: Math.round((base.hsl.oranges.hue || 0) * (sknScale / 100)),
+                  saturation: Math.round((base.hsl.oranges.saturation || 0) * (sknScale / 100)),
+                  luminance: Math.round((base.hsl.oranges.luminance || 0) * (sknScale / 100)),
+                }
+              : prev.hsl?.oranges,
+          }
+        : prev.hsl,
+    }));
+  };
+
+  // 1-Click QuickCorrect Micro-Nudge (S / E / R / G / B)
+  const handleQuickCorrectNudge = (channel: 'S' | 'E' | 'R' | 'G' | 'B', dir: 1 | -1) => {
+    setAdjustments((prev: Partial<Adjustments>) => {
+      if (channel === 'S') return { ...prev, vibrance: Math.max(-100, Math.min(100, (prev.vibrance || 0) + 5 * dir)) };
+      if (channel === 'E') return { ...prev, exposure: Number(Math.max(-5, Math.min(5, (prev.exposure || 0) + 0.1 * dir)).toFixed(2)) };
+      if (channel === 'R') return { ...prev, temperature: Math.max(-100, Math.min(100, (prev.temperature || 0) + 3 * dir)), tint: Math.max(-100, Math.min(100, (prev.tint || 0) + 2 * dir)) };
+      if (channel === 'G') return { ...prev, tint: Math.max(-100, Math.min(100, (prev.tint || 0) - 3 * dir)) };
+      return { ...prev, temperature: Math.max(-100, Math.min(100, (prev.temperature || 0) - 3 * dir)) };
+    });
   };
 
   const handleAdjustmentChange = (key: BasicAdjustment, value: any) => {
@@ -734,12 +902,7 @@ export default function BasicAdjustments({
     <div>
       {!isForMask && (
         <div className="mb-3">
-          {detectedSceneBadge && (
-            <div className="mb-1.5 px-2 py-1 rounded bg-amber-500/15 border border-amber-500/30 flex items-center justify-between text-[11px] text-amber-300 animate-fadeIn">
-              <span className="font-medium">AI Scene: {detectedSceneBadge}</span>
-              <span className="text-[10px] text-amber-400/80">Tailored Polish Applied</span>
-            </div>
-          )}
+
           <div className="grid grid-cols-5 gap-1">
             {/* 1-Click Auto Enhance Button */}
             <button
@@ -979,7 +1142,195 @@ export default function BasicAdjustments({
               )}
             </div>
           </div>
+
+          {/* Smart Editing Quick-Bar & Per-Pixel Diagnostic HUD */}
+          <div className="mt-2 p-2 rounded-md bg-card-active border border-border-color/50 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-1 flex-wrap">
+              <span className="text-[11px] font-semibold text-amber-300">
+                {smartDiag
+                  ? `AI Scene: ${smartDiag.sceneName}`
+                  : detectedSceneBadge
+                    ? `AI Scene: ${detectedSceneBadge}`
+                    : 'Smart Editing Ready'}
+              </span>
+              <label className="flex items-center gap-1 text-[10px] text-text-secondary cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoAnalyzeOnOpen}
+                  onChange={(e) => {
+                    if (appSettings) {
+                      handleSettingsChange({ ...appSettings, autoAnalyzeOnOpen: e.target.checked });
+                    }
+                  }}
+                  className="accent-amber-400 rounded-xs w-3 h-3"
+                />
+                Auto-Analyze on Open
+              </label>
+            </div>
+
+            {smartDiag && (
+              <div className="grid grid-cols-3 gap-1 text-[10px]">
+                <div className="px-1.5 py-0.5 rounded bg-surface text-emerald-300 truncate" title="Per-Pixel Exposure & Highlight Guard">
+                  EV: {smartDiag.perPixelEvStatus}
+                </div>
+                <div className="px-1.5 py-0.5 rounded bg-surface text-sky-300 truncate" title="Midrange-Normalized Color Cast Removal">
+                  WB: {smartDiag.tintCastStatus}
+                </div>
+                <div className="px-1.5 py-0.5 rounded bg-surface text-purple-300 truncate" title="Pre-Tone Noise Gate Status">
+                  NR: {smartDiag.noiseGateStatus}
+                </div>
+              </div>
+            )}
+
+            {/* Master 0..200% Super-Slider */}
+            <Slider
+              label="Smart Strength (%)"
+              min={0}
+              max={200}
+              step={1}
+              defaultValue={100}
+              value={masterStrength}
+              onChange={(e: any) => {
+                const v = parseInt(e.target.value, 10);
+                setMasterStrength(v);
+                applyCoupledSmartSliders(v, enhanceMacro, colorMacro, skinMacro);
+              }}
+              onDragStateChange={onDragStateChange}
+            />
+
+            {/* 3 Coupled Macro Sliders (Enhance, Rich Color & Cast, Skin Tone) */}
+            <div className="pl-2 border-l-2 border-amber-500/30 flex flex-col gap-1">
+              <Slider
+                label="Enhance & Per-Pixel Tone"
+                min={0}
+                max={200}
+                step={1}
+                defaultValue={100}
+                value={enhanceMacro}
+                onChange={(e: any) => {
+                  const v = parseInt(e.target.value, 10);
+                  setEnhanceMacro(v);
+                  applyCoupledSmartSliders(masterStrength, v, colorMacro, skinMacro);
+                }}
+                onDragStateChange={onDragStateChange}
+              />
+              <Slider
+                label="Rich Color & Cast Removal"
+                min={0}
+                max={200}
+                step={1}
+                defaultValue={100}
+                value={colorMacro}
+                onChange={(e: any) => {
+                  const v = parseInt(e.target.value, 10);
+                  setColorMacro(v);
+                  applyCoupledSmartSliders(masterStrength, enhanceMacro, v, skinMacro);
+                }}
+                onDragStateChange={onDragStateChange}
+              />
+              <Slider
+                label="Skin & Portrait Protection"
+                min={0}
+                max={200}
+                step={1}
+                defaultValue={100}
+                value={skinMacro}
+                onChange={(e: any) => {
+                  const v = parseInt(e.target.value, 10);
+                  setSkinMacro(v);
+                  applyCoupledSmartSliders(masterStrength, enhanceMacro, colorMacro, v);
+                }}
+                onDragStateChange={onDragStateChange}
+              />
+            </div>
+
+            {/* QuickCorrect S / E / R / G / B 1-Click Micro-Nudge Bar */}
+            <div className="flex items-center justify-between gap-1 pt-1 border-t border-border-color/40">
+              <span className="text-[10px] text-text-secondary">Quick Nudge:</span>
+              {(['S', 'E', 'R', 'G', 'B'] as const).map((ch) => (
+                <div key={ch} className="flex items-center rounded bg-surface border border-border-color/40 text-[10px]">
+                  <button
+                    type="button"
+                    onClick={() => handleQuickCorrectNudge(ch, -1)}
+                    className="px-1 py-0.5 hover:bg-surface-secondary text-text-secondary hover:text-text-primary"
+                    title={`Decrease ${ch}`}
+                  >
+                    -
+                  </button>
+                  <span className="px-1 font-semibold text-text-primary">{ch}</span>
+                  <button
+                    type="button"
+                    onClick={() => handleQuickCorrectNudge(ch, 1)}
+                    className="px-1 py-0.5 hover:bg-surface-secondary text-text-secondary hover:text-text-primary"
+                    title={`Increase ${ch}`}
+                  >
+                    +
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
+      )}
+      {!hiddenTools.includes('whiteBalance') && (
+        <AdjustmentSubSection
+          actions={
+            !isForMask && (
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={toggleWhiteBalanceMode}
+                  className={`w-6 h-6 flex items-center justify-center rounded-md text-xs font-semibold transition-colors ${
+                    isKelvinMode ? 'bg-accent text-button-text' : 'hover:bg-bg-secondary text-text-secondary'
+                  }`}
+                  data-tooltip={t('adjustments.color.kelvinModeTooltip')}
+                >
+                  K
+                </button>
+                {toggleWbPicker && (
+                  <button
+                    onClick={toggleWbPicker}
+                    className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
+                      isWbPickerActive ? 'bg-accent text-button-text' : 'hover:bg-bg-secondary text-text-secondary'
+                    }`}
+                    data-tooltip={t('adjustments.color.wbPickerTooltip')}
+                  >
+                    <Pipette size={16} />
+                  </button>
+                )}
+              </div>
+            )
+          }
+          id="whiteBalance"
+          order={toolOrder.indexOf('whiteBalance')}
+          title={t('adjustments.color.whiteBalance')}
+        >
+          <Slider
+            key={isKelvinMode ? 'kelvinTemperature' : 'temperature'}
+            defaultValue={kelvinAsShot?.temperature}
+            label={t('adjustments.color.temperature')}
+            max={kelvinAsShot ? MAX_TEMPERATURE : RELATIVE_RANGE}
+            min={kelvinAsShot ? MIN_TEMPERATURE : -RELATIVE_RANGE}
+            onChange={(e: SliderChangeEvent) => handleWhiteBalanceChange('temperature', e.target.value)}
+            scale={kelvinAsShot ? kelvinSliderScale : undefined}
+            step={kelvinAsShot ? 50 : 1}
+            suffix={kelvinAsShot ? 'K' : undefined}
+            value={displayedWhiteBalance.temperature}
+            trackClassName="temperature-gradient-track"
+            onDragStateChange={onDragStateChange}
+          />
+          <Slider
+            key={isKelvinMode ? 'kelvinTint' : 'tint'}
+            defaultValue={kelvinAsShot?.tint}
+            label={t('adjustments.color.tint')}
+            max={tintRange}
+            min={-tintRange}
+            onChange={(e: SliderChangeEvent) => handleWhiteBalanceChange('tint', e.target.value)}
+            step={1}
+            value={displayedWhiteBalance.tint}
+            trackClassName="tint-gradient-track"
+            onDragStateChange={onDragStateChange}
+          />
+        </AdjustmentSubSection>
       )}
       {hideTonemapper ? (
         <Slider
@@ -1053,6 +1404,13 @@ export default function BasicAdjustments({
         step={0.01}
         value={adjustments.brightness}
         onDragStateChange={onDragStateChange}
+      />
+      <LightsSubPipeline
+        adjustments={adjustments}
+        setAdjustments={setAdjustments}
+        onDragStateChange={onDragStateChange}
+        isForMask={isForMask}
+        defaultExpanded={false}
       />
     </div>
   );

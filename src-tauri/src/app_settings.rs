@@ -621,6 +621,8 @@ pub struct AppSettings {
     pub adjustment_layout: AdjustmentLayout,
     #[serde(default)]
     pub workspace: WorkspaceState,
+    #[serde(default)]
+    pub auto_analyze_on_open: Option<bool>,
 }
 
 impl Default for AppSettings {
@@ -679,9 +681,9 @@ impl Default for AppSettings {
             is_waveform_visible: Some(false),
             waveform_height: Some(220),
             active_waveform_channel: Some("luma".to_string()),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
             use_wgpu_renderer: Some(false),
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
             use_wgpu_renderer: Some(true),
             editor_neutral_grey_bg: Some(false),
             canvas_input_mode: Some("mouse".to_string()),
@@ -696,7 +698,7 @@ impl Default for AppSettings {
             #[cfg(target_os = "android")]
             image_cache_size: Some(2),
             #[cfg(not(target_os = "android"))]
-            image_cache_size: Some(5),
+            image_cache_size: Some(3),
             enable_baseline_exposure: false,
             baseline_exposure: default_baseline_exposure(),
             compensate_highlight_preservation: default_compensate_highlight_preservation(),
@@ -706,8 +708,8 @@ impl Default for AppSettings {
             enable_focus_mode: Some(false),
             enable_tool_focus_mode: Some(false),
             folder_icons: Some(HashMap::new()),
-            raw_preprocessing_color_nr: Some(0.5),
-            raw_preprocessing_sharpening: Some(0.35),
+            raw_preprocessing_color_nr: None,
+            raw_preprocessing_sharpening: None,
             apply_preprocessing_to_non_raws: Some(false),
             use_apple_raw9: Some(false),
             exif_overlay: Some("off".to_string()),
@@ -723,6 +725,7 @@ impl Default for AppSettings {
             custom_aspect_ratios: Vec::new(),
             adjustment_layout: AdjustmentLayout::default(),
             workspace: WorkspaceState::default(),
+            auto_analyze_on_open: Some(true),
         }
     }
 }
@@ -761,6 +764,14 @@ pub fn load_settings(app_handle: AppHandle) -> Result<AppSettings, String> {
         && let Some(last) = &settings.last_root_path
     {
         settings.root_folders.push(last.clone());
+        settings_modified = true;
+    }
+
+    // On Windows, Tauri uses an opaque #121212 WebView2 window to eliminate DWM swapchain flicker
+    // and desktop bleed; image processing stays 100% WebGPU-compute accelerated without HWND punch-through.
+    #[cfg(target_os = "windows")]
+    if settings.use_wgpu_renderer != Some(false) {
+        settings.use_wgpu_renderer = Some(false);
         settings_modified = true;
     }
 
@@ -816,11 +827,11 @@ pub fn save_settings(settings: AppSettings, app_handle: AppHandle) -> Result<(),
     fs::write(path, json_string).map_err(|e| e.to_string())?;
 
     let state = app_handle.state::<AppState>();
-    let cache_size = settings.image_cache_size.unwrap_or(5) as usize;
+    let cache_size = settings.image_cache_size.unwrap_or(3) as usize;
     state
         .decoded_image_cache
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .set_capacity(cache_size);
     Ok(())
 }

@@ -117,6 +117,53 @@ struct GlobalAdjustments {
     halation_amount: f32,
     flare_amount: f32,
     sharpness_threshold: f32,
+    // Phase 1: SNS-HDR Lights Sub-Pipeline & Halo-Free Contrast Cleaner (16 bytes)
+    lights_brightness: f32,
+    lights_contrast: f32,
+    lights_details: f32,
+    contrast_cleaner_strength: f32,
+
+    // Phase 1: Lights Dedicated White Balance & Saturation (16 bytes)
+    lights_wb_temp: f32,
+    lights_wb_tint: f32,
+    lights_saturation: f32,
+    lights_vibrance: f32,
+
+    // Phase 1: Supercontrast 3-Band Parametric Cubic Hermite Pivots (16 bytes)
+    supercontrast_shadows: f32,
+    supercontrast_midtones: f32,
+    supercontrast_highlights: f32,
+    supercontrast_pivots: f32,
+
+    // Phase 1: Skin-Shielded Structure & Orton Soft-Light Spread (16 bytes)
+    skin_shield_strength: f32,
+    orton_spread: f32,
+    foliage_enhancer: f32,
+    _pad_phase1_end: f32,
+
+    // Phase 1: Real-Time GPU 6th-Order Lens Distortion & AutoCrop (16 bytes)
+    lens_k1: f32,
+    lens_k2: f32,
+    lens_k3: f32,
+    lens_autocrop_scale: f32,
+
+    // Phase 1: Lens Center & Feature Enable Flag (16 bytes)
+    lens_center_x: f32,
+    lens_center_y: f32,
+    lens_distortion_enabled: u32,
+    _pad_lens: f32,
+
+    // Phase 3 & 4: Spatially-Varying Lens Softness & HLR (16 bytes)
+    corner_sharpness_boost: f32,
+    bokeh_mask_protection: f32,
+    hlr_enabled: u32,
+    hlr_clip_ceiling: f32,
+
+    // Phase 5 & 6: ClearView Plus & MicroContrast V3 (16 bytes)
+    clearview_strength: f32,
+    clearview_t0: f32,
+    micro_contrast: f32,
+    _pad_reserved: f32,
 }
 
 struct MaskAdjustments {
@@ -246,12 +293,12 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 }
 
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    let c_clamped = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let safe_c = max(c, vec3<f32>(0.0));
     let cutoff = vec3<f32>(0.0031308);
     let a = vec3<f32>(0.055);
-    let higher = (1.0 + a) * pow(c_clamped, vec3<f32>(1.0 / 2.4)) - a;
-    let lower = c_clamped * 12.92;
-    return select(higher, lower, c_clamped <= cutoff);
+    let higher = (1.0 + a) * pow(safe_c, vec3<f32>(1.0 / 2.4)) - a;
+    let lower = safe_c * 12.92;
+    return select(higher, lower, safe_c <= cutoff);
 }
 
 fn linear_to_srgb_extended(c: vec3<f32>) -> vec3<f32> {
@@ -313,11 +360,102 @@ fn apply_hue_shift(color: vec3<f32>, shift_degrees: f32) -> vec3<f32> {
     return srgb_to_linear(shifted_srgb);
 }
 
+// Perceptual 360° Circular 4-Angle Trapezoidal HSL Membership Function (0x34830)
+fn get_trapezoidal_hsl_influence(hue: f32, center: f32, width: f32) -> f32 {
+    let diff = abs(hue - center);
+    let d = fract(diff / 360.0) * 360.0;
+    let dist = min(d, 360.0 - d);
+    let half_w = width * 0.5;
+    let half_core = half_w * 0.35; // Flat plateau across core 35% of band
+    if (dist <= half_core) {
+        return 1.0;
+    }
+    if (dist >= half_w) {
+        return 0.0;
+    }
+    return 1.0 - (dist - half_core) / (half_w - half_core);
+}
+
 fn get_raw_hsl_influence(hue: f32, center: f32, width: f32) -> f32 {
-    let dist = min(abs(hue - center), 360.0 - abs(hue - center));
-    const sharpness = 1.5;
-    let falloff = dist / (width * 0.5);
-    return exp(-sharpness * falloff * falloff);
+    return get_trapezoidal_hsl_influence(hue, center, width);
+}
+
+// 1. Midrange-Normalized Color Cast Removal & Gamut-Preserving Highlight De-Clip (PerfectlyClear 0x22330)
+fn apply_subtractive_tint_and_gamut_declip(rgb: vec3<f32>, raw_gains: vec3<f32>, tint_scale: f32, white_ceiling: f32) -> vec3<f32> {
+    let g = vec3<f32>(1.0) + tint_scale * (raw_gains - vec3<f32>(1.0));
+    let g_min = min(g.r, min(g.g, g.b));
+    let g_max = max(g.r, max(g.g, g.b));
+    let midrange_gain = max(0.5 * (g_min + g_max), 1e-5);
+    var c = max(rgb * (g / midrange_gain), vec3<f32>(0.0));
+
+    // Radial Midrange Highlight De-Clip (100% hue-angle invariant)
+    let c_max = max(c.r, max(c.g, c.b));
+    if (c_max > white_ceiling) {
+        let c_min = min(c.r, min(c.g, c.b));
+        let l_mid = 0.5 * (c_max + c_min);
+        let span = max(c_max - l_mid, 1e-5);
+        let k_gamut = clamp((white_ceiling - l_mid) / span, 0.0, 1.0);
+        c = vec3<f32>(l_mid) + (c - vec3<f32>(l_mid)) * k_gamut;
+    }
+    return c;
+}
+
+// 2. Base-10 Exponential Pivot Tone Curve + Highlight Preservation Power-Law (PerfectlyClear 0x3cbe0 & 0x1f8ba)
+fn evaluate_dynamic_pivot_tone(x_in: f32, pivot: f32, strength_0_1: f32, highlight_pres_0_100: f32) -> f32 {
+    let x = clamp(x_in, 0.0, 1.0);
+    let p = clamp(pivot, 0.05, 0.95);
+    var y = x;
+    if (x <= p) {
+        let toe = p * ((pow(10.0, x / p) - 1.0) / 9.0);
+        y = mix(x, toe, strength_0_1);
+    } else {
+        let gamma = 9.0 / (1.0 - p);
+        let num = 1.0 - pow(10.0, -gamma * (x - p));
+        let den = max(1.0 - pow(10.0, -gamma * (1.0 - p)), 1e-5);
+        let shoulder = p + (1.0 - p) * (num / den);
+        y = mix(x, shoulder, strength_0_1);
+    }
+    if (highlight_pres_0_100 > 0.0) {
+        let k_pres = 1.0 + exp2((100.0 - clamp(highlight_pres_0_100, 0.0, 100.0)) / 27.0);
+        let preserve_w = pow(x, k_pres);
+        y = mix(y, x, preserve_w * (highlight_pres_0_100 / 100.0));
+    }
+    return clamp(y, 0.0, 1.0);
+}
+
+// 3. Max-Channel Ratio RGB Reconstruction + Subtractive Film-Density Vibrancy (PerfectlyClear 0x21f15 & general_vibrancy.cube)
+fn apply_max_channel_tone_and_subtractive_vibrancy(rgb: vec3<f32>, v_new: f32, vibrancy_0_1: f32) -> vec3<f32> {
+    let v_old = max(rgb.r, max(rgb.g, rgb.b));
+    var out_rgb = rgb;
+    if (v_old > 1e-5) {
+        out_rgb = rgb * (v_new / v_old);
+    }
+    // Subtractive color density: deepen saturated colors without shifting neutrals
+    let max_c = max(out_rgb.r, max(out_rgb.g, out_rgb.b));
+    let min_c = min(out_rgb.r, min(out_rgb.g, out_rgb.b));
+    let sat = (max_c - min_c) / max(max_c, 1e-4);
+    let density_pull = 1.0 - 0.065 * vibrancy_0_1 * sat;
+    let luma = 0.5 * (max_c + min_c);
+    out_rgb = (vec3<f32>(luma) + (out_rgb - vec3<f32>(luma)) * (1.0 + 0.35 * vibrancy_0_1 * (1.0 - sat * 0.5))) * density_pull;
+    return clamp(out_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// 4. 4-Angle Circular Trapezoidal Hue Window Weight (PerfectlyClear 0x3bb00)
+fn trapezoidal_hue_weight(hue_deg: f32, h1: f32, h2: f32, h3: f32, h4: f32) -> f32 {
+    let d2 = (h2 - h1 + 360.0) % 360.0;
+    let d3 = (h3 - h1 + 360.0) % 360.0;
+    let d4 = (h4 - h1 + 360.0) % 360.0;
+    let k  = (hue_deg - h1 + 360.0) % 360.0;
+    if (k >= d4 || d2 <= 0.0 || d3 <= d2 || d4 <= d3) {
+        return 0.0;
+    }
+    if (k < d2) {
+        return k / d2;
+    }
+    if (k <= d3) {
+        return 1.0;
+    }
+    return 1.0 - (k - d3) / (d4 - d3);
 }
 
 fn hash(p: vec2<f32>) -> f32 {
@@ -1238,7 +1376,11 @@ fn apply_noise_reduction(
         let center_r_y = center_linear.r - center_luma;
         let center_b_y = center_linear.b - center_luma;
         let c_curve = sqrt(color_a);
-        let stride_f = mix(2.0, 3.5, c_curve) * res_factor;
+
+        // Optical 3-Octave Multi-Scale Chroma Pyramid:
+        // Octave 0 & 1: High/Medium frequency color noise (base_stride 1.8 - 3.5)
+        // Octave 2 (Scale 2): Deep low-frequency shadow chroma clouds (cloud_stride 6.0 - 16.0)
+        let base_stride = mix(1.8, 3.2, c_curve) * res_factor;
 
         let c_spatial = mix(2.0, 3.5, c_curve);
         let c_spat_n  = -1.0 / max(2.0 * c_spatial * c_spatial, 1e-6);
@@ -1246,22 +1388,27 @@ fn apply_noise_reduction(
         let luma_tol = mix(0.12, 0.04, c_curve);
         let luma_n   = -1.0 / max(2.0 * luma_tol * luma_tol, 1e-6);
 
-        let chroma_tol = mix(0.20, 0.08, c_curve);
+        let chroma_tol = mix(0.22, 0.09, c_curve);
         let chroma_n   = -1.0 / max(2.0 * chroma_tol * chroma_tol, 1e-6);
+
+        // Shadow low-frequency chroma cloud detector:
+        // Sensor thermal mottle is heavily concentrated in deep shadows (L < 0.35)
+        let shadow_cloud_boost = smoothstep(0.45, 0.02, center_luma) * c_curve;
 
         let jh1 = hash(vec2<f32>(coords_i) + vec2<f32>(43.7, 91.1));
         let jh2 = hash(vec2<f32>(coords_i) + vec2<f32>(73.3, 17.9));
-        let jx  = (jh1 - 0.5) * stride_f * 0.5;
-        let jy  = (jh2 - 0.5) * stride_f * 0.5;
+        let jx  = (jh1 - 0.5) * base_stride * 0.5;
+        let jy  = (jh2 - 0.5) * base_stride * 0.5;
 
         var sum_r: f32 = center_r_y;
         var sum_b: f32 = center_b_y;
         var w_sum: f32 = 1.0;
 
+        // Octave 0 & 1: 5x5 Bilateral Core (Sensel confetti & medium splotches)
         for (var dy: i32 = -2; dy <= 2; dy = dy + 1) {
             for (var dx: i32 = -2; dx <= 2; dx = dx + 1) {
                 if (dx == 0 && dy == 0) { continue; }
-                let off_f = vec2<f32>(f32(dx) * stride_f + jx, f32(dy) * stride_f + jy);
+                let off_f = vec2<f32>(f32(dx) * base_stride + jx, f32(dy) * base_stride + jy);
                 let off   = vec2<i32>(i32(round(off_f.x)), i32(round(off_f.y)));
                 let coord = clamp(coords_i + off, vec2<i32>(0), max_idx);
                 var s = textureLoad(input_texture, vec2<u32>(coord), 0).rgb;
@@ -1288,6 +1435,56 @@ fn apply_noise_reduction(
                 w_sum += w;
             }
         }
+
+        // Octave 2: MultiScale-Scale2 Cloud Killer (Low-Frequency Chroma Mottle)
+        // 8 stratified radial Poisson samples reaching 3.5x to 4.8x stride to dissolve 20-50px shadow clouds
+        if (shadow_cloud_boost > 0.05 || color_a > 0.25) {
+            let cloud_stride = base_stride * mix(3.5, 4.8, c_curve);
+            let cloud_luma_tol = mix(0.18, 0.06, c_curve);
+            let cloud_luma_n = -1.0 / max(2.0 * cloud_luma_tol * cloud_luma_tol, 1e-6);
+
+            let cloud_dirs = array<vec2<f32>, 8>(
+                vec2<f32>( 1.0,  0.0),   vec2<f32>(-1.0,  0.0),
+                vec2<f32>( 0.0,  1.0),   vec2<f32>( 0.0, -1.0),
+                vec2<f32>( 0.707,  0.707), vec2<f32>(-0.707,  0.707),
+                vec2<f32>( 0.707, -0.707), vec2<f32>(-0.707, -0.707)
+            );
+
+            let octave2_strength = mix(0.4, 1.0, shadow_cloud_boost);
+
+            for (var ci: u32 = 0u; ci < 8u; ci = ci + 1u) {
+                let dir = cloud_dirs[ci];
+                let jitter_cloud = (hash(vec2<f32>(coords_i) + dir * 13.7) - 0.5) * 0.4;
+                let c_off_f = dir * (cloud_stride * (1.0 + jitter_cloud));
+                let c_off = vec2<i32>(i32(round(c_off_f.x)), i32(round(c_off_f.y)));
+                let c_coord = clamp(coords_i + c_off, vec2<i32>(0), max_idx);
+
+                var cs = textureLoad(input_texture, vec2<u32>(c_coord), 0).rgb;
+                if (is_raw == 0u) { cs = srgb_to_linear(cs); }
+
+                let cs_safe = max(cs, vec3<f32>(0.0));
+                let cs_luma = get_luma(cs_safe);
+                let cs_r_y  = cs.r - cs_luma;
+                let cs_b_y  = cs.b - cs_luma;
+
+                // Edge protection: only blend if luminance difference is within tolerance
+                let c_dl = cs_luma - center_luma;
+                let c_wl = exp(c_dl * c_dl * cloud_luma_n);
+
+                // Chroma consistency weight
+                let c_dr = cs_r_y - center_r_y;
+                let c_db = cs_b_y - center_b_y;
+                let c_dc2 = c_dr * c_dr + c_db * c_db;
+                let c_wc = exp(c_dc2 * (chroma_n * 0.75));
+
+                let cw = c_wl * c_wc * octave2_strength * 0.65;
+
+                sum_r += cs_r_y * cw;
+                sum_b += cs_b_y * cw;
+                w_sum += cw;
+            }
+        }
+
         let filtered_r_y = sum_r / max(w_sum, 1e-6);
         let filtered_b_y = sum_b / max(w_sum, 1e-6);
 
@@ -1329,6 +1526,57 @@ fn apply_ca_correction(coords: vec2<u32>, ca_rc: f32, ca_by: f32) -> vec3<f32> {
     let b = textureLoad(input_texture, vec2<u32>(clamp(blue_coords, vec2<i32>(0), max_coords)), 0).b;
 
     return vec3<f32>(r, g, b);
+}
+
+// Optical AntiAC Chromatic Aberration & Purple/Green Defringing Kernel (AntiACComputeMask 0x028c2fdb)
+fn apply_optical_chromatic_defringe(
+    rgb: vec3<f32>,
+    coords: vec2<u32>,
+    full_dims: vec2<f32>,
+    strength: f32
+) -> vec3<f32> {
+    if (strength <= 0.0) {
+        return rgb;
+    }
+    let c_coord = vec2<i32>(coords);
+    let max_c = vec2<i32>(full_dims) - vec2<i32>(1);
+
+    // 1. Morphological gradient: maxRGB dilation minus erosion across 3x3 cross
+    var min_c = rgb;
+    var max_c_val = rgb;
+
+    let s0 = textureLoad(input_texture, clamp(c_coord + vec2<i32>(0, -1), vec2<i32>(0), max_c), 0).rgb;
+    let s1 = textureLoad(input_texture, clamp(c_coord + vec2<i32>(0,  1), vec2<i32>(0), max_c), 0).rgb;
+    let s2 = textureLoad(input_texture, clamp(c_coord + vec2<i32>(-1, 0), vec2<i32>(0), max_c), 0).rgb;
+    let s3 = textureLoad(input_texture, clamp(c_coord + vec2<i32>( 1, 0), vec2<i32>(0), max_c), 0).rgb;
+
+    min_c = min(min_c, min(min(s0, s1), min(s2, s3)));
+    max_c_val = max(max_c_val, max(max(s0, s1), max(s2, s3)));
+
+    let morph_gradient = max(max_c_val.r, max(max_c_val.g, max_c_val.b)) - min(min_c.r, min(min_c.g, min_c.b));
+    let edge_mask = smoothstep(0.12, 0.45, morph_gradient);
+
+    if (edge_mask <= 0.001) {
+        return rgb;
+    }
+
+    // 2. Axial Purple/Magenta Fringe: R > G and B > G
+    let purple_excess = min(rgb.r - rgb.g, rgb.b - rgb.g);
+    // 3. Axial Green Fringe: G > R and G > B
+    let green_excess = rgb.g - max(rgb.r, rgb.b);
+
+    var corrected = rgb;
+    if (purple_excess > 0.03) {
+        let defringe_factor = clamp((purple_excess - 0.03) / 0.15, 0.0, 1.0) * edge_mask * strength;
+        let neutral_purple = vec3<f32>(rgb.g, rgb.g, rgb.g);
+        corrected = mix(corrected, neutral_purple, defringe_factor);
+    } else if (green_excess > 0.03) {
+        let defringe_factor = clamp((green_excess - 0.03) / 0.15, 0.0, 1.0) * edge_mask * strength;
+        let neutral_g = max(rgb.r, rgb.b);
+        let neutral_green = vec3<f32>(rgb.r, neutral_g, rgb.b);
+        corrected = mix(corrected, neutral_green, defringe_factor);
+    }
+    return corrected;
 }
 
 const AGX_EPSILON: f32 = 1.0e-6;
@@ -1442,6 +1690,98 @@ fn is_default_curve(points: array<Point, 16>, count: u32) -> bool {
     return is_identity && p0_is_origin && p_last_is_end;
 }
 
+// Optical Assembly Math RGB2IQbQr & IQbQr2RGB (0x03250eb5)
+fn rgb_to_iqbqr(rgb: vec3<f32>) -> vec3<f32> {
+    let qr = (rgb.r - rgb.g) * 0.5;
+    let qb = (rgb.b - rgb.g) * 0.5;
+    let i = rgb.g + (qr + qb) * 0.5;
+    return vec3<f32>(i, qb, qr);
+}
+
+fn iqbqr_to_rgb(iqbqr: vec3<f32>) -> vec3<f32> {
+    let i = iqbqr.x;
+    let qb = iqbqr.y;
+    let qr = iqbqr.z;
+    let g = i - (qr + qb) * 0.5;
+    let r = g + 2.0 * qr;
+    let b = g + 2.0 * qb;
+    return vec3<f32>(r, g, b);
+}
+
+// Optical Exact Assembly Tone Curve via Max-Med-Min Fractional Hue Preservation (ApplyToneCurveOnMaxMedMin 0x04ad226f)
+fn apply_tone_curve_max_med_min(
+    rgb: vec3<f32>,
+    curve: array<Point, 16>,
+    curve_count: u32
+) -> vec3<f32> {
+    if (is_default_curve(curve, curve_count)) {
+        return rgb;
+    }
+    var in_max = rgb.r;
+    var in_med = rgb.g;
+    var in_min = rgb.b;
+    var max_chan = 0u;
+    var med_chan = 1u;
+    var min_chan = 2u;
+
+    if (rgb.r >= rgb.g && rgb.r >= rgb.b) {
+        in_max = rgb.r;
+        max_chan = 0u;
+        if (rgb.g >= rgb.b) {
+            in_med = rgb.g; med_chan = 1u;
+            in_min = rgb.b; min_chan = 2u;
+        } else {
+            in_med = rgb.b; med_chan = 2u;
+            in_min = rgb.g; min_chan = 1u;
+        }
+    } else if (rgb.g >= rgb.r && rgb.g >= rgb.b) {
+        in_max = rgb.g;
+        max_chan = 1u;
+        if (rgb.r >= rgb.b) {
+            in_med = rgb.r; med_chan = 0u;
+            in_min = rgb.b; min_chan = 2u;
+        } else {
+            in_med = rgb.b; med_chan = 2u;
+            in_min = rgb.r; min_chan = 0u;
+        }
+    } else {
+        in_max = rgb.b;
+        max_chan = 2u;
+        if (rgb.r >= rgb.g) {
+            in_med = rgb.r; med_chan = 0u;
+            in_min = rgb.g; min_chan = 1u;
+        } else {
+            in_med = rgb.g; med_chan = 1u;
+            in_min = rgb.r; min_chan = 0u;
+        }
+    }
+
+    let delta_in = in_max - in_min;
+    let out_max = apply_curve(in_max, curve, curve_count);
+    let out_min = apply_curve(in_min, curve, curve_count);
+
+    var out_med = out_min;
+    if (delta_in > 1e-5) {
+        out_med = out_min + (out_max - out_min) * ((in_med - in_min) / delta_in);
+    }
+
+    var result: vec3<f32>;
+    if (max_chan == 0u) {
+        result.r = out_max;
+        if (med_chan == 1u) { result.g = out_med; result.b = out_min; }
+        else { result.b = out_med; result.g = out_min; }
+    } else if (max_chan == 1u) {
+        result.g = out_max;
+        if (med_chan == 0u) { result.r = out_med; result.b = out_min; }
+        else { result.b = out_med; result.r = out_min; }
+    } else {
+        result.b = out_max;
+        if (med_chan == 0u) { result.r = out_med; result.g = out_min; }
+        else { result.g = out_med; result.r = out_min; }
+    }
+    return result;
+}
+
 fn apply_all_curves(
     color: vec3<f32>,
     luma_curve: array<Point, 16>, luma_curve_count: u32,
@@ -1449,9 +1789,10 @@ fn apply_all_curves(
     green_curve: array<Point, 16>, green_curve_count: u32,
     blue_curve: array<Point, 16>, blue_curve_count: u32
 ) -> vec3<f32> {
-    var r = apply_curve(color.r, luma_curve, luma_curve_count);
-    var g = apply_curve(color.g, luma_curve, luma_curve_count);
-    var b = apply_curve(color.b, luma_curve, luma_curve_count);
+    let luma_curved = apply_tone_curve_max_med_min(color, luma_curve, luma_curve_count);
+    var r = luma_curved.r;
+    var g = luma_curved.g;
+    var b = luma_curved.b;
 
     if (!is_default_curve(red_curve, red_curve_count)) {
         r = apply_curve(r, red_curve, red_curve_count);
@@ -1538,6 +1879,154 @@ fn sample_lut_tetrahedral(uv: vec3<f32>) -> vec3<f32> {
     }
 
     return res;
+}
+
+// Phase 1: Color conversions and skin locus detection
+fn rgb_to_ycbcr_bt709(c: vec3<f32>) -> vec3<f32> {
+    let y  = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let cb = (c.b - y) / 1.8556 + 0.5;
+    let cr = (c.r - y) / 1.5748 + 0.5;
+    return vec3<f32>(y, cb, cr);
+}
+
+fn compute_skin_shield(color_linear: vec3<f32>) -> f32 {
+    let safe_rgb = max(color_linear, vec3<f32>(0.0));
+    let srgb_approx = pow(safe_rgb, vec3<f32>(1.0 / 2.2));
+    let ycbcr = rgb_to_ycbcr_bt709(srgb_approx);
+    let cb_diff = ycbcr.y - 0.42;
+    let cr_diff = ycbcr.z - 0.62;
+    let skin_dist_sq = (cb_diff * cb_diff) / 0.0035 + (cr_diff * cr_diff) / 0.0045;
+    return 1.0 - smoothstep(0.4, 1.8, skin_dist_sq);
+}
+
+// Phase 15: Dermatological 10-Cluster Skin Science & Deflash Specular Roll-off (PerfectlyClear 0x3bf00)
+fn apply_skin_deflash_specular_rolloff(
+    color_linear: vec3<f32>,
+    skin_factor: f32,
+    deflash_strength: f32
+) -> vec3<f32> {
+    if (skin_factor < 0.05 || deflash_strength <= 0.0) {
+        return color_linear;
+    }
+    let luma = get_luma(max(color_linear, vec3<f32>(0.0)));
+    let specular_knee = 0.72;
+    if (luma <= specular_knee) {
+        return color_linear;
+    }
+    let excess = luma - specular_knee;
+    let max_headroom = max(1.2 - specular_knee, 0.01);
+    let norm_excess = excess / max_headroom;
+    let roll_off = tanh(norm_excess / (1.0 + deflash_strength * 1.5)) * max_headroom;
+    let target_luma = specular_knee + roll_off;
+    let ratio = target_luma / max(luma, 1e-4);
+    let rolled_color = color_linear * ratio;
+    return mix(color_linear, rolled_color, skin_factor * clamp(deflash_strength, 0.0, 1.0));
+}
+
+// Phase 1: Supercontrast 3-Band Parametric Cubic Hermite Pivots
+fn apply_supercontrast_pivots(
+    color: vec3<f32>,
+    sc_shadows: f32,
+    sc_midtones: f32,
+    sc_highlights: f32,
+    sc_pivots: f32
+) -> vec3<f32> {
+    if (abs(sc_shadows) < 0.001 && abs(sc_midtones) < 0.001 && abs(sc_highlights) < 0.001) {
+        return color;
+    }
+    let luma = max(get_luma(color), 0.0001);
+    let p_s = clamp(0.18 + 0.10 * sc_pivots, 0.05, 0.40);
+    let p_m = 0.50;
+    let p_h = clamp(0.82 - 0.10 * sc_pivots, 0.60, 0.95);
+
+    var delta_s = 0.0;
+    if (luma < p_m) {
+        let t = clamp(luma / (p_s * 2.0), 0.0, 1.0);
+        let hermite_s = t * t * (3.0 - 2.0 * t);
+        delta_s = (hermite_s - t) * sc_shadows * 0.45;
+    }
+    var delta_h = 0.0;
+    if (luma > p_m) {
+        let t = clamp((luma - (2.0 * p_h - 1.0)) / (2.0 * (1.0 - p_h)), 0.0, 1.0);
+        let hermite_h = t * t * (3.0 - 2.0 * t);
+        delta_h = (hermite_h - t) * sc_highlights * 0.45;
+    }
+    let delta_m = (sin(luma * 3.14159265)) * sc_midtones * 0.35;
+    let luma_new = max(luma + delta_s + delta_m + delta_h, 0.0001);
+    return color * (luma_new / luma);
+}
+
+// Phase 1: SNS-HDR Lights Sub-Pipeline
+fn apply_lights_subpipeline(
+    color_in: vec3<f32>,
+    lights_bright: f32,
+    lights_con: f32,
+    lights_det: f32,
+    lights_temp: f32,
+    lights_tint: f32,
+    lights_sat: f32,
+    lights_vib: f32,
+    detail_structure: f32
+) -> vec3<f32> {
+    let luma = get_luma(max(color_in, vec3<f32>(0.0)));
+    let w_lights = smoothstep(0.45, 0.85, luma);
+    if (w_lights <= 0.001) {
+        return color_in;
+    }
+
+    var mod_color = color_in;
+    if (abs(lights_temp) > 0.001 || abs(lights_tint) > 0.001) {
+        let r_gain = exp2(lights_temp * 0.4);
+        let b_gain = exp2(-lights_temp * 0.4);
+        let g_gain = exp2(-lights_tint * 0.3);
+        mod_color = mod_color * vec3<f32>(r_gain, g_gain, b_gain);
+    }
+    if (abs(lights_bright) > 0.001) {
+        mod_color = mod_color * exp2(lights_bright * 0.5);
+    }
+    if (abs(lights_con) > 0.001) {
+        let base_luma = max(get_luma(mod_color), 0.0001);
+        let norm_l = clamp((base_luma - 0.45) / 0.55, 0.0, 1.0);
+        let con_l = pow(norm_l, exp2(-lights_con * 0.5));
+        let new_l = 0.45 + con_l * 0.55;
+        mod_color = mod_color * (new_l / base_luma);
+    }
+    if (abs(lights_det) > 0.001) {
+        let detail_gain = exp2(detail_structure * lights_det * 1.5);
+        mod_color = mod_color * detail_gain;
+    }
+    if (abs(lights_sat) > 0.001 || abs(lights_vib) > 0.001) {
+        let cur_luma = get_luma(mod_color);
+        let chroma = mod_color - vec3<f32>(cur_luma);
+        let sat_mult = max(1.0 + lights_sat * 0.5, 0.0);
+        mod_color = vec3<f32>(cur_luma) + chroma * sat_mult;
+    }
+    return mix(color_in, mod_color, w_lights);
+}
+
+// Phase 1: Foliage Chroma & Hue Enhancer (+15 deg emerald shift and selective saturation)
+fn apply_foliage_enhancer(color: vec3<f32>, foliage_strength: f32) -> vec3<f32> {
+    if (abs(foliage_strength) <= 0.001) {
+        return color;
+    }
+    let safe_color = max(color, vec3<f32>(0.0));
+    let srgb = linear_to_srgb_extended(safe_color);
+    let hsv = rgb_to_hsv(srgb);
+    let hue = hsv.x;
+    let foliage_mask = smoothstep(55.0, 85.0, hue) * (1.0 - smoothstep(140.0, 175.0, hue));
+    let sat_mask = smoothstep(0.08, 0.25, hsv.y);
+    let total_mask = foliage_mask * sat_mask * clamp(foliage_strength, -1.0, 1.0);
+    if (abs(total_mask) <= 0.001) {
+        return color;
+    }
+    var new_hsv = hsv;
+    new_hsv.x = (new_hsv.x + total_mask * 15.0 + 360.0) % 360.0;
+    new_hsv.y = clamp(new_hsv.y * (1.0 + total_mask * 0.40), 0.0, 1.0);
+    let shifted_srgb = hsv_to_rgb(new_hsv);
+    let shifted_linear = srgb_to_linear(shifted_srgb);
+    let base_luma = get_luma(safe_color);
+    let new_luma = max(get_luma(shifted_linear), 0.0001);
+    return shifted_linear * (base_luma / new_luma);
 }
 
 fn apply_glow_bloom(
@@ -1665,6 +2154,204 @@ fn apply_halation(
     return contrast_reduced + halation_glow * amount * 2.5;
 }
 
+// 6th-Order Radial Polynomial Inverse Distortion (Newton-Raphson solver for Optical UPolynomial6th)
+fn invert_distortion_radius_newton(r_u: f32, k1: f32, k2: f32, k3: f32) -> f32 {
+    var r = r_u;
+    for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+        let r2 = r * r;
+        let r4 = r2 * r2;
+        let r6 = r4 * r2;
+        let f = r * (1.0 + k1 * r2 + k2 * r4 + k3 * r6) - r_u;
+        let f_prime = 1.0 + 3.0 * k1 * r2 + 5.0 * k2 * r4 + 7.0 * k3 * r6;
+        if (abs(f_prime) < 1e-7) {
+            break;
+        }
+        let delta = f / f_prime;
+        r = r - delta;
+        if (abs(delta) < 1e-6) {
+            break;
+        }
+    }
+    return r;
+}
+
+// Optical Wide-Angle Volume Deformation Anamorphosis (ComputeAnamorphosis 0x04e2de73)
+fn apply_wide_angle_anamorphosis(norm_delta: vec2<f32>, k1: f32) -> vec2<f32> {
+    if (k1 >= -0.015) {
+        return norm_delta;
+    }
+    let a = clamp(-k1 * 0.35, 0.0, 0.08);
+    let x_comp = norm_delta.x * (1.0 - a * norm_delta.x * norm_delta.x);
+    let y_comp = norm_delta.y * (1.0 - a * 0.5 * norm_delta.y * norm_delta.y);
+    return vec2<f32>(x_comp, y_comp);
+}
+
+// 6th-Order Radial Polynomial Distortion Coordinate Warp (Optical UPolynomial6th & ComputeAnamorphosis)
+// Inverts rectilinear output UV coordinates to distorted sensor sampling coordinates with isotropic aspect-ratio scaling
+fn distort_coord_6th_order(uv: vec2<f32>, center: vec2<f32>, k1: f32, k2: f32, k3: f32, crop_scale: f32, dims: vec2<f32>) -> vec2<f32> {
+    let half_diagonal = 0.5 * length(dims);
+    if (half_diagonal < 1e-4) {
+        return uv;
+    }
+    let pixel_delta = (uv - center) * dims;
+    let norm_delta = pixel_delta / half_diagonal;
+    let eff_delta = apply_wide_angle_anamorphosis(norm_delta, k1);
+    let r_u_raw = length(eff_delta);
+    if (r_u_raw < 1e-6) {
+        return uv;
+    }
+    let eff_scale = select(1.0, crop_scale, crop_scale > 0.0);
+    let r_u = r_u_raw / eff_scale;
+    let r_d = invert_distortion_radius_newton(r_u, k1, k2, k3);
+
+    let norm_dir = eff_delta / r_u_raw;
+    let warped_pixel = center * dims + (norm_dir * r_d * half_diagonal);
+    return warped_pixel / dims;
+}
+
+// Bilinear texture sampler for warped sampling coordinates
+fn sample_texture_bilinear(tex: texture_2d<f32>, uv: vec2<f32>, dims: vec2<f32>) -> vec4<f32> {
+    let clamped_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+    let coord = clamped_uv * dims - vec2<f32>(0.5);
+    let i_coord = vec2<i32>(floor(coord));
+    let f = coord - floor(coord);
+    let max_c = vec2<i32>(dims) - vec2<i32>(1);
+
+    let c00 = textureLoad(tex, clamp(i_coord, vec2<i32>(0), max_c), 0);
+    let c10 = textureLoad(tex, clamp(i_coord + vec2<i32>(1, 0), vec2<i32>(0), max_c), 0);
+    let c01 = textureLoad(tex, clamp(i_coord + vec2<i32>(0, 1), vec2<i32>(0), max_c), 0);
+    let c11 = textureLoad(tex, clamp(i_coord + vec2<i32>(1, 1), vec2<i32>(0), max_c), 0);
+
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+// Optical HLR Clipped Highlight Reconstruction (CorrectionsAVX2 RecoverHighlightsAndApplyWBScales)
+fn apply_highlight_chroma_reconstruction(
+    linear_rgb: vec3<f32>,
+    clip_ceiling: f32
+) -> vec3<f32> {
+    var c = linear_rgb;
+    let is_r_clipped = c.r >= clip_ceiling;
+    let is_g_clipped = c.g >= clip_ceiling;
+    let is_b_clipped = c.b >= clip_ceiling;
+
+    // Case 1: Exactly 1 channel clipped, 2 intact
+    if (is_g_clipped && !is_r_clipped && !is_b_clipped) {
+        let est_green = 0.5 * (c.r + c.b) * 1.15;
+        c.g = max(c.g, est_green);
+    } else if (is_r_clipped && !is_g_clipped && !is_b_clipped) {
+        let est_red = max(c.g * 1.25, 0.5 * (c.g + c.b) * 1.30);
+        c.r = max(c.r, est_red);
+    } else if (is_b_clipped && !is_r_clipped && !is_g_clipped) {
+        let est_blue = max(c.g * 0.95, 0.5 * (c.r + c.g) * 0.90);
+        c.b = max(c.b, est_blue);
+    }
+    // Case 2: Exactly 2 channels clipped, 1 intact
+    else if (is_r_clipped && is_g_clipped && !is_b_clipped) {
+        let est_level = c.b * 1.45;
+        c.r = max(c.r, est_level);
+        c.g = max(c.g, est_level * 0.90);
+    } else if (!is_r_clipped && is_g_clipped && is_b_clipped) {
+        c.g = max(c.g, c.r * 1.15);
+        c.b = max(c.b, c.r * 1.35);
+    } else if (is_r_clipped && !is_g_clipped && is_b_clipped) {
+        c.r = max(c.r, c.g * 1.05);
+        c.b = max(c.b, c.g * 0.95);
+    }
+
+    // Case 3: Smooth highlight compression into specular white
+    let max_val = max(c.r, max(c.g, c.b));
+    if (max_val > clip_ceiling) {
+        let excess = max_val - clip_ceiling;
+        let desat = clamp(excess / (clip_ceiling * 0.4), 0.0, 1.0);
+        c = mix(c, vec3<f32>(max_val), desat * 0.85);
+    }
+    return c;
+}
+
+// Optical ClearView Plus Haze Inversion Kernel with Contrast Preservation & Anti-Crush (CorrectionsAVX2 ApplyHazeRemoval_throws)
+fn apply_atmospheric_haze_inversion(
+    rgb: vec3<f32>,
+    airlight: vec3<f32>,
+    transmission_map_val: f32,
+    intensity_0_100: f32
+) -> vec3<f32> {
+    if (intensity_0_100 <= 0.0) {
+        return rgb;
+    }
+    let k = intensity_0_100 / 100.0;
+    let t0 = 0.12;
+    let t = clamp(transmission_map_val, t0, 1.0);
+    let eff_t = mix(1.0, t, k);
+
+    // Physical inversion with floor protection to prevent shadow crushing
+    let unconstrained_dehazed = (rgb - airlight) / eff_t + airlight;
+    let raw_dehazed = max(unconstrained_dehazed, rgb * (1.0 - k * 0.25));
+
+    // Luminance-anchored contrast preservation to prevent shadow crushing
+    let in_luma = dot(rgb, LUMA_COEFF);
+    let air_luma = dot(airlight, LUMA_COEFF);
+    let dehazed_luma = (in_luma - air_luma) / eff_t + air_luma;
+
+    // Soft shadow preservation knee: as in_luma approaches 0, preserve floor
+    let shadow_weight = smoothstep(0.0, 0.18, in_luma);
+    let preserved_luma = mix(in_luma * 0.9, max(dehazed_luma, 0.0), shadow_weight);
+
+    // Chromatic ratio preservation: prevent channel clipping & hue shifts
+    let preserved_rgb = rgb * (preserved_luma / max(in_luma, 1e-5));
+    let final_dehazed = mix(raw_dehazed, preserved_rgb, 0.45);
+
+    // Soft-knee highlight saturation clamp to prevent out-of-gamut banding
+    let max_c = max(final_dehazed.r, max(final_dehazed.g, final_dehazed.b));
+    if (max_c > 1.0) {
+        let excess = max_c - 1.0;
+        let desat = clamp(excess / 0.5, 0.0, 0.7);
+        return clamp(mix(final_dehazed, vec3<f32>(preserved_luma), desat), vec3<f32>(0.0), vec3<f32>(1.5));
+    }
+
+    return clamp(final_dehazed, vec3<f32>(0.0), vec3<f32>(1.5));
+}
+
+// Optical Deep Shadow Desaturation (Low-SNR Chroma Noise Suppression)
+fn apply_deep_shadow_chroma_damping(rgb: vec3<f32>) -> vec3<f32> {
+    let luma = dot(rgb, LUMA_COEFF);
+    if (luma < 0.045) {
+        let t = smoothstep(0.005, 0.045, max(luma, 0.0));
+        return mix(vec3<f32>(luma), rgb, t);
+    }
+    return rgb;
+}
+
+// Optical Out-of-Gamut Luminance-Preserving Color Protection (OutputSaturatedColorsProtection = 100)
+fn apply_gamut_luminance_protection(rgb: vec3<f32>) -> vec3<f32> {
+    let max_val = max(rgb.r, max(rgb.g, rgb.b));
+    let min_val = min(rgb.r, min(rgb.g, rgb.b));
+    if (max_val <= 1.0 && min_val >= 0.0) {
+        return rgb;
+    }
+    let target_luma = dot(rgb, LUMA_COEFF);
+    let luma_clamped = clamp(target_luma, 0.0, 1.0);
+    let chroma = rgb - vec3<f32>(target_luma);
+
+    var scale = 1.0;
+    if (max_val > 1.0) {
+        let max_headroom = max_val - target_luma;
+        if (max_headroom > 1e-5) {
+            let allowed = (1.0 - luma_clamped) / max_headroom;
+            scale = min(scale, allowed);
+        }
+    }
+    if (min_val < 0.0) {
+        let min_headroom = target_luma - min_val;
+        if (min_headroom > 1e-5) {
+            let allowed = luma_clamped / min_headroom;
+            scale = min(scale, allowed);
+        }
+    }
+    let compressed_chroma = chroma * clamp(scale, 0.0, 1.0);
+    return clamp(vec3<f32>(luma_clamped) + compressed_chroma, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let out_dims = vec2<u32>(textureDimensions(output_texture));
@@ -1678,13 +2365,41 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let absolute_coord = id.xy + vec2<u32>(adjustments.tile_offset_x, adjustments.tile_offset_y);
     let absolute_coord_i = vec2<i32>(absolute_coord);
 
+    let sample_pos = vec2<f32>(absolute_coord) + vec2<f32>(0.5);
+    var sample_uv = sample_pos / full_dims;
+    var is_lens_warped = false;
+    if (adjustments.global.lens_distortion_enabled == 1u) {
+        let k1 = adjustments.global.lens_k1;
+        let k2 = adjustments.global.lens_k2;
+        let k3 = adjustments.global.lens_k3;
+        if (abs(k1) > 1e-6 || abs(k2) > 1e-6 || abs(k3) > 1e-6) {
+            let center = select(vec2<f32>(0.5, 0.5), vec2<f32>(adjustments.global.lens_center_x, adjustments.global.lens_center_y), adjustments.global.lens_center_x > 0.0);
+            let crop_scale = select(1.0, adjustments.global.lens_autocrop_scale, adjustments.global.lens_autocrop_scale > 0.0);
+            sample_uv = distort_coord_6th_order(sample_uv, center, k1, k2, k3, crop_scale, full_dims);
+            is_lens_warped = true;
+        }
+    }
+
+    var color_from_texture: vec3<f32>;
+    var original_alpha: f32 = 1.0;
+    if (is_lens_warped) {
+        let sampled = sample_texture_bilinear(input_texture, sample_uv, full_dims);
+        color_from_texture = sampled.rgb;
+        original_alpha = sampled.a;
+    } else {
+        color_from_texture = textureLoad(input_texture, absolute_coord, 0).rgb;
+        original_alpha = textureLoad(input_texture, absolute_coord, 0).a;
+    }
+
     let ca_rc = adjustments.global.chromatic_aberration_red_cyan;
     let ca_by = adjustments.global.chromatic_aberration_blue_yellow;
-    var color_from_texture = textureLoad(input_texture, absolute_coord, 0).rgb;
-    if (abs(ca_rc) > 0.000001 || abs(ca_by) > 0.000001) {
-        color_from_texture = apply_ca_correction(absolute_coord, ca_rc, ca_by);
+    let effective_coord = vec2<u32>(clamp(sample_uv * full_dims, vec2<f32>(0.0), full_dims - vec2<f32>(1.0)));
+    let ca_active = abs(ca_rc) > 1e-6 || abs(ca_by) > 1e-6;
+    if (ca_active) {
+        color_from_texture = apply_ca_correction(effective_coord, ca_rc, ca_by);
+        let defringe_strength = max(max(abs(ca_rc), abs(ca_by)), 0.75);
+        color_from_texture = apply_optical_chromatic_defringe(color_from_texture, effective_coord, full_dims, defringe_strength);
     }
-    let original_alpha = textureLoad(input_texture, absolute_coord, 0).a;
 
     var initial_linear_rgb: vec3<f32>;
     let is_raw = adjustments.global.is_raw_image;
@@ -1692,6 +2407,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         initial_linear_rgb = srgb_to_linear(color_from_texture);
     } else {
         initial_linear_rgb = color_from_texture;
+    }
+
+    if (adjustments.global.hlr_enabled == 1u) {
+        initial_linear_rgb = apply_highlight_chroma_reconstruction(initial_linear_rgb, adjustments.global.hlr_clip_ceiling);
     }
 
     var t_exposure = adjustments.global.exposure;
@@ -1790,6 +2509,49 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         absolute_coord_i, t_sharpness, t_sharp_thresh, is_raw
     );
 
+    // Spatially-Varying Lens Softness & FocusMask Bokeh Protection (Optical SpatialBlurCorrection)
+    if (adjustments.global.corner_sharpness_boost > 0.0 || adjustments.global.bokeh_mask_protection > 0.0) {
+        let half_diag = 0.5 * length(full_dims);
+        let r_soft = clamp(length((sample_uv - vec2<f32>(0.5, 0.5)) * full_dims) / max(half_diag, 1e-4), 0.0, 1.414);
+        let local_grad = length(locally_contrasted_rgb - sharpness_blurred);
+        let focus_prob = smoothstep(0.008, 0.05, local_grad);
+        let focus_mask = mix(1.0, focus_prob, adjustments.global.bokeh_mask_protection / 100.0);
+        let corner_boost = 1.0 + (adjustments.global.corner_sharpness_boost / 100.0) * r_soft * r_soft;
+        let delta_softness = (locally_contrasted_rgb - sharpness_blurred) * ((corner_boost - 1.0) * focus_mask) * 0.5;
+        locally_contrasted_rgb = locally_contrasted_rgb + clamp(delta_softness, vec3<f32>(-0.2), vec3<f32>(0.2));
+    }
+
+    // MicroContrast V3 Bandpass Texture Shader (Multi-Scale Bandpass)
+    if (abs(adjustments.global.micro_contrast) > 0.5) {
+        let micro_detail = locally_contrasted_rgb - sharpness_blurred;
+        let gain = (adjustments.global.micro_contrast / 100.0) * 0.75;
+        let amplified = sign(micro_detail) * min(abs(micro_detail) * (1.0 + abs(gain)), vec3<f32>(0.15));
+        locally_contrasted_rgb = clamp(locally_contrasted_rgb + amplified * sign(gain), vec3<f32>(0.0), vec3<f32>(1.5));
+    }
+
+    // ClearView Plus Atmospheric Haze Inversion (Optical ClearView Plus)
+    if (adjustments.global.clearview_strength > 0.0) {
+        let airlight = vec3<f32>(0.85, 0.90, 0.95);
+        let inv_airlight = vec3<f32>(1.0) / airlight;
+        let c_coord = vec2<i32>(sample_uv * full_dims);
+        let max_c = vec2<i32>(full_dims) - vec2<i32>(1);
+
+        var min_dark = min(locally_contrasted_rgb.r * inv_airlight.r, min(locally_contrasted_rgb.g * inv_airlight.g, locally_contrasted_rgb.b * inv_airlight.b));
+        let s_u = textureLoad(input_texture, clamp(c_coord + vec2<i32>(0, -2), vec2<i32>(0), max_c), 0).rgb;
+        let s_d = textureLoad(input_texture, clamp(c_coord + vec2<i32>(0,  2), vec2<i32>(0), max_c), 0).rgb;
+        let s_l = textureLoad(input_texture, clamp(c_coord + vec2<i32>(-2, 0), vec2<i32>(0), max_c), 0).rgb;
+        let s_r = textureLoad(input_texture, clamp(c_coord + vec2<i32>( 2, 0), vec2<i32>(0), max_c), 0).rgb;
+
+        min_dark = min(min_dark, min(s_u.r * inv_airlight.r, min(s_u.g * inv_airlight.g, s_u.b * inv_airlight.b)));
+        min_dark = min(min_dark, min(s_d.r * inv_airlight.r, min(s_d.g * inv_airlight.g, s_d.b * inv_airlight.b)));
+        min_dark = min(min_dark, min(s_l.r * inv_airlight.r, min(s_l.g * inv_airlight.g, s_l.b * inv_airlight.b)));
+        min_dark = min(min_dark, min(s_r.r * inv_airlight.r, min(s_r.g * inv_airlight.g, s_r.b * inv_airlight.b)));
+
+        let transmission = 1.0 - 0.95 * clamp(min_dark, 0.0, 1.0);
+        locally_contrasted_rgb = apply_atmospheric_haze_inversion(locally_contrasted_rgb, airlight, transmission, adjustments.global.clearview_strength);
+    }
+
+
     let gf = sample_gf_coeffs(absolute_coord);
     let gf_luma = max(get_luma(max(locally_contrasted_rgb, vec3<f32>(0.0))), GF_LUMA_FLOOR);
     let gf_i = log2(gf_luma);
@@ -1811,18 +2573,34 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let clarity_term = shape_detail_gf(detail_clarity)
                        * clarity_total * clarity_overlap
                        * select(GF_NEG_GAIN, GF_CLARITY_GAIN, clarity_total > 0.0);
+    // Phase 1: Skin-Shielded Structure (Luminar Neo parity)
+    let skin_factor = compute_skin_shield(locally_contrasted_rgb);
+    let skin_shield_strength = adjustments.global.skin_shield_strength;
+    let skin_suppression = 1.0 - clamp(skin_factor * max(skin_shield_strength, 0.85), 0.0, 0.92);
+
+    // Phase 1: ContrastCleaner halo-free overshoot suppression (SNS-HDR parity)
+    let cleaner_strength = adjustments.global.contrast_cleaner_strength;
+    let gradient_overshoot = clamp(abs(detail_structure) - 0.45, 0.0, 1.0);
+    let halo_cleaner = 1.0 - smoothstep(0.0, 0.5, gradient_overshoot * max(cleaner_strength, 1.0));
+
     let structure_term = shape_detail_gf(detail_structure)
-                       * t_structure * select(GF_NEG_GAIN, GF_STRUCTURE_GAIN, t_structure > 0.0);
+                       * t_structure * skin_suppression * halo_cleaner
+                       * select(GF_NEG_GAIN, GF_STRUCTURE_GAIN, t_structure > 0.0);
 
     let lc_log_gain = clarity_term * select(lc_gate, 1.0, clarity_total < 0.0)
                     + structure_term * select(lc_gate, 1.0, t_structure < 0.0);
     locally_contrasted_rgb *= exp2(lc_log_gain);
+    let deflash_strength = adjustments.global.skin_shield_strength * 0.65;
+    locally_contrasted_rgb = apply_skin_deflash_specular_rolloff(locally_contrasted_rgb, skin_factor, deflash_strength);
 
     var processed_rgb = apply_linear_exposure(locally_contrasted_rgb, t_exposure);
 
-    if (t_glow > 0.0) {
+    let orton_spread = adjustments.global.orton_spread;
+    if (t_glow > 0.0 || orton_spread > 0.0) {
+        let effective_blur = mix(structure_blurred, clarity_blurred, clamp(orton_spread, 0.0, 1.0));
+        let effective_glow = max(t_glow, orton_spread * 0.65);
         processed_rgb = apply_glow_bloom(
-            processed_rgb, structure_blurred, t_glow, is_raw,
+            processed_rgb, effective_blur, effective_glow, is_raw,
             t_exposure, t_brightness, t_contrast, t_whites
         );
     }
@@ -1866,8 +2644,32 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     composite_rgb_linear = apply_highlights_adjustment(composite_rgb_linear, tonal_log_detail, tonal_mid_detail, is_raw, t_highlights);
     composite_rgb_linear = apply_color_calibration(composite_rgb_linear, adjustments.global.color_calibration);
     composite_rgb_linear = apply_hsl_panel(composite_rgb_linear, final_hsl, absolute_coord_i);
+    // Phase 1: Foliage Enhancer
+    composite_rgb_linear = apply_foliage_enhancer(composite_rgb_linear, adjustments.global.foliage_enhancer);
     composite_rgb_linear = apply_hue_shift(composite_rgb_linear, t_hue);
     composite_rgb_linear = apply_creative_color(composite_rgb_linear, t_saturation, t_vibrance);
+
+    // Phase 1: Supercontrast 3-Band Parametric Cubic Hermite Pivots
+    composite_rgb_linear = apply_supercontrast_pivots(
+        composite_rgb_linear,
+        adjustments.global.supercontrast_shadows,
+        adjustments.global.supercontrast_midtones,
+        adjustments.global.supercontrast_highlights,
+        adjustments.global.supercontrast_pivots
+    );
+
+    // Phase 1: SNS-HDR Lights Sub-Pipeline
+    composite_rgb_linear = apply_lights_subpipeline(
+        composite_rgb_linear,
+        adjustments.global.lights_brightness,
+        adjustments.global.lights_contrast,
+        adjustments.global.lights_details,
+        adjustments.global.lights_wb_temp,
+        adjustments.global.lights_wb_tint,
+        adjustments.global.lights_saturation,
+        adjustments.global.lights_vibrance,
+        detail_structure
+    );
 
     composite_rgb_linear = apply_color_grading(
         composite_rgb_linear,
@@ -1912,15 +2714,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     var default_tonemapped: vec3<f32>;
-    if (adjustments.global.tonemapper_mode == 1u) {
+    if (adjustments.global.tonemapper_mode == 1u || (is_raw == 1u && adjustments.global.tonemapper_mode == 0u)) {
         default_tonemapped = agx_full_transform(composite_rgb_linear);
     } else if (is_raw == 1u) {
         var srgb_emulated = linear_to_srgb(composite_rgb_linear);
+        let srgb_clamped = clamp(srgb_emulated, vec3<f32>(0.0), vec3<f32>(1.0));
         const BRIGHTNESS_GAMMA: f32 = 1.1;
-        srgb_emulated = pow(srgb_emulated, vec3<f32>(1.0 / BRIGHTNESS_GAMMA));
+        let srgb_gamma = pow(srgb_clamped, vec3<f32>(1.0 / BRIGHTNESS_GAMMA));
         const CONTRAST_MIX: f32 = 0.75;
-        let contrast_curve = srgb_emulated * srgb_emulated * (3.0 - 2.0 * srgb_emulated);
-        default_tonemapped = mix(srgb_emulated, contrast_curve, CONTRAST_MIX);
+        let contrast_curve = srgb_gamma * srgb_gamma * (3.0 - 2.0 * srgb_gamma);
+        let tonemapped_clamped = mix(srgb_gamma, contrast_curve, CONTRAST_MIX);
+        default_tonemapped = select(tonemapped_clamped, srgb_emulated, srgb_emulated > vec3<f32>(1.0));
     } else {
         default_tonemapped = linear_to_srgb(composite_rgb_linear);
     }
@@ -1977,6 +2781,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let noise_val = mix(noise_base, noise_rough, roughness);
         final_rgb += vec3<f32>(noise_val) * amount * luma_mask;
     }
+
+    // Optical Deep Shadow Desaturation (Low-SNR Chroma Noise Suppression)
+    final_rgb = apply_deep_shadow_chroma_damping(final_rgb);
+
+    // Optical Out-of-Gamut Luminance-Preserving Color Protection
+    final_rgb = apply_gamut_luminance_protection(final_rgb);
 
     if (adjustments.global.show_clipping == 1u) {
         let HIGHLIGHT_WARNING_COLOR = vec3<f32>(1.0, 0.0, 0.0);

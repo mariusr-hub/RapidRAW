@@ -32,6 +32,7 @@ interface LibraryState {
   // Images & Selection
   imageList: Array<ImageFile>;
   imageRatings: Record<string, number>;
+  exifMap: Record<string, any>;
   multiSelectedPaths: Array<string>;
   selectionAnchorPath: string | null;
   libraryActivePath: string | null;
@@ -60,6 +61,7 @@ interface LibraryState {
   setFilterCriteria: (criteria: Partial<FilterCriteria> | ((prev: FilterCriteria) => FilterCriteria)) => void;
   setSearchCriteria: (criteria: Partial<SearchCriteria> | ((prev: SearchCriteria) => SearchCriteria)) => void;
   setSortCriteria: (criteria: Partial<SortCriteria> | ((prev: SortCriteria) => SortCriteria)) => void;
+  updateExifMap: (chunk: Record<string, any>) => void;
 }
 
 export const useLibraryStore = create<LibraryState>((set) => ({
@@ -75,6 +77,7 @@ export const useLibraryStore = create<LibraryState>((set) => ({
 
   imageList: [],
   imageRatings: {},
+  exifMap: {},
   multiSelectedPaths: [],
   selectionAnchorPath: null,
   libraryActivePath: null,
@@ -153,5 +156,10 @@ export const useLibraryStore = create<LibraryState>((set) => ({
     set((state) => ({
       sortCriteria:
         typeof criteria === 'function' ? criteria(state.sortCriteria) : { ...state.sortCriteria, ...criteria },
+    })),
+
+  updateExifMap: (chunk: Record<string, any>) =>
+    set((state) => ({
+      exifMap: { ...state.exifMap, ...chunk },
     })),
 }));

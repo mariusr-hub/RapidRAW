@@ -2,7 +2,386 @@ use std::path::Path;
 use std::time::Instant;
 use image::{DynamicImage, Rgb32FImage};
 
-fn main() {
+/// Defense 7: Computes unclipped midtone chromatic balance (R/G, B/G)
+fn compute_frame_wb_balance(img: &Rgb32FImage) -> Option<(f32, f32)> {
+    let raw = img.as_raw();
+    let mut r_sum = 0.0f64;
+    let mut g_sum = 0.0f64;
+    let mut b_sum = 0.0f64;
+    let mut count = 0u64;
+
+    for chunk in raw.chunks_exact(3) {
+        let r = chunk[0] as f64;
+        let g = chunk[1] as f64;
+        let b = chunk[2] as f64;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if luma > 0.12 && luma < 0.82 {
+            r_sum += r;
+            g_sum += g;
+            b_sum += b;
+            count += 1;
+        }
+    }
+
+    if count > 200 && g_sum > 1e-4 {
+        Some(((r_sum / g_sum) as f32, (b_sum / g_sum) as f32))
+    } else {
+        None
+    }
+}
+
+fn render_single_bracket_scene(
+    base_dir: &Path,
+    scene_prefix: &str,
+    cr2_names: &[&str],
+    force: bool,
+    settings: &rapidraw_lib::app_settings::AppSettings,
+) {
+    let math_target = format!("{}_hdr2_math.jpg", scene_prefix);
+    let legacy_target = format!("{}_hdr_legacy.jpg", scene_prefix);
+
+    let math_path = base_dir.join(&math_target);
+    let legacy_path = base_dir.join(&legacy_target);
+
+    let file_paths: Vec<String> = cr2_names
+        .iter()
+        .map(|f| base_dir.join(f).to_string_lossy().into_owned())
+        .collect();
+
+    if !file_paths.iter().all(|p| Path::new(p).exists()) {
+        eprintln!("Skipping {}: source files missing in {:?}", scene_prefix, base_dir);
+        return;
+    }
+
+    println!("------------------------------------------------------------");
+    println!(">>> PROCESSING MASTER HDR BRACKET: {} ({} frames) <<<", scene_prefix, cr2_names.len());
+    let start = Instant::now();
+
+    let mut frames = match rapidraw_lib::hdr_deghosting::load_hdr_frames::<tauri::Wry>(&file_paths, None, settings) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to load frames for {}: {}", scene_prefix, e);
+            return;
+        }
+    };
+
+    let ref_idx = rapidraw_lib::hdr_deghosting::select_best_reference_index(&frames);
+    rapidraw_lib::hdr_deghosting::align_hdr_frames::<tauri::Wry>(&mut frames, None);
+    rapidraw_lib::hdr_deghosting::apply_reference_deghosting_mask::<tauri::Wry>(&mut frames, ref_idx, None, None, None);
+
+    let rgb_frames: Vec<Rgb32FImage> = frames.iter().map(|f| f.1.to_rgb32f()).collect();
+    let exposure_scales: Vec<f32> = frames
+        .iter()
+        .map(|f| rapidraw_lib::hdr_deghosting::compute_physical_exposure_scale(f.2, f.3, f.4))
+        .collect();
+    let first_raw = &file_paths[ref_idx];
+
+    // Defense 7: Unclipped midtone chromatic balance
+    if let Some((rg, bg)) = compute_frame_wb_balance(&rgb_frames[ref_idx]) {
+        println!("  [Defense 7] Reference frame chromatic balance: R/G={:.3}, B/G={:.3}", rg, bg);
+    }
+
+    // 1. Render HDR2 Math
+    if force || !math_path.exists() {
+        let mut options = rapidraw_lib::hdr_fusion::HdrMergeOptions::default();
+        options.reference_index = Some(ref_idx);
+        options.frame_isos = Some(frames.iter().map(|f| f.3).collect());
+        options.engine = Some(rapidraw_lib::hdr_fusion::HdrEngineMode::Hdr2);
+
+        match rapidraw_lib::hdr_fusion::fuse_exposures_dual::<tauri::Wry>(
+            &rgb_frames,
+            &exposure_scales,
+            &options,
+            None,
+            None,
+        ) {
+            Ok(res) => {
+                let sdr_preview = DynamicImage::ImageRgb32F(res.tone_mapped_preview).to_rgb8();
+                if let Err(e) = rapidraw_lib::export_processing::save_jpeg_high_quality_with_metadata(
+                    &math_path,
+                    &sdr_preview,
+                    Some(first_raw),
+                ) {
+                    eprintln!("Failed to save {}: {}", math_target, e);
+                } else {
+                    println!("Successfully rendered {} in {:.2?}", math_target, start.elapsed());
+                }
+            }
+            Err(e) => eprintln!("Failed to fuse HDR2 Math for {}: {}", scene_prefix, e),
+        }
+    }
+
+    // 2. Render Legacy
+    if force || !legacy_path.exists() {
+        let mut options = rapidraw_lib::hdr_fusion::HdrMergeOptions::default();
+        options.reference_index = Some(ref_idx);
+        options.frame_isos = Some(frames.iter().map(|f| f.3).collect());
+        options.engine = Some(rapidraw_lib::hdr_fusion::HdrEngineMode::LinearRadiance);
+
+        match rapidraw_lib::hdr_fusion::fuse_exposures_dual::<tauri::Wry>(
+            &rgb_frames,
+            &exposure_scales,
+            &options,
+            None,
+            None,
+        ) {
+            Ok(res) => {
+                let sdr_preview = DynamicImage::ImageRgb32F(res.tone_mapped_preview).to_rgb8();
+                if let Err(e) = rapidraw_lib::export_processing::save_jpeg_high_quality_with_metadata(
+                    &legacy_path,
+                    &sdr_preview,
+                    Some(first_raw),
+                ) {
+                    eprintln!("Failed to save {}: {}", legacy_target, e);
+                } else {
+                    println!("Successfully rendered {} in {:.2?}", legacy_target, start.elapsed());
+                }
+            }
+            Err(e) => eprintln!("Failed to fuse Legacy for {}: {}", scene_prefix, e),
+        }
+    }
+}
+
+fn render_hdr_panorama_scene(
+    base_dir: &Path,
+    scene_prefix: &str,
+    angle_groups: &[Vec<&str>],
+    fov: Option<(f64, Option<f64>)>,
+    has_ai_target: bool,
+    force: bool,
+    settings: &rapidraw_lib::app_settings::AppSettings,
+) {
+    let math_target = format!("{}_hdr2_math.jpg", scene_prefix);
+    let ai_target = format!("{}_hdr2_ai.jpg", scene_prefix);
+    let legacy_target = format!("{}_hdr_legacy.jpg", scene_prefix);
+
+    let math_path = base_dir.join(&math_target);
+    let ai_path = base_dir.join(&ai_target);
+    let legacy_path = base_dir.join(&legacy_target);
+
+    let all_files: Vec<&str> = angle_groups.iter().flat_map(|g| g.iter().copied()).collect();
+    if !all_files.iter().all(|f| base_dir.join(f).exists()) {
+        eprintln!("Skipping {}: source files missing in {:?}", scene_prefix, base_dir);
+        return;
+    }
+
+    println!("------------------------------------------------------------");
+    println!(">>> PROCESSING MASTER HDR PANORAMA: {} ({} angles, {} frames) <<<",
+        scene_prefix, angle_groups.len(), all_files.len());
+    let start = Instant::now();
+
+    // Fuse each angle bracket to obtain linear radiance panels
+    let mut hdr_panels: Vec<Rgb32FImage> = Vec::new();
+    let first_raw = base_dir.join(angle_groups[0][0]).to_string_lossy().into_owned();
+
+    for (g_idx, group) in angle_groups.iter().enumerate() {
+        let file_paths: Vec<String> = group.iter().map(|f| base_dir.join(f).to_string_lossy().into_owned()).collect();
+        let mut frames = match rapidraw_lib::hdr_deghosting::load_hdr_frames::<tauri::Wry>(&file_paths, None, settings) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to load frames for angle {}: {}", g_idx, e);
+                return;
+            }
+        };
+        let ref_idx = rapidraw_lib::hdr_deghosting::select_best_reference_index(&frames);
+        rapidraw_lib::hdr_deghosting::align_hdr_frames::<tauri::Wry>(&mut frames, None);
+        rapidraw_lib::hdr_deghosting::apply_reference_deghosting_mask::<tauri::Wry>(&mut frames, ref_idx, None, None, None);
+
+        let rgb_frames: Vec<Rgb32FImage> = frames.iter().map(|f| f.1.to_rgb32f()).collect();
+        let exposure_scales: Vec<f32> = frames
+            .iter()
+            .map(|f| rapidraw_lib::hdr_deghosting::compute_physical_exposure_scale(f.2, f.3, f.4))
+            .collect();
+
+        // Defense 7 check
+        if let Some((rg, bg)) = compute_frame_wb_balance(&rgb_frames[ref_idx]) {
+            println!("  [Defense 7] Angle {} chromatic balance: R/G={:.3}, B/G={:.3}", g_idx + 1, rg, bg);
+        }
+
+        let mut options = rapidraw_lib::hdr_fusion::HdrMergeOptions::default();
+        options.reference_index = Some(ref_idx);
+        options.frame_isos = Some(frames.iter().map(|f| f.3).collect());
+        options.engine = Some(rapidraw_lib::hdr_fusion::HdrEngineMode::Hdr2);
+
+        match rapidraw_lib::hdr_fusion::fuse_exposures_dual::<tauri::Wry>(
+            &rgb_frames,
+            &exposure_scales,
+            &options,
+            None,
+            None,
+        ) {
+            Ok(res) => {
+                println!("  - Merged HDR angle {} of {}", g_idx + 1, angle_groups.len());
+                hdr_panels.push(res.linear_radiance);
+            }
+            Err(e) => {
+                eprintln!("Failed to fuse angle {}: {}", g_idx, e);
+                return;
+            }
+        }
+    }
+
+    if hdr_panels.len() < 2 {
+        eprintln!("Insufficient panels to stitch {}", scene_prefix);
+        return;
+    }
+
+    println!("  - Stitching {} panels into spherical/cylindrical canvas...", hdr_panels.len());
+    let stitched_hdr = match rapidraw_lib::hdr_panorama::stitch_hdr_panels(
+        &hdr_panels,
+        rapidraw_lib::panorama_utils::camera_model::PanoramaProjection::Cylindrical,
+        0.5,
+        fov,
+        None,
+    ) {
+        Ok(composite) => composite,
+        Err(e) => {
+            eprintln!("Failed to stitch HDR panorama {}: {}", scene_prefix, e);
+            return;
+        }
+    };
+    println!("  - Successfully stitched linear HDR composite in {:.2?}", start.elapsed());
+
+    // 1. Render HDR2 Math tone-mapped image
+    if force || !math_path.exists() {
+        let mut tm_options = rapidraw_lib::hdr_fusion::HdrMergeOptions::default();
+        tm_options.engine = Some(rapidraw_lib::hdr_fusion::HdrEngineMode::Hdr2);
+        let tone_mapped = rapidraw_lib::hdr_fusion::tone_map_radiance_image::<tauri::Wry>(
+            &stitched_hdr,
+            &tm_options,
+            None,
+        );
+        let sdr_preview = DynamicImage::ImageRgb32F(tone_mapped).to_rgb8();
+        if let Err(e) = rapidraw_lib::export_processing::save_jpeg_high_quality_with_metadata(
+            &math_path,
+            &sdr_preview,
+            Some(&first_raw),
+        ) {
+            eprintln!("Failed to save {}: {}", math_target, e);
+        } else {
+            println!("Successfully rendered {} in {:.2?}", math_target, start.elapsed());
+        }
+    }
+
+    // 2. Render HDR2 AI tone-mapped image (if requested)
+    if has_ai_target && (force || !ai_path.exists()) {
+        let mut tm_options = rapidraw_lib::hdr_fusion::HdrMergeOptions::default();
+        tm_options.engine = Some(rapidraw_lib::hdr_fusion::HdrEngineMode::Hdr2Ai);
+        let tone_mapped = rapidraw_lib::hdr_fusion::tone_map_radiance_image::<tauri::Wry>(
+            &stitched_hdr,
+            &tm_options,
+            None,
+        );
+        let sdr_preview = DynamicImage::ImageRgb32F(tone_mapped).to_rgb8();
+        if let Err(e) = rapidraw_lib::export_processing::save_jpeg_high_quality_with_metadata(
+            &ai_path,
+            &sdr_preview,
+            Some(&first_raw),
+        ) {
+            eprintln!("Failed to save {}: {}", ai_target, e);
+        } else {
+            println!("Successfully rendered {} in {:.2?}", ai_target, start.elapsed());
+        }
+    }
+
+    // 3. Render Legacy tone-mapped image
+    if force || !legacy_path.exists() {
+        let mut tm_options = rapidraw_lib::hdr_fusion::HdrMergeOptions::default();
+        tm_options.engine = Some(rapidraw_lib::hdr_fusion::HdrEngineMode::LinearRadiance);
+        let tone_mapped = rapidraw_lib::hdr_fusion::tone_map_radiance_image::<tauri::Wry>(
+            &stitched_hdr,
+            &tm_options,
+            None,
+        );
+        let sdr_preview = DynamicImage::ImageRgb32F(tone_mapped).to_rgb8();
+        if let Err(e) = rapidraw_lib::export_processing::save_jpeg_high_quality_with_metadata(
+            &legacy_path,
+            &sdr_preview,
+            Some(&first_raw),
+        ) {
+            eprintln!("Failed to save {}: {}", legacy_target, e);
+        } else {
+            println!("Successfully rendered {} in {:.2?}", legacy_target, start.elapsed());
+        }
+    }
+}
+
+fn render_master_scenes(
+    base_dir: &Path,
+    args: &[String],
+    target_filter: Option<&str>,
+    force: bool,
+    settings: &rapidraw_lib::app_settings::AppSettings,
+) {
+    let has_master_flag = args.iter().any(|a| a == "--master-test-scenes" || a == "--master-suite");
+    let should_render = |name: &str| -> bool {
+        if has_master_flag {
+            return true;
+        }
+        if let Some(t) = target_filter {
+            if t == name || t.contains(name) || name.contains(t) {
+                return true;
+            }
+        }
+        for a in args.iter().skip(1) {
+            if !a.starts_with('-') && (a == name || a.contains(name) || name.contains(a)) {
+                return true;
+            }
+        }
+        false
+    };
+
+    println!("================================================================================");
+    println!(">>> RAPIDRAW PRO: RENDERING MASTER GROUND-TRUTH TEST SCENES <<<");
+    println!("================================================================================");
+
+    // 1. IMG_4065_Pano (24 frames: 8 angles x 3 exposures)
+    if should_render("IMG_4065_Pano") || should_render("IMG_4065") {
+        let angle_groups = vec![
+            vec!["IMG_4065.CR2", "IMG_4066.CR2", "IMG_4067.CR2"],
+            vec!["IMG_4068.CR2", "IMG_4069.CR2", "IMG_4070.CR2"],
+            vec!["IMG_4071.CR2", "IMG_4072.CR2", "IMG_4073.CR2"],
+            vec!["IMG_4074.CR2", "IMG_4075.CR2", "IMG_4076.CR2"],
+            vec!["IMG_4077.CR2", "IMG_4078.CR2", "IMG_4079.CR2"],
+            vec!["IMG_4080.CR2", "IMG_4081.CR2", "IMG_4082.CR2"],
+            vec!["IMG_4083.CR2", "IMG_4084.CR2", "IMG_4085.CR2"],
+            vec!["IMG_4086.CR2", "IMG_4087.CR2", "IMG_4088.CR2"],
+        ];
+        render_hdr_panorama_scene(base_dir, "IMG_4065_Pano", &angle_groups, Some((24.0, Some(8.0))), true, force, settings);
+    }
+
+    // 2. IMG_4044_Pano (6 frames: 2 angles x 3 exposures: [4047-4049], [4050-4052])
+    if should_render("IMG_4044_Pano") || should_render("IMG_4044") {
+        let angle_groups = vec![
+            vec!["IMG_4047.CR2", "IMG_4048.CR2", "IMG_4049.CR2"],
+            vec!["IMG_4050.CR2", "IMG_4051.CR2", "IMG_4052.CR2"],
+        ];
+        render_hdr_panorama_scene(base_dir, "IMG_4044_Pano", &angle_groups, Some((24.0, Some(8.0))), false, force, settings);
+    }
+
+    // 3. IMG_5021_Pano (12 frames: 4 angles x 3 exposures: [5021-5032])
+    if should_render("IMG_5021_Pano") || should_render("IMG_5021") {
+        let angle_groups = vec![
+            vec!["IMG_5021.CR2", "IMG_5022.CR2", "IMG_5023.CR2"],
+            vec!["IMG_5024.CR2", "IMG_5025.CR2", "IMG_5026.CR2"],
+            vec!["IMG_5027.CR2", "IMG_5028.CR2", "IMG_5029.CR2"],
+            vec!["IMG_5030.CR2", "IMG_5031.CR2", "IMG_5032.CR2"],
+        ];
+        render_hdr_panorama_scene(base_dir, "IMG_5021_Pano", &angle_groups, None, false, force, settings);
+    }
+
+    // 4. IMG_4053 (Single 3-frame bracket)
+    if should_render("IMG_4053") {
+        render_single_bracket_scene(base_dir, "IMG_4053", &["IMG_4053.CR2", "IMG_4054.CR2", "IMG_4055.CR2"], force, settings);
+    }
+
+    // 5. IMG_3993 (Single 3-frame bracket)
+    if should_render("IMG_3993") {
+        render_single_bracket_scene(base_dir, "IMG_3993", &["IMG_3993.CR2", "IMG_3994.CR2", "IMG_3995.CR2"], force, settings);
+    }
+}
+
+fn real_main() {
     let _ = rayon::ThreadPoolBuilder::new().num_threads(4).build_global();
 
     let args: Vec<String> = std::env::args().collect();
@@ -46,6 +425,20 @@ fn main() {
     println!("================================================================================");
     println!(">>> RAPIDRAW STUDIO: EXECUTING TARGETED/BATCH INTEGRATION SUITE <<<");
     println!("================================================================================");
+
+    let is_master_run = args.iter().any(|a| a == "--master-test-scenes" || a == "--master-suite")
+        || target_filter.as_ref().map_or(false, |t| {
+            t == "IMG_4065_Pano" || t == "IMG_4044_Pano" || t == "IMG_5021_Pano" || t == "IMG_4053" || t == "IMG_3993"
+            || t.contains("_hdr2_") || t.contains("_hdr_legacy")
+        })
+        || args.iter().skip(1).any(|a| {
+            !a.starts_with('-') && (a == "IMG_4065_Pano" || a == "IMG_4044_Pano" || a == "IMG_5021_Pano" || a == "IMG_4053" || a == "IMG_3993")
+        });
+
+    if is_master_run {
+        render_master_scenes(base_dir, &args, target_filter.as_deref(), force, &settings);
+        return;
+    }
 
     // =========================================================================
     // 1. SINGLE HDR BRACKET SETS (22 Datasets)
@@ -960,5 +1353,19 @@ fn main() {
     println!("\n================================================================================");
     println!(">>> RAPIDRAW: ALL MASTER DATASETS COMPLETED SUCCESSFULLY! <<<");
     println!("================================================================================");
+}
+
+fn main() {
+    let builder = std::thread::Builder::new()
+        .name("rapidraw_render_all".into())
+        .stack_size(32 * 1024 * 1024);
+
+    let handler = builder
+        .spawn(|| {
+            real_main();
+        })
+        .expect("Failed to spawn render thread with 32 MB stack");
+
+    handler.join().expect("Render thread panicked or failed");
 }
 

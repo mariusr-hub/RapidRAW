@@ -83,25 +83,48 @@ impl DinicGraph {
         self.level[t] != -1
     }
 
-    pub(crate) fn dfs(&mut self, v: usize, t: usize, pushed: f32) -> f32 {
-        if pushed < 1e-4 || v == t {
-            return pushed;
-        }
-        for cid in self.ptr[v]..self.adj[v].len() {
-            self.ptr[v] = cid;
-            let edge = self.adj[v][cid].clone();
-            let tr = edge.to;
-            if self.level[v] + 1 != self.level[tr] || edge.capacity - edge.flow < 1e-4 {
-                continue;
+    pub(crate) fn dfs(&mut self, s: usize, t: usize, initial_push: f32) -> f32 {
+        let mut stack: Vec<(usize, usize, f32)> = Vec::with_capacity(64);
+        stack.push((s, self.ptr[s], initial_push));
+
+        while let Some(&(u, start_edge, pushed)) = stack.last() {
+            if u == t {
+                let flow_pushed = pushed;
+                stack.pop();
+                while let Some((v, next_edge, _)) = stack.pop() {
+                    let edge_idx = next_edge - 1;
+                    self.adj[v][edge_idx].flow += flow_pushed;
+                    let rev_idx = self.adj[v][edge_idx].rev;
+                    let tr = self.adj[v][edge_idx].to;
+                    self.adj[tr][rev_idx].flow -= flow_pushed;
+                }
+                return flow_pushed;
             }
-            let tr_pushed = self.dfs(tr, t, pushed.min(edge.capacity - edge.flow));
-            if tr_pushed < 1e-4 {
-                continue;
+
+            let mut advanced = false;
+            let num_edges = self.adj[u].len();
+            let start_cid = start_edge.max(self.ptr[u]);
+
+            for cid in start_cid..num_edges {
+                self.ptr[u] = cid;
+                let edge_cap = self.adj[u][cid].capacity;
+                let edge_flow = self.adj[u][cid].flow;
+                let tr = self.adj[u][cid].to;
+
+                if self.level[u] + 1 == self.level[tr] && edge_cap - edge_flow > 1e-4 {
+                    let next_push = pushed.min(edge_cap - edge_flow);
+                    let last_idx = stack.len() - 1;
+                    stack[last_idx].1 = cid + 1;
+                    stack.push((tr, self.ptr[tr], next_push));
+                    advanced = true;
+                    break;
+                }
             }
-            self.adj[v][cid].flow += tr_pushed;
-            let rev_idx = self.adj[v][cid].rev;
-            self.adj[tr][rev_idx].flow -= tr_pushed;
-            return tr_pushed;
+
+            if !advanced {
+                self.ptr[u] = num_edges;
+                stack.pop();
+            }
         }
         0.0
     }
@@ -148,20 +171,45 @@ fn perceptual_channel(v: f32) -> f32 {
     (x / (x + 0.18)).sqrt()
 }
 
+#[derive(Debug, Clone)]
+pub struct SeamWeightMask {
+    pub roi_min_x: u32,
+    pub roi_min_y: u32,
+    pub roi_w: u32,
+    pub roi_h: u32,
+    pub data: Vec<f32>,
+}
+
+impl SeamWeightMask {
+    #[inline]
+    pub fn get_weight(&self, canvas_x: u32, canvas_y: u32) -> f32 {
+        if canvas_x >= self.roi_min_x
+            && canvas_x < self.roi_min_x + self.roi_w
+            && canvas_y >= self.roi_min_y
+            && canvas_y < self.roi_min_y + self.roi_h
+        {
+            let rx = (canvas_x - self.roi_min_x) as usize;
+            let ry = (canvas_y - self.roi_min_y) as usize;
+            self.data[ry * self.roi_w as usize + rx]
+        } else {
+            0.5
+        }
+    }
+}
+
 /// Finds the optimal 2D Graph-Cut seam mask between two registered images using Dinic Max-Flow / Min-Cut
 /// on a downscaled overlap ROI proxy grid.
 ///
 /// Routes seams around moving objects (vehicles, pedestrians, swaying branches) and crosses linear
 /// structures where gradients and colors agree.
-/// Returns a full-resolution float weight mask in `[0.0, 1.0]` where `1.0` = `pano_canvas`, `0.0` = `img_to_add`.
+/// Returns an ROI-bounded float weight mask in `[0.0, 1.0]` where `1.0` = `pano_canvas`, `0.0` = `img_to_add`.
 pub fn compute_2d_graphcut_seam_mask(
     pano_canvas: &Rgb32FImage,
     pano_valid_mask: &GrayImage,
     img_to_add: &Rgb32FImage,
     add_valid_mask: &GrayImage,
-) -> Vec<f32> {
+) -> SeamWeightMask {
     let (w, h) = pano_canvas.dimensions();
-    let num_pixels = (w * h) as usize;
 
     // 1. Calculate bounding box of intersection
     let mut min_ox = w;
@@ -185,15 +233,13 @@ pub fn compute_2d_graphcut_seam_mask(
     }
 
     if !has_overlap || min_ox >= max_ox || min_oy >= max_oy {
-        let mut mask = vec![0.0f32; num_pixels];
-        for (i, val) in mask.iter_mut().enumerate() {
-            let x = (i % w as usize) as u32;
-            let y = (i / w as usize) as u32;
-            if pano_valid_mask.get_pixel(x, y)[0] > 0 {
-                *val = 1.0;
-            }
-        }
-        return mask;
+        return SeamWeightMask {
+            roi_min_x: 0,
+            roi_min_y: 0,
+            roi_w: 0,
+            roi_h: 0,
+            data: Vec::new(),
+        };
     }
 
     // 2. Expand ROI slightly so outer boundary ownership (`only_A` vs `only_B`) is captured
@@ -286,6 +332,10 @@ pub fn compute_2d_graphcut_seam_mask(
     // 4. Compute Sobel edge gradients and Chamfer distance transforms on the proxy grid
     let mut grad_a = vec![0.0f32; p_len];
     let mut grad_b = vec![0.0f32; p_len];
+    let mut dir_gx_a = vec![0.0f32; p_len];
+    let mut dir_gy_a = vec![0.0f32; p_len];
+    let mut dir_gx_b = vec![0.0f32; p_len];
+    let mut dir_gy_b = vec![0.0f32; p_len];
     let mut dist_a = vec![1e5f32; p_len];
     let mut dist_b = vec![1e5f32; p_len];
 
@@ -306,10 +356,14 @@ pub fn compute_2d_graphcut_seam_mask(
 
                 let gx_a = p_lum_a[py * pw + xr] - p_lum_a[py * pw + xl];
                 let gy_a = p_lum_a[yd * pw + px] - p_lum_a[yu * pw + px];
+                dir_gx_a[idx] = gx_a;
+                dir_gy_a[idx] = gy_a;
                 grad_a[idx] = (gx_a * gx_a + gy_a * gy_a).sqrt();
 
                 let gx_b = p_lum_b[py * pw + xr] - p_lum_b[py * pw + xl];
                 let gy_b = p_lum_b[yd * pw + px] - p_lum_b[yu * pw + px];
+                dir_gx_b[idx] = gx_b;
+                dir_gy_b[idx] = gy_b;
                 grad_b[idx] = (gx_b * gx_b + gy_b * gy_b).sqrt();
             }
         }
@@ -373,38 +427,44 @@ pub fn compute_2d_graphcut_seam_mask(
         let sink = num_overlap_nodes + 1;
         let mut graph = DinicGraph::new(num_overlap_nodes + 2);
 
-        // Compute per-node seam penalty M(p)
-        let mut node_cost = vec![0.002f32; p_len];
+        // Compute per-node seam penalty M(p) and vertical object barriers
+        let mut node_cost = vec![0.005f32; p_len];
+        let mut vert_object_barrier = vec![false; p_len];
+
         for idx in 0..p_len {
             if node_id[idx] == usize::MAX {
                 continue;
             }
             let ca = p_col_a[idx];
             let cb = p_col_b[idx];
-            let dr = ca[0] - cb[0];
-            let dg = ca[1] - cb[1];
-            let db_c = ca[2] - cb[2];
-            let raw_d_col = (dr * dr + dg * dg + db_c * db_c).sqrt();
 
-            // Normalize color difference by local brightness so the min-cut cannot take
-            // a cheap shortcut through dark shadow silhouettes near a panel border.
-            let lum_mean = 0.5 * (p_lum_a[idx] + p_lum_b[idx]);
-            let d_col = raw_d_col / (0.14 + 0.86 * lum_mean);
+            // Defense 4: Kwatra-Regularized Seam Energy on Y + 0.25UV with lateral chromatic aberration invariance
+            let ya = 0.2126 * ca[0] + 0.7152 * ca[1] + 0.0722 * ca[2];
+            let yb = 0.2126 * cb[0] + 0.7152 * cb[1] + 0.0722 * cb[2];
+            let ua = ca[2] - ya;
+            let ub = cb[2] - yb;
+            let va = ca[0] - ya;
+            let vb = cb[0] - yb;
 
-            let ga = grad_a[idx];
-            let gb = grad_b[idx];
-            let d_grad = (ga - gb).abs() + 0.55 * (ga + gb) * (d_col * 6.0).min(1.0);
+            let lum_diff = (ya - yb).abs();
+            let chroma_diff = 0.25 * ((ua - ub).abs() + (va - vb).abs());
+            let col_diff = lum_diff + chroma_diff;
+            let max_grad = grad_a[idx].max(grad_b[idx]);
+            let eps_noise = 0.02f32;
+            let lambda_smooth = 0.005f32;
+            let seam_cost = (col_diff / (max_grad + eps_noise)) + lambda_smooth;
 
-            // Quadratic boost on large color differences routes seams cleanly around moving trucks/people
-            let motion_boost = (d_col * 4.5).powi(2);
+            node_cost[idx] = seam_cost;
 
-            // Penalize cuts near the extreme outer boundaries of the overlap (ratio -> 0 or 1)
-            let da = dist_a[idx];
-            let db = dist_b[idx];
-            let ratio = da / (da + db + 1e-4);
-            let border_penalty = 1.0 + 3.5 * (2.0 * ratio - 1.0).powi(2);
-
-            node_cost[idx] = (0.002 + d_col + 2.0 * d_grad + motion_boost) * border_penalty;
+            // Defense 10: Binary Object Integrity Constraint
+            // Detect vertical foreground contours (lamp posts, railings, railway tracks)
+            let is_vert_a = dir_gx_a[idx].abs() > 0.06 && dir_gx_a[idx].abs() > 1.8 * dir_gy_a[idx].abs();
+            let is_vert_b = dir_gx_b[idx].abs() > 0.06 && dir_gx_b[idx].abs() > 1.8 * dir_gy_b[idx].abs();
+            let is_vert_contour = is_vert_a || is_vert_b;
+            let has_disparity = (dir_gx_a[idx] - dir_gx_b[idx]).abs() > 0.03 || col_diff > 0.04;
+            if is_vert_contour && has_disparity {
+                vert_object_barrier[idx] = true;
+            }
         }
 
         let mut pinned = vec![false; p_len];
@@ -442,24 +502,21 @@ pub fn compute_2d_graphcut_seam_mask(
                 let db = dist_b[idx];
                 let ratio = da / (da + db + 1e-4);
 
+                // Defense 4 & 10: Pin ONLY outer 5% lens boundary buffer (ratio > 0.95 or ratio < 0.05).
+                // Center-pulling springs (ratio > 0.65 / ratio < 0.35) and quadratic border penalties
+                // are removed so seams can route freely around railway tracks and architecture.
                 if (touches_only_a && !touches_only_b)
-                    || (db <= 3.0 && da > db + 3.0)
-                    || (ratio > 0.86 && da > 6.0)
+                    || (db <= 2.0 && da > db + 2.0)
+                    || (ratio > 0.95 && da > 4.0)
                 {
                     graph.add_terminal_edge(source, u, 1e6);
                     pinned[idx] = true;
                 } else if (touches_only_b && !touches_only_a)
-                    || (da <= 3.0 && db > da + 3.0)
-                    || (ratio < 0.14 && db > 6.0)
+                    || (da <= 2.0 && db > da + 2.0)
+                    || (ratio < 0.05 && db > 4.0)
                 {
                     graph.add_terminal_edge(u, sink, 1e6);
                     pinned[idx] = true;
-                } else if ratio > 0.65 {
-                    let t_cap = ((ratio - 0.65) / 0.21).powi(2) * 1.2;
-                    graph.add_terminal_edge(source, u, t_cap);
-                } else if ratio < 0.35 {
-                    let t_cap = ((0.35 - ratio) / 0.21).powi(2) * 1.2;
-                    graph.add_terminal_edge(u, sink, t_cap);
                 }
 
                 // Add undirected N-links to right and bottom neighbors
@@ -467,7 +524,11 @@ pub fn compute_2d_graphcut_seam_mask(
                     let r_idx = py * pw + (px + 1);
                     let v = node_id[r_idx];
                     if v != usize::MAX {
-                        let cap = 0.5 * (node_cost[idx] + node_cost[r_idx]);
+                        let mut cap = 0.5 * (node_cost[idx] + node_cost[r_idx]);
+                        // Defense 10: Penalize cuts crossing vertical foreground contours (lamp posts, railings, railway tracks)
+                        if vert_object_barrier[idx] || vert_object_barrier[r_idx] {
+                            cap += 5.0; // Prohibitive barrier forces seam to route around structure
+                        }
                         graph.add_edge(u, v, cap);
                     }
                 }
@@ -515,26 +576,29 @@ pub fn compute_2d_graphcut_seam_mask(
         }
     }
 
-    // 6. Bilinearly upsample the optimal Graph-Cut proxy mask to full resolution
-    let mut full_mask = vec![0.0f32; num_pixels];
+    // 6. Bilinearly upsample the optimal Graph-Cut proxy mask strictly within ROI bounding box
+    let num_roi_pixels = roi_w * roi_h;
+    let mut roi_mask = vec![0.0f32; num_roi_pixels];
     let inv_step = 1.0 / step as f32;
 
-    for y in 0..h as usize {
-        for x in 0..w as usize {
+    for ry in 0..roi_h {
+        let y = roi_min_y as usize + ry;
+        for rx in 0..roi_w {
+            let x = roi_min_x as usize + rx;
             let on_pano = pano_valid_mask.get_pixel(x as u32, y as u32)[0] > 0;
             let on_add = add_valid_mask.get_pixel(x as u32, y as u32)[0] > 0;
-            let idx = y * w as usize + x;
+            let idx = ry * roi_w + rx;
 
             if on_pano && !on_add {
-                full_mask[idx] = 1.0;
+                roi_mask[idx] = 1.0;
             } else if !on_pano && on_add {
-                full_mask[idx] = 0.0;
+                roi_mask[idx] = 0.0;
             } else if on_pano && on_add {
-                let rx = x.saturating_sub(roi_min_x as usize) as f32;
-                let ry = y.saturating_sub(roi_min_y as usize) as f32;
+                let rx_f = rx as f32;
+                let ry_f = ry as f32;
 
-                let gx = ((rx + 0.5) * inv_step - 0.5).clamp(0.0, (pw - 1) as f32);
-                let gy = ((ry + 0.5) * inv_step - 0.5).clamp(0.0, (ph - 1) as f32);
+                let gx = ((rx_f + 0.5) * inv_step - 0.5).clamp(0.0, (pw - 1) as f32);
+                let gy = ((ry_f + 0.5) * inv_step - 0.5).clamp(0.0, (ph - 1) as f32);
 
                 let x0 = gx.floor() as usize;
                 let y0 = gy.floor() as usize;
@@ -550,10 +614,16 @@ pub fn compute_2d_graphcut_seam_mask(
 
                 let top = v00 * (1.0 - fx) + v10 * fx;
                 let bot = v01 * (1.0 - fx) + v11 * fx;
-                full_mask[idx] = (top * (1.0 - fy) + bot * fy).clamp(0.0, 1.0);
+                roi_mask[idx] = (top * (1.0 - fy) + bot * fy).clamp(0.0, 1.0);
             }
         }
     }
 
-    full_mask
+    SeamWeightMask {
+        roi_min_x,
+        roi_min_y,
+        roi_w: roi_w as u32,
+        roi_h: roi_h as u32,
+        data: roi_mask,
+    }
 }

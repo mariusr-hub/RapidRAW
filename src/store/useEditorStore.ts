@@ -5,6 +5,7 @@ import { ChannelConfig } from '../components/adjustments/Curves';
 import { ImageDimensions } from '../hooks/useImageRenderSize';
 import { ToolType } from '../components/panel/right/Masks';
 import { OverlayMode } from '../components/panel/right/CropPanel';
+import type { IsophoteGuide, ShieldRegion } from '../components/panel/editor/overlays/InpaintGuideOverlay';
 
 export type CenterMarker = 'vignette' | 'centre';
 
@@ -99,6 +100,10 @@ interface EditorState {
   isAIConnectorConnected: boolean;
   hasRenderedFirstFrame: boolean;
   patchesSentToBackend: Set<string>;
+  inpaintGuideMode: 'none' | 'linepen' | 'shield';
+  isophoteGuides: IsophoteGuide[];
+  shieldRegions: ShieldRegion[];
+  activeInpaintGuideId: string | null;
 
   // Clipboard
   copiedSectionAdjustments: any | null;
@@ -118,7 +123,7 @@ export const useEditorStore = create<EditorState>((set) => ({
   selectedImage: null,
   adjustments: INITIAL_ADJUSTMENTS,
   previewOverride: null,
-  compareMode: 'none',
+  compareMode: 'vertical_split',
   splitPosition: 0.5,
   snapshots: [],
   activeSnapshotId: null,
@@ -174,6 +179,10 @@ export const useEditorStore = create<EditorState>((set) => ({
   isMaskControlHovered: false,
   hasRenderedFirstFrame: false,
   patchesSentToBackend: new Set<string>(),
+  inpaintGuideMode: 'none',
+  isophoteGuides: [],
+  shieldRegions: [],
+  activeInpaintGuideId: null,
 
   setEditor: (updater) => set((state) => (typeof updater === 'function' ? updater(state) : updater)),
 

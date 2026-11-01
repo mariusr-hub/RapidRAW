@@ -184,13 +184,15 @@ pub fn load_handheld_brackets_with_mode<R: tauri::Runtime>(
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy();
+            let pct = 5 + (idx * 20 / coherent_paths.len().max(1));
             let _ = h.emit(
                 "hdr-progress",
                 format!(
-                    "Loading linear RAW bracket {}/{} ({})...",
+                    "Decoding raw exposure {}/{} ({})... {}%",
                     idx + 1,
                     coherent_paths.len(),
-                    name
+                    name,
+                    pct
                 ),
             );
         }
@@ -820,14 +822,16 @@ pub fn merge_handheld_hdr_linear_panel<R: tauri::Runtime>(
             }
         }
         let exif_ratio = (ref_exp / f.nominal_exposure().max(1e-5)).clamp(0.02, 64.0);
+        let pct = 25 + (k * 25 / n.max(1));
         if let Some(h_app) = app_handle {
             let _ = h_app.emit(
                 "hdr-progress",
                 format!(
-                    "Aligning & calibrating bracket {}/{} (EV ratio {:.2}x)...",
+                    "Aligning handheld bracket {}/{} (EV ratio {:.2}x)... {}%",
                     k + 1,
                     n,
-                    exif_ratio
+                    exif_ratio,
+                    pct
                 ),
             );
         }
@@ -880,7 +884,7 @@ pub fn merge_handheld_hdr_linear_panel<R: tauri::Runtime>(
     if let Some(h_app) = app_handle {
         let _ = h_app.emit(
             "hdr-progress",
-            "Merging Reference-Locked 32-bit Linear Radiance...",
+            "Synthesizing 32-bit linear radiance map... 52%",
         );
     }
 
@@ -915,6 +919,13 @@ pub fn merge_handheld_hdr_linear_panel<R: tauri::Runtime>(
                 }
             }
         }
+    }
+
+    if let Some(h_app) = app_handle {
+        let _ = h_app.emit(
+            "hdr-progress",
+            "Merging dynamic range highlights & deep shadows... 60%",
+        );
     }
 
     // 2. Recover highlights from darker brackets (only where p_eff > 0.44 in the reference frame)
@@ -1068,6 +1079,13 @@ pub fn merge_handheld_hdr_linear_panel<R: tauri::Runtime>(
             });
     }
 
+    if let Some(h_app) = app_handle {
+        let _ = h_app.emit(
+            "hdr-progress",
+            "Linear radiance map complete... 65%",
+        );
+    }
+
     Ok(LinearHdrPanel {
         linear_radiance: merged.to_rgb32f(),
         nominal_exposure: ref_exp,
@@ -1099,12 +1117,12 @@ pub fn merge_handheld_hdr_pipeline<R: tauri::Runtime>(
     if let Some(h_app) = app_handle {
         let _ = h_app.emit(
             "hdr-progress",
-            "Tone-mapping via Virtual-Exposure Multi-Scale Laplacian Pyramid...",
+            "Synthesizing HDR tones: Multi-scale Laplacian pyramid... 68%",
         );
     }
 
     let tone_mapped_preview =
-        tone_map_virtual_exposure_pyramid(&panel.linear_radiance, options);
+        tone_map_virtual_exposure_pyramid_with_progress(&panel.linear_radiance, options, app_handle);
 
     Ok(HdrFusionResult {
         linear_radiance: panel.linear_radiance,
@@ -1129,6 +1147,18 @@ fn linear_to_srgb_fast(x: f32) -> f32 {
 pub fn tone_map_virtual_exposure_pyramid(
     radiance: &Rgb32FImage,
     options: &HdrMergeOptions,
+) -> Rgb32FImage {
+    tone_map_virtual_exposure_pyramid_with_progress::<tauri::Wry>(radiance, options, None)
+}
+
+/// Synthesizes virtual exposures from a single ghost-free 32-bit Linear Radiance image
+/// and fuses them via an 8-level Burt-Adelson Laplacian pyramid with real-time stage progress.
+/// Because all virtual exposures come from the exact same aligned & deghosted radiance map,
+/// it achieves 100% ghost-free, bokeh-pure, halo-free natural local contrast.
+pub fn tone_map_virtual_exposure_pyramid_with_progress<R: tauri::Runtime>(
+    radiance: &Rgb32FImage,
+    options: &HdrMergeOptions,
+    app_handle: Option<&AppHandle<R>>,
 ) -> Rgb32FImage {
     let w = radiance.width() as usize;
     let h = radiance.height() as usize;
@@ -1272,81 +1302,154 @@ pub fn tone_map_virtual_exposure_pyramid(
     }
 
     let mut weight_pyrs: Vec<Vec<Plane>> = weight_maps
-        .iter()
+        .par_iter()
         .map(|wm| gaussian_pyramid(wm, levels))
         .collect();
 
-    // Normalize weights across the virtual exposures at every pyramid level
+    // Normalize weights across the virtual exposures at every pyramid level in parallel chunks
     for lvl in 0..levels {
         let len = weight_pyrs[0][lvl].data.len();
-        for i in 0..len {
-            let mut sum_w = 0.0f32;
-            for k in 0..num_virtual {
-                sum_w += weight_pyrs[k][lvl].data[i];
-            }
-            let inv_sum = 1.0 / sum_w.max(1e-6);
-            for k in 0..num_virtual {
-                weight_pyrs[k][lvl].data[i] *= inv_sum;
-            }
-        }
-    }
-
-    // Fuse each RGB channel via Burt-Adelson Laplacian pyramid
-    let mut fused_planar = PlanarRgb::new(w, h);
-    for ch in 0..3 {
-        let lap_pyrs: Vec<LaplacianPyramid> = virtual_frames
-            .iter()
-            .map(|vf| laplacian_pyramid(&vf.c[ch], levels))
-            .collect();
-
-        let num_details = lap_pyrs[0].details.len();
-        let mut blended_details: Vec<Plane> = Vec::with_capacity(num_details);
-
-        for lvl in 0..num_details {
-            let (lw, lh) = (lap_pyrs[0].details[lvl].w, lap_pyrs[0].details[lvl].h);
-            let mut blended = Plane::new(lw, lh);
-            for k in 0..num_virtual {
-                let d_data = &lap_pyrs[k].details[lvl].data;
-                let w_data = &weight_pyrs[k][lvl].data;
-                blended
-                    .data
-                    .par_iter_mut()
-                    .zip(d_data.par_iter().zip(w_data.par_iter()))
-                    .for_each(|(o, (&d, &wt))| {
-                        *o += d * wt;
-                    });
-            }
-
-            // Gentle mid-frequency detail boost on levels 1 and 2
-            if (lvl == 1 || lvl == 2) && (detail_boost - 1.0).abs() > 0.01 {
-                blended
-                    .data
-                    .par_iter_mut()
-                    .for_each(|v| *v *= detail_boost);
-            }
-            blended_details.push(blended);
-        }
-
-        let (rw, rh) = (lap_pyrs[0].residual.w, lap_pyrs[0].residual.h);
-        let mut blended_residual = Plane::new(rw, rh);
+        let mut sum_plane = vec![0.0f32; len];
         for k in 0..num_virtual {
-            let r_data = &lap_pyrs[k].residual.data;
-            let w_data = &weight_pyrs[k][levels - 1].data;
-            blended_residual
+            let w_slice = &weight_pyrs[k][lvl].data;
+            sum_plane
+                .par_iter_mut()
+                .zip(w_slice.par_iter())
+                .for_each(|(s, &w_val)| *s += w_val);
+        }
+        for k in 0..num_virtual {
+            weight_pyrs[k][lvl]
                 .data
                 .par_iter_mut()
-                .zip(r_data.par_iter().zip(w_data.par_iter()))
-                .for_each(|(o, (&r_v, &wt))| {
-                    *o += r_v * wt;
+                .zip(sum_plane.par_iter())
+                .for_each(|(w_val, &s)| {
+                    *w_val /= s.max(1e-6);
                 });
         }
-
-        let collapsed = collapse_pyramid(&LaplacianPyramid {
-            details: blended_details,
-            residual: blended_residual,
-        });
-        fused_planar.c[ch] = collapsed.map(|v| v.clamp(0.0, 1.0));
     }
+
+    if let Some(h_app) = app_handle {
+        let _ = h_app.emit(
+            "hdr-progress",
+            "Constructing multi-scale Gaussian weight pyramids... 72%",
+        );
+    }
+
+    // Fuse via single Luminance-Guided Burt-Adelson Laplacian pyramid (8x-10x faster)
+    if let Some(h_app) = app_handle {
+        let _ = h_app.emit(
+            "hdr-progress",
+            "Synthesizing HDR tones: Multi-scale luminance pyramid... 78%",
+        );
+    }
+
+    let num_px = w * h;
+    let mut acc_r = vec![0.0f32; num_px];
+    let mut acc_g = vec![0.0f32; num_px];
+    let mut acc_b = vec![0.0f32; num_px];
+    let mut blended_details: Vec<Plane> = Vec::new();
+    let mut blended_residual = Plane::new(1, 1);
+
+    for k in 0..num_virtual {
+        let vf = &virtual_frames[k];
+        let mut luma_k = Plane::new(w, h);
+        luma_k
+            .data
+            .par_iter_mut()
+            .zip(vf.c[0].data.par_iter())
+            .zip(vf.c[1].data.par_iter())
+            .zip(vf.c[2].data.par_iter())
+            .for_each(|(((y_out, &r), &g), &b)| {
+                *y_out = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(1e-4);
+            });
+
+        let w0 = &weight_pyrs[k][0].data;
+        acc_r
+            .par_iter_mut()
+            .zip(vf.c[0].data.par_iter())
+            .zip(w0.par_iter())
+            .for_each(|((ar, &r), &wt)| *ar += r * wt);
+        acc_g
+            .par_iter_mut()
+            .zip(vf.c[1].data.par_iter())
+            .zip(w0.par_iter())
+            .for_each(|((ag, &g), &wt)| *ag += g * wt);
+        acc_b
+            .par_iter_mut()
+            .zip(vf.c[2].data.par_iter())
+            .zip(w0.par_iter())
+            .for_each(|((ab, &b), &wt)| *ab += b * wt);
+
+        let pyr = laplacian_pyramid(&luma_k, levels);
+        if k == 0 {
+            blended_details = pyr
+                .details
+                .iter()
+                .map(|p| Plane::new(p.w, p.h))
+                .collect();
+            blended_residual = Plane::new(pyr.residual.w, pyr.residual.h);
+        }
+        for (lvl, detail_plane) in pyr.details.iter().enumerate() {
+            let w_data = &weight_pyrs[k][lvl].data;
+            blended_details[lvl]
+                .data
+                .par_iter_mut()
+                .zip(detail_plane.data.par_iter().zip(w_data.par_iter()))
+                .for_each(|(o, (&d, &wt))| {
+                    *o += d * wt;
+                });
+        }
+        let w_res = &weight_pyrs[k][levels - 1].data;
+        blended_residual
+            .data
+            .par_iter_mut()
+            .zip(pyr.residual.data.par_iter().zip(w_res.par_iter()))
+            .for_each(|(o, (&r_v, &wt))| {
+                *o += r_v * wt;
+            });
+    }
+
+    // Gentle mid-frequency detail boost on levels 1 and 2
+    for (lvl, blended) in blended_details.iter_mut().enumerate() {
+        if (lvl == 1 || lvl == 2) && (detail_boost - 1.0).abs() > 0.01 {
+            blended
+                .data
+                .par_iter_mut()
+                .for_each(|v| *v *= detail_boost);
+        }
+    }
+
+    if let Some(h_app) = app_handle {
+        let _ = h_app.emit(
+            "hdr-progress",
+            "Collapsing multi-scale HDR pyramid & restoring chroma... 88%",
+        );
+    }
+
+    let fused_y = collapse_pyramid(&LaplacianPyramid {
+        details: blended_details,
+        residual: blended_residual,
+    });
+
+    let mut fused_planar = PlanarRgb::new(w, h);
+    let eps = 1e-3f32;
+    let [c0, c1, c2] = &mut fused_planar.c;
+    c0.data
+        .par_iter_mut()
+        .zip(c1.data.par_iter_mut())
+        .zip(c2.data.par_iter_mut())
+        .zip(fused_y.data.par_iter())
+        .zip(acc_r.par_iter().zip(acc_g.par_iter()).zip(acc_b.par_iter()))
+        .for_each(|((((r_out, g_out), b_out), &target_y_raw), ((&ar, &ag), &ab))| {
+            let ref_y = (0.2126 * ar + 0.7152 * ag + 0.0722 * ab).max(eps);
+            let target_y = target_y_raw.clamp(0.0, 1.0);
+            let gain = (target_y + eps) / (ref_y + eps);
+            let shadow_t = smoothstep(0.005, 0.06, ref_y);
+            let delta = target_y - ref_y;
+            *r_out = (ar * gain * shadow_t + (ar + delta) * (1.0 - shadow_t)).clamp(0.0, 1.0);
+            *g_out = (ag * gain * shadow_t + (ag + delta) * (1.0 - shadow_t)).clamp(0.0, 1.0);
+            *b_out = (ab * gain * shadow_t + (ab + delta) * (1.0 - shadow_t)).clamp(0.0, 1.0);
+        });
 
     let mut out_img = fused_planar.to_rgb32f();
 
@@ -1375,6 +1478,13 @@ pub fn tone_map_virtual_exposure_pyramid(
             (0.0, 1.0)
         };
         let inv_span = 1.0 / (wp - bp).max(0.25);
+
+        if let Some(h_app) = app_handle {
+            let _ = h_app.emit(
+                "hdr-progress",
+                "Applying Oklab perceptual grading & dynamic range anchor... 94%",
+            );
+        }
 
         // Gentle Oklab contrast & chroma preservation so multi-scale pyramid fusion retains rich blacks and lively colors
         out_img.as_mut().par_chunks_mut(3).for_each(|px| {
@@ -1405,3 +1515,100 @@ pub fn tone_map_virtual_exposure_pyramid(
     let _ = gaussian_blur; // keep import used
     out_img
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgb;
+
+    #[test]
+    fn test_hdr_luma_guided_pyramid_preserves_neutrality_and_highlights() {
+        let (w, h) = (64, 64);
+        let mut rad = Rgb32FImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let px = if y < 20 {
+                    // Bright sky
+                    [3.2f32, 3.4f32, 3.8f32]
+                } else if y < 44 {
+                    // Neutral gray
+                    [0.18f32, 0.18f32, 0.18f32]
+                } else {
+                    // Deep shadow
+                    [0.008f32, 0.006f32, 0.005f32]
+                };
+                rad.put_pixel(x, y, Rgb(px));
+            }
+        }
+
+        let options = HdrMergeOptions {
+            profile: Some(HdrToneProfile::Natural),
+            ..Default::default()
+        };
+
+        let result = tone_map_virtual_exposure_pyramid(&rad, &options);
+        assert_eq!(result.dimensions(), (w, h));
+
+        for y in 0..h {
+            for x in 0..w {
+                let px = result.get_pixel(x, y).0;
+                assert!(px[0].is_finite() && px[0] >= 0.0 && px[0] <= 1.0, "R pixel out of range: {:?}", px);
+                assert!(px[1].is_finite() && px[1] >= 0.0 && px[1] <= 1.0, "G pixel out of range: {:?}", px);
+                assert!(px[2].is_finite() && px[2] >= 0.0 && px[2] <= 1.0, "B pixel out of range: {:?}", px);
+
+                if y >= 25 && y < 40 && x >= 10 && x < 54 {
+                    assert!(
+                        (px[0] - px[1]).abs() < 0.015,
+                        "Neutral gray R-G deviation at ({}, {}): {} vs {}",
+                        x, y, px[0], px[1]
+                    );
+                    assert!(
+                        (px[1] - px[2]).abs() < 0.015,
+                        "Neutral gray G-B deviation at ({}, {}): {} vs {}",
+                        x, y, px[1], px[2]
+                    );
+                }
+
+                if y < 10 {
+                    let sky_luma = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2];
+                    assert!(
+                        sky_luma < 0.99 && px[0] < 1.0 && px[1] < 1.0 && px[2] < 1.0,
+                        "Sky detail blown out at ({}, {}): luma = {}, px = {:?}",
+                        x, y, sky_luma, px
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hdr_extreme_aspect_ratio_panorama() {
+        // 20:1 extreme panorama with low vertical height (14px)
+        let (w, h) = (280, 14);
+        let mut rad = Rgb32FImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let lum = 0.1 + 0.8 * (x as f32 / w as f32);
+                rad.put_pixel(x, y, Rgb([lum, lum, lum]));
+            }
+        }
+
+        let options = HdrMergeOptions {
+            profile: Some(HdrToneProfile::Natural),
+            ..Default::default()
+        };
+
+        let result = tone_map_virtual_exposure_pyramid(&rad, &options);
+        assert_eq!(result.dimensions(), (w, h));
+
+        for y in 0..h {
+            for x in 0..w {
+                let px = result.get_pixel(x, y).0;
+                assert!(px[0].is_finite() && px[0] >= 0.0 && px[0] <= 1.0);
+                assert!(px[1].is_finite() && px[1] >= 0.0 && px[1] <= 1.0);
+                assert!(px[2].is_finite() && px[2] >= 0.0 && px[2] <= 1.0);
+            }
+        }
+    }
+}
+

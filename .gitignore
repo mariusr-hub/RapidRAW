@@ -46,3 +46,17 @@ bench/out/
 !/scratch/triage.md
 .cargo/config.toml
 src-tauri/.cargo/config.toml
+
+# Binaries and local build artifacts
+*.exe
+*.dll
+*.pb
+/target/
+/scratch/
+
+src-tauri/crates/**/target/
+**/target/
+
+src-tauri/crates/**/target/
+**/target/
+

@@ -274,17 +274,15 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
               label: t('contextMenus.editor.denoise'),
               icon: Grip,
               onClick: () => {
-                setUI({
-                  denoiseModalState: {
-                    isOpen: true,
-                    isProcessing: false,
-                    previewBase64: null,
-                    error: null,
-                    targetPaths: [selectedImage.path],
-                    progressMessage: null,
-                    isRaw: selectedImage?.isRaw || false,
+                const uiStore = useUIStore.getState();
+                uiStore.setActivePanel('rightTop', Panel.Adjustments);
+                setUI((state) => ({
+                  activePanel: Panel.Adjustments,
+                  collapsibleSectionsState: {
+                    ...state.collapsibleSectionsState,
+                    details: true,
                   },
-                });
+                }));
               },
             },
             {

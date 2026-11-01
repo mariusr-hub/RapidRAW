@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useMemo } from 'react';
-import { Eye, EyeOff, ArrowLeft, Maximize, Loader2, Undo, Redo, Columns, Rows, Grid2X2, Sparkles, Waves } from 'lucide-react';
+import { Eye, EyeOff, ArrowLeft, Maximize, Loader2, Undo, Redo, Columns, Rows, Grid2X2, Sparkles, Waves, Sun, Flame, Feather, Zap } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
@@ -706,6 +706,62 @@ const EditorToolbar = memo(
                 </motion.div>
               )}
             </AnimatePresence>
+          </div>
+
+          {/* Quick Edit Enhancements */}
+          <div className="flex items-center bg-surface rounded-full p-0.5 border border-border-color/60 gap-0.5">
+            <button
+              className="px-2 py-1 rounded-full text-xs font-medium transition-colors text-text-secondary hover:text-text-primary hover:bg-card-active flex items-center gap-1"
+              onClick={() => {
+                const uiStore = useUIStore.getState();
+                uiStore.setActivePanel('rightTop', Panel.Adjustments);
+                uiStore.setUI({ activePanel: Panel.Adjustments });
+                window.dispatchEvent(new CustomEvent('rapidraw-quick-smart-tone'));
+              }}
+              data-tooltip="Smart Tone (Dynamic Exposure & Contrast)"
+            >
+              <Sun size={13} className="text-amber-400" />
+              <span className="hidden xl:inline">Smart Tone</span>
+            </button>
+            <button
+              className="px-2 py-1 rounded-full text-xs font-medium transition-colors text-text-secondary hover:text-text-primary hover:bg-card-active flex items-center gap-1"
+              onClick={() => {
+                const uiStore = useUIStore.getState();
+                uiStore.setActivePanel('rightTop', Panel.Adjustments);
+                uiStore.setUI({ activePanel: Panel.Adjustments });
+                window.dispatchEvent(new CustomEvent('rapidraw-quick-color-contrast'));
+              }}
+              data-tooltip="Color Contrast (Fidelity & Separation)"
+            >
+              <Flame size={13} className="text-rose-400" />
+              <span className="hidden xl:inline">Color</span>
+            </button>
+            <button
+              className="px-2 py-1 rounded-full text-xs font-medium transition-colors text-text-secondary hover:text-text-primary hover:bg-card-active flex items-center gap-1"
+              onClick={() => {
+                const uiStore = useUIStore.getState();
+                uiStore.setActivePanel('rightTop', Panel.Adjustments);
+                uiStore.setUI({ activePanel: Panel.Adjustments });
+                window.dispatchEvent(new CustomEvent('rapidraw-quick-diffusion'));
+              }}
+              data-tooltip="Light Diffusion (Gentle Dreamy Glow & Soft Highlights)"
+            >
+              <Feather size={13} className="text-sky-400" />
+              <span className="hidden xl:inline">Diffusion</span>
+            </button>
+            <button
+              className="px-2 py-1 rounded-full text-xs font-medium transition-colors text-text-secondary hover:text-text-primary hover:bg-card-active flex items-center gap-1"
+              onClick={() => {
+                const uiStore = useUIStore.getState();
+                uiStore.setActivePanel('rightTop', Panel.Adjustments);
+                uiStore.setUI({ activePanel: Panel.Adjustments });
+                window.dispatchEvent(new CustomEvent('rapidraw-quick-supercontrast'));
+              }}
+              data-tooltip="Tonal Dynamics (Targeted 3-Way Tonal Separation)"
+            >
+              <Zap size={13} className="text-emerald-400" />
+              <span className="hidden xl:inline">Tonal Dynamics</span>
+            </button>
           </div>
 
           {/* Compare & Split Modes */}

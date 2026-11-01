@@ -33,8 +33,13 @@ import {
   FolderOpen,
   FolderIcon,
   SquaresIntersect,
+  PenTool,
+  Shield,
   X,
+  Sparkles,
 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'react-toastify';
 
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import Switch from '../../ui/Switch';
@@ -409,6 +414,76 @@ export default function AIPanel() {
     generative: true,
     properties: true,
   });
+
+  const [isDetectingDefects, setIsDetectingDefects] = useState(false);
+
+  const handleAutoRemoveDustAndBlemishes = useCallback(async () => {
+    if (!selectedImage) return;
+    setIsDetectingDefects(true);
+    try {
+      const res: any = await invoke('auto_remove_dust_and_blemishes');
+
+      if (!res || !res.spots || res.spots.length === 0) {
+        toast.info(t('editor.ai.noDefectsFound', 'No dust or blemish spots detected in image.'));
+        return;
+      }
+
+      const patchId = uuidv4();
+      const subMaskId = uuidv4();
+
+      const newContainer: AiPatch = {
+        id: patchId,
+        invert: false,
+        isLoading: false,
+        name: t('editor.ai.autoDustBlemishName', 'Auto Dust & Blemishes'),
+        patchData: null,
+        prompt: '',
+        visible: true,
+        subMasks: [
+          {
+            id: subMaskId,
+            name: 'Defect Retouch',
+            type: Mask.Retouch,
+            mode: SubMaskMode.Additive,
+            visible: true,
+            invert: false,
+            opacity: 100,
+            parameters: {
+              intensity: 75,
+              lines: res.spots.map((s: any) => ({
+                tool: 'brush',
+                brushSize: Math.max(24, s.radius * 3.5),
+                feather: 0.5,
+                points: [{ x: s.x, y: s.y }],
+              })),
+            },
+          },
+        ],
+      };
+
+      setAdjustments((prev: Adjustments) => ({
+        ...prev,
+        aiPatches: [...(prev.aiPatches || []), newContainer],
+      }));
+
+      onSelectPatchContainer(patchId);
+      onSelectSubMask(subMaskId);
+
+      toast.success(
+        t('editor.ai.defectsFound', `Detected and repaired {{count}} dust & blemish spots`, {
+          count: res.total_detected,
+        }),
+      );
+
+      setTimeout(() => {
+        handleDirectPatch(subMaskId, 0, 0);
+      }, 60);
+    } catch (err: any) {
+      toast.error(`Auto Defect Erase failed: ${err.message || String(err)}`);
+    } finally {
+      setIsDetectingDefects(false);
+    }
+  }, [selectedImage, setAdjustments, onSelectPatchContainer, onSelectSubMask, handleDirectPatch, t]);
 
   const { showContextMenu } = useContextMenu();
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
@@ -1131,6 +1206,39 @@ export default function AIPanel() {
                     className="z-10 shrink-0"
                     onClick={handleDeselect}
                   >
+                    {/* 1-Click Auto Remove Dust & Blemishes */}
+                    <div className="mb-4 bg-surface/60 border border-accent/30 rounded-lg p-2.5 flex items-center justify-between shadow-xs">
+                      <div className="flex items-center gap-2">
+                        <div className="p-1.5 rounded-md bg-accent/15 text-accent">
+                          <Wand2 size={16} />
+                        </div>
+                        <div>
+                          <div className="text-xs font-semibold text-text-primary">
+                            {t('editor.ai.autoDustBlemishTitle', 'Auto Defect Erase')}
+                          </div>
+                          <div className="text-[10px] text-text-secondary leading-tight">
+                            {t('editor.ai.autoDustBlemishDesc', '1-click sensor dust & blemish removal')}
+                          </div>
+                        </div>
+                      </div>
+                      <Button
+                        size="sm"
+                        className="text-xs px-2.5 py-1 flex items-center gap-1.5"
+                        disabled={isDetectingDefects || hasAnyActiveAiTask}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleAutoRemoveDustAndBlemishes();
+                        }}
+                      >
+                        {isDetectingDefects ? (
+                          <Loader2 size={12} className="animate-spin text-accent" />
+                        ) : (
+                          <Sparkles size={12} className="text-accent" />
+                        )}
+                        <span>{t('editor.ai.autoRemoveDustBlemishes', 'Auto Erase')}</span>
+                      </Button>
+                    </div>
+
                     <Text variant={TextVariants.heading} className="mb-2">
                       {t('editor.ai.manualCleanupTitle')}
                     </Text>
@@ -1183,9 +1291,28 @@ export default function AIPanel() {
                     activeDragItem={activeDragItem}
                     hasPatches={(adjustments.aiPatches || []).length > 0}
                   >
-                    <Text variant={TextVariants.heading} className="mb-2">
-                      {t('editor.ai.editsTitle')}
-                    </Text>
+                    <div className="flex items-center justify-between mb-2">
+                      <Text variant={TextVariants.heading}>
+                        {t('editor.ai.editsTitle')}
+                      </Text>
+                      <Button
+                        size="xs"
+                        className="bg-surface text-xs px-2 py-0.5 border border-border-color hover:border-accent flex items-center gap-1 text-text-secondary hover:text-text-primary"
+                        disabled={isDetectingDefects || hasAnyActiveAiTask}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleAutoRemoveDustAndBlemishes();
+                        }}
+                        title={t('editor.ai.autoRemoveDustBlemishes', 'Auto Remove Dust & Blemishes')}
+                      >
+                        {isDetectingDefects ? (
+                          <Loader2 size={11} className="animate-spin text-accent" />
+                        ) : (
+                          <Sparkles size={11} className="text-accent" />
+                        )}
+                        <span className="text-[11px]">{t('editor.ai.autoDust', 'Auto Erase')}</span>
+                      </Button>
+                    </div>
 
                     <AnimatePresence
                       initial={false}
@@ -1975,6 +2102,65 @@ function SettingsPanel({
   const isCloud = aiProvider === 'cloud';
   const isContainerRunning = Boolean(activeAiTasks[displayContainer.id]) || Boolean(displayContainer.isLoading);
 
+  const inpaintGuideMode = useEditorStore((s) => s.inpaintGuideMode);
+  const isophoteGuides = useEditorStore((s) => s.isophoteGuides);
+  const shieldRegions = useEditorStore((s) => s.shieldRegions);
+  const activeInpaintGuideId = useEditorStore((s) => s.activeInpaintGuideId);
+  const setEditor = useEditorStore((s) => s.setEditor);
+
+  const selectedGuide = isophoteGuides.find((g) => g.id === activeInpaintGuideId);
+
+  const handleAddLinePen = () => {
+    const id = uuidv4();
+    const offset = (isophoteGuides.length % 6) * 35;
+    const newGuide = {
+      id,
+      start: { x: 200 + offset, y: 300 + offset },
+      end: { x: 400 + offset, y: 300 + offset },
+      feather: 40,
+    };
+    setEditor((s) => ({
+      inpaintGuideMode: 'linepen',
+      activeInpaintGuideId: id,
+      isophoteGuides: [...s.isophoteGuides, newGuide],
+    }));
+  };
+
+  const handleAddShield = () => {
+    const id = uuidv4();
+    const offset = (shieldRegions.length % 6) * 35;
+    const newShield = {
+      id,
+      x: 180 + offset,
+      y: 180 + offset,
+      width: 140,
+      height: 140,
+    };
+    setEditor((s) => ({
+      inpaintGuideMode: 'shield',
+      activeInpaintGuideId: id,
+      shieldRegions: [...s.shieldRegions, newShield],
+    }));
+  };
+
+  const handleDeleteActiveGuide = () => {
+    if (!activeInpaintGuideId) return;
+    setEditor((s) => ({
+      activeInpaintGuideId: null,
+      isophoteGuides: s.isophoteGuides.filter((g) => g.id !== activeInpaintGuideId),
+      shieldRegions: s.shieldRegions.filter((sh) => sh.id !== activeInpaintGuideId),
+    }));
+  };
+
+  const handleClearGuides = () => {
+    setEditor({
+      inpaintGuideMode: 'none',
+      activeInpaintGuideId: null,
+      isophoteGuides: [],
+      shieldRegions: [],
+    });
+  };
+
   useEffect(() => {
     if (container) setPrompt(container.prompt || '');
   }, [container?.id]);
@@ -2229,6 +2415,137 @@ function SettingsPanel({
                   />
                 </div>
               )}
+
+              {isComponentMode &&
+                (activeSubMask.type === Mask.Retouch ||
+                  activeSubMask.type === Mask.Heal ||
+                  activeSubMask.type === Mask.Clone) && (
+                  <div className="pt-3 mt-3 border-t border-border-default/40 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <Text
+                        variant={TextVariants.label}
+                        className="font-semibold text-text-primary flex items-center gap-1.5"
+                      >
+                        <Shield className="w-3.5 h-3.5 text-accent-primary" />
+                        {t('editor.ai.inpaintGuides.title', 'Structure Guides & Shield')}
+                      </Text>
+                      {(isophoteGuides.length > 0 || shieldRegions.length > 0) && (
+                        <button
+                          onClick={handleClearGuides}
+                          className="text-[11px] text-text-muted hover:text-accent-danger transition-colors flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          {t('editor.ai.inpaintGuides.clear', 'Clear')}
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant={inpaintGuideMode === 'linepen' ? 'primary' : 'secondary'}
+                        size="small"
+                        className="w-full text-xs flex items-center justify-center gap-1.5"
+                        onClick={() => {
+                          if (inpaintGuideMode === 'linepen') {
+                            setEditor({ inpaintGuideMode: 'none' });
+                          } else {
+                            if (isophoteGuides.length === 0) {
+                              handleAddLinePen();
+                            } else {
+                              setEditor({ inpaintGuideMode: 'linepen' });
+                            }
+                          }
+                        }}
+                      >
+                        <PenTool className="w-3 h-3" />
+                        {t('editor.ai.inpaintGuides.modes.linepen', 'LinePen')} ({isophoteGuides.length})
+                      </Button>
+
+                      <Button
+                        variant={inpaintGuideMode === 'shield' ? 'primary' : 'secondary'}
+                        size="small"
+                        className="w-full text-xs flex items-center justify-center gap-1.5"
+                        onClick={() => {
+                          if (inpaintGuideMode === 'shield') {
+                            setEditor({ inpaintGuideMode: 'none' });
+                          } else {
+                            if (shieldRegions.length === 0) {
+                              handleAddShield();
+                            } else {
+                              setEditor({ inpaintGuideMode: 'shield' });
+                            }
+                          }
+                        }}
+                      >
+                        <Shield className="w-3 h-3" />
+                        {t('editor.ai.inpaintGuides.modes.shield', 'Shield')} ({shieldRegions.length})
+                      </Button>
+                    </div>
+
+                    {inpaintGuideMode === 'linepen' && (
+                      <Button
+                        variant="ghost"
+                        size="small"
+                        className="w-full text-xs text-accent-primary border border-accent-primary/20 hover:bg-accent-primary/10"
+                        onClick={handleAddLinePen}
+                      >
+                        + {t('editor.ai.inpaintGuides.addLinePen', 'Add Isophote Direction Guide')}
+                      </Button>
+                    )}
+
+                    {inpaintGuideMode === 'shield' && (
+                      <Button
+                        variant="ghost"
+                        size="small"
+                        className="w-full text-xs text-accent-danger border border-accent-danger/20 hover:bg-accent-danger/10"
+                        onClick={handleAddShield}
+                      >
+                        + {t('editor.ai.inpaintGuides.addShield', 'Add Protection Shield')}
+                      </Button>
+                    )}
+
+                    {selectedGuide && (
+                      <div className="flex flex-col gap-1.5 pt-1">
+                        <Slider
+                          label={t('editor.ai.inpaintGuides.feather', 'Corridor Feather')}
+                          min={10}
+                          max={200}
+                          step={1}
+                          value={selectedGuide.feather}
+                          onChange={(e: any) => {
+                            const feather = parseFloat(e.target.value);
+                            setEditor((s) => ({
+                              isophoteGuides: s.isophoteGuides.map((g) =>
+                                g.id === selectedGuide.id ? { ...g, feather } : g
+                              ),
+                            }));
+                          }}
+                          fillOrigin="min"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleDeleteActiveGuide}
+                          className="self-end text-[11px] text-text-muted hover:text-accent-danger transition-colors flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          {t('editor.ai.inpaintGuides.deleteSelected', 'Delete Selected')}
+                        </button>
+                      </div>
+                    )}
+                    {!selectedGuide && activeInpaintGuideId && (
+                      <div className="flex justify-end pt-1">
+                        <button
+                          type="button"
+                          onClick={handleDeleteActiveGuide}
+                          className="text-[11px] text-text-muted hover:text-accent-danger transition-colors flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          {t('editor.ai.inpaintGuides.deleteSelected', 'Delete Selected Shield')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
               {subMaskConfig.showBrushTools && brushSettings && (
                 <BrushTools settings={brushSettings} onSettingsChange={setBrushSettings} />

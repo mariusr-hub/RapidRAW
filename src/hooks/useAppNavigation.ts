@@ -350,7 +350,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             initialRatings[f.path] = f.rating;
           }
         });
-        setLibrary({ imageRatings: initialRatings });
+        setLibrary({ imageRatings: initialRatings, exifMap: {} });
 
         const exifSortKeys = ['date_taken', 'iso', 'shutter_speed', 'aperture', 'focal_length'];
         const isExifSortActive = exifSortKeys.includes(sortCriteria.key);
@@ -372,6 +372,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
               }
             }
 
+            useLibraryStore.getState().updateExifMap(combinedExifMap);
+
             const finalImageList = files.map((image) => ({
               ...image,
               exif: combinedExifMap[image.path] || image.exif || null,
@@ -382,20 +384,27 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
             setTimeout(() => {
               const fetchExifInChunks = async () => {
-                const chunkSize = 50;
+                const chunkSize = 100;
                 for (let i = 0; i < paths.length; i += chunkSize) {
                   if (useLibraryStore.getState().currentFolderPath !== path) break;
 
                   const chunk = paths.slice(i, i + chunkSize);
                   try {
-                    const chunkExif: any = await invoke(Invokes.ReadExifForPaths, { paths: chunk });
-                    setLibrary((state) => ({
-                      imageList: state.imageList.map((image) => ({
-                        ...image,
-                        exif: chunkExif[image.path] || image.exif || null,
-                      })),
-                    }));
-                    await new Promise((resolve) => setTimeout(resolve, 50));
+                    const chunkExif: Record<string, any> = await invoke(Invokes.ReadExifForPaths, { paths: chunk });
+                    useLibraryStore.getState().updateExifMap(chunkExif);
+
+                    // Mutate in-place on existing image objects: eliminates 500,000 array clones & V8 GC spikes
+                    const currentList = useLibraryStore.getState().imageList;
+                    for (const p of chunk) {
+                      if (chunkExif[p]) {
+                        const img = currentList.find((item) => item.path === p);
+                        if (img) {
+                          img.exif = chunkExif[p];
+                        }
+                      }
+                    }
+
+                    await new Promise((resolve) => setTimeout(resolve, 30));
                   } catch (err) {
                     console.error('Failed to read EXIF chunk:', err);
                   }

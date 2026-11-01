@@ -69,6 +69,25 @@ fn download_and_verify(
 }
 
 fn main() {
+    let crate_shader = PathBuf::from("crates/rapidraw-gpu/src/shader.wgsl");
+    let app_shader = PathBuf::from("src/shaders/shader.wgsl");
+    println!("cargo:rerun-if-changed={}", crate_shader.display());
+    println!("cargo:rerun-if-changed={}", app_shader.display());
+
+    if crate_shader.exists() && app_shader.exists() {
+        let a = fs::read(&crate_shader).expect("Failed to read crates/rapidraw-gpu/src/shader.wgsl");
+        let b = fs::read(&app_shader).expect("Failed to read src/shaders/shader.wgsl");
+        if a != b {
+            panic!(
+                "SHADER PARITY VIOLATION: '{}' ({} bytes) != '{}' ({} bytes). Copy the authoritative shader so both files are byte-for-byte identical.",
+                crate_shader.display(),
+                a.len(),
+                app_shader.display(),
+                b.len()
+            );
+        }
+    }
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
@@ -174,6 +193,8 @@ fn main() {
     }
 
     if target_os == "windows" {
+        println!("cargo:rustc-link-arg-bins=/STACK:33554432");
+        println!("cargo:rustc-link-arg-tests=/STACK:33554432");
         println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
     }

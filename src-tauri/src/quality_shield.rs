@@ -29,7 +29,7 @@ impl Default for QualityGateOptions {
             target_white_ceiling: 0.985,
             max_acceptable_black_floor: 0.12,
             min_acceptable_contrast_std: 0.110,
-            enforce_histogram_stretch: false,
+            enforce_histogram_stretch: true,
         }
     }
 }
@@ -185,7 +185,7 @@ pub fn enforce_photographic_quality_invariants(
 
             // Preserve chromaticity: scale channels proportionally
             let scale = if y > 1e-5 {
-                (new_y / y).clamp(0.10, 3.0)
+                (new_y / y).clamp(0.001, 3.0)
             } else {
                 1.0
             };

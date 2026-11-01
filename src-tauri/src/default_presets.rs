@@ -14,6 +14,15 @@ fn make_preset(id: &str, name: &str, adjustments: serde_json::Value) -> Preset {
 
 pub fn get_default_curated_presets() -> Vec<PresetItem> {
     vec![
+        // 0. SNS-HDR Reference Profiles (Halo-Free Dynamic Range & Color Calibration)
+        PresetItem::Folder(PresetFolder {
+            id: "folder-sns-hdr".to_string(),
+            name: "SNS-HDR Reference Profiles".to_string(),
+            children: crate::adjustment_utils::get_sns_hdr_reference_presets()
+                .into_iter()
+                .map(|p| make_preset(&p.id, &p.name, p.adjustments))
+                .collect(),
+        }),
         // 1. Wedding & Portrait Fine-Art
         PresetItem::Folder(PresetFolder {
             id: "folder-wedding".to_string(),

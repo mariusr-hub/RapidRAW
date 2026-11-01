@@ -67,6 +67,14 @@ const NORMAL_MAX_SIZE: u32 = 768;
 const NORMAL_NUM_TOKENS: i64 = 2500;
 const NORMAL_SHA256: &str = "24eacb5dc7a2c54c7bc98f7de085ffbed79ad006ea5b664c2c2cdc02ff3a52f0";
 
+pub const LIGHTGLUE_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/lightglue_disk.onnx?download=true";
+pub const LIGHTGLUE_FILENAME: &str = "lightglue_disk.onnx";
+pub const LIGHTGLUE_SHA256: &str = "f3a2c58a18357a70a80e1a141a0bd38d9f43058b73f8a6509f635c0528e1467a";
+
+pub const FASTFLOW_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/fastflow_hdr.onnx?download=true";
+pub const FASTFLOW_FILENAME: &str = "fastflow_hdr.onnx";
+pub const FASTFLOW_SHA256: &str = "e98e096417d47228a4175ce08ea2fae9ae4ce8bb60205d6cbbf76f571550a2e7";
+
 pub struct AiModels {
     pub sam_encoder: Mutex<Session>,
     pub sam_decoder: Mutex<Session>,
@@ -94,12 +102,15 @@ pub struct CachedDepthMap {
     pub original_size: (u32, u32),
 }
 
+#[derive(Default)]
 pub struct AiState {
     pub models: Option<Arc<AiModels>>,
     pub denoise_model: Option<Arc<Mutex<Session>>>,
     pub clip_models: Option<Arc<ClipModels>>,
     pub lama_model: Option<Arc<Mutex<Session>>>,
     pub normal_model: Option<Arc<Mutex<Session>>>,
+    pub lightglue_model: Option<Arc<Mutex<Session>>>,
+    pub fastflow_model: Option<Arc<Mutex<Session>>>,
     pub embeddings: Option<ImageEmbeddings>,
     pub depth_map: Option<CachedDepthMap>,
 }
@@ -108,6 +119,42 @@ static DIRECTML_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 pub fn is_directml_active() -> bool {
     DIRECTML_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Creates an ONNX Runtime Session targeting Intel Iris Xe via DirectML on Windows,
+/// gracefully falling back to CPU execution if DirectML is unavailable.
+pub fn create_directml_session(model_path: &Path) -> Result<Session> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(builder) = Session::builder() {
+            if let Ok(builder_dml) = builder.with_execution_providers([
+                ort::execution_providers::DirectMLExecutionProvider::default().build(),
+            ]) {
+                if let Ok(session) = builder_dml.commit_from_file(model_path) {
+                    DIRECTML_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "AI Model loaded successfully on Intel Iris Xe via DirectML: {:?}",
+                        model_path.file_name()
+                    );
+                    return Ok(session);
+                }
+            }
+        }
+    }
+    let session = Session::builder()?.commit_from_file(model_path)?;
+    Ok(session)
+}
+
+/// Reversible mu-law log-radiance transformation protecting 14-bit dynamic range (mu = 5000.0)
+pub fn linear_to_mu_law(val: f32) -> f32 {
+    let mu = 5000.0f32;
+    (1.0 + mu * val.max(0.0)).ln() / (1.0 + mu).ln()
+}
+
+pub fn mu_law_to_linear(val: f32) -> f32 {
+    let mu = 5000.0f32;
+    let v = val.max(0.0);
+    (((1.0 + mu).ln() * v).exp() - 1.0) / mu
 }
 
 fn edt_1d(f: &mut [f32], v: &mut [usize], z: &mut [f32], d: &mut [f32]) {
@@ -561,12 +608,7 @@ pub async fn get_or_init_ai_models(
     } else {
         *ai_state_lock = Some(AiState {
             models: Some(models.clone()),
-            denoise_model: None,
-            clip_models: None,
-            lama_model: None,
-            normal_model: None,
-            embeddings: None,
-            depth_map: None,
+            ..Default::default()
         });
     }
 
@@ -634,13 +676,8 @@ pub async fn get_or_init_denoise_model(
         state.denoise_model = Some(denoise_model.clone());
     } else {
         *ai_state_lock = Some(AiState {
-            models: None,
             denoise_model: Some(denoise_model.clone()),
-            clip_models: None,
-            lama_model: None,
-            normal_model: None,
-            embeddings: None,
-            depth_map: None,
+            ..Default::default()
         });
     }
 
@@ -707,13 +744,8 @@ pub async fn get_or_init_clip_models(
         state.clip_models = Some(clip_models.clone());
     } else {
         *ai_state_lock = Some(AiState {
-            models: None,
-            denoise_model: None,
             clip_models: Some(clip_models.clone()),
-            lama_model: None,
-            normal_model: None,
-            embeddings: None,
-            depth_map: None,
+            ..Default::default()
         });
     }
 
@@ -768,13 +800,8 @@ pub async fn get_or_init_lama_model(
         state.lama_model = Some(lama_model.clone());
     } else {
         *ai_state_lock = Some(AiState {
-            models: None,
-            denoise_model: None,
-            clip_models: None,
             lama_model: Some(lama_model.clone()),
-            normal_model: None,
-            embeddings: None,
-            depth_map: None,
+            ..Default::default()
         });
     }
 
@@ -829,13 +856,8 @@ pub async fn get_or_init_normal_model(
         state.normal_model = Some(normal_model.clone());
     } else {
         *ai_state_lock = Some(AiState {
-            models: None,
-            denoise_model: None,
-            clip_models: None,
-            lama_model: None,
             normal_model: Some(normal_model.clone()),
-            embeddings: None,
-            depth_map: None,
+            ..Default::default()
         });
     }
 

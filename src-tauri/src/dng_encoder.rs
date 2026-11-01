@@ -536,13 +536,10 @@ pub fn encode_linear_dng(image: &Rgb32FImage, metadata: Option<&DngExportMetadat
         cursor.write_all(&vec![0u8; pad as usize]).map_err(|e| e.to_string())?;
     }
 
-    // 4. Write 32-Bit IEEE Floating-Point RGB Radiance Raw Pixel Buffer
-    let raw_floats = image.as_raw();
-    let mut float_bytes = Vec::with_capacity(raw_floats.len() * 4);
-    for &sample in raw_floats {
-        float_bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    cursor.write_all(&float_bytes).map_err(|e| e.to_string())?;
+    // 4. Write 32-Bit IEEE Floating-Point RGB Radiance Raw Pixel Buffer (Zero-Copy)
+    let raw_floats: &[f32] = image.as_raw();
+    let byte_slice: &[u8] = bytemuck::cast_slice(raw_floats);
+    cursor.write_all(byte_slice).map_err(|e| e.to_string())?;
 
     Ok(cursor.into_inner())
 }

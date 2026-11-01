@@ -240,6 +240,28 @@ pub async fn generate_manual_cleanup_patch(
         is_heal = true;
     }
 
+    let shield_rects: Vec<(f32, f32, f32, f32)> = current_adjustments
+        .get("shieldRegions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let sx = s.get("x")?.as_f64()? as f32;
+                    let sy = s.get("y")?.as_f64()? as f32;
+                    let sw = s.get("width")?.as_f64()? as f32;
+                    let sh = s.get("height")?.as_f64()? as f32;
+                    Some((sx, sy, sw, sh))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let is_point_shielded = |px: f32, py: f32| -> bool {
+        shield_rects.iter().any(|&(sx, sy, sw, sh)| {
+            px >= sx && px <= sx + sw && py >= sy && py <= sy + sh
+        })
+    };
+
     let mut color_image = RgbImage::new(crop_w, crop_h);
 
     if !is_heal {
@@ -248,8 +270,14 @@ pub async fn generate_manual_cleanup_patch(
                 let px_x = x as u32;
                 let px_y = y as u32;
                 if mask_bitmap.get_pixel(px_x, px_y)[0] > 0 {
-                    let src_x = (px_x as i32 + offset_x).clamp(0, img_w as i32 - 1) as u32;
-                    let src_y = (px_y as i32 + offset_y).clamp(0, img_h as i32 - 1) as u32;
+                    let mut src_x = (px_x as i32 + offset_x).clamp(0, img_w as i32 - 1) as u32;
+                    let mut src_y = (px_y as i32 + offset_y).clamp(0, img_h as i32 - 1) as u32;
+
+                    if is_point_shielded(src_x as f32, src_y as f32) {
+                        src_x = px_x;
+                        src_y = px_y;
+                    }
+
                     let src_px = source_image.get_pixel(src_x, src_y);
 
                     let dest_x = px_x - min_x_u32;
@@ -299,8 +327,12 @@ pub async fn generate_manual_cleanup_patch(
                         let img_x = (min_x as i32 + x as i32 - 1) as u32;
                         let img_y = (min_y as i32 + y as i32 - 1) as u32;
 
-                        let src_x = (img_x as i32 + offset_x).clamp(0, img_w as i32 - 1) as u32;
-                        let src_y = (img_y as i32 + offset_y).clamp(0, img_h as i32 - 1) as u32;
+                        let mut src_x = (img_x as i32 + offset_x).clamp(0, img_w as i32 - 1) as u32;
+                        let mut src_y = (img_y as i32 + offset_y).clamp(0, img_h as i32 - 1) as u32;
+                        if is_point_shielded(src_x as f32, src_y as f32) {
+                            src_x = img_x;
+                            src_y = img_y;
+                        }
 
                         let dest_px = source_image.get_pixel(img_x, img_y);
                         let src_px = source_image.get_pixel(src_x, src_y);
@@ -334,8 +366,12 @@ pub async fn generate_manual_cleanup_patch(
             let img_x = (min_x as i32 + x as i32 - 1) as u32;
             let img_y = (min_y as i32 + y as i32 - 1) as u32;
 
-            let src_x = (img_x as i32 + offset_x).clamp(0, img_w as i32 - 1) as u32;
-            let src_y = (img_y as i32 + offset_y).clamp(0, img_h as i32 - 1) as u32;
+            let mut src_x = (img_x as i32 + offset_x).clamp(0, img_w as i32 - 1) as u32;
+            let mut src_y = (img_y as i32 + offset_y).clamp(0, img_h as i32 - 1) as u32;
+            if is_point_shielded(src_x as f32, src_y as f32) {
+                src_x = img_x;
+                src_y = img_y;
+            }
             let src_px = source_image.get_pixel(src_x, src_y);
 
             let idx = y * bw + x;
@@ -1277,6 +1313,47 @@ pub async fn generate_retouch_patch(
         .map(|i| (-(i as f32) / (2.0 * sig_c_sq)).exp())
         .collect();
 
+    let shield_rects: Vec<(f32, f32, f32, f32)> = current_adjustments
+        .get("shieldRegions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let sx = s.get("x")?.as_f64()? as f32;
+                    let sy = s.get("y")?.as_f64()? as f32;
+                    let sw = s.get("width")?.as_f64()? as f32;
+                    let sh = s.get("height")?.as_f64()? as f32;
+                    Some((sx, sy, sw, sh))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let is_point_shielded = |px: f32, py: f32| -> bool {
+        shield_rects.iter().any(|&(sx, sy, sw, sh)| {
+            px >= sx && px <= sx + sw && py >= sy && py <= sy + sh
+        })
+    };
+
+    let isophote_guides: Vec<IsophoteGuideLine> = current_adjustments
+        .get("isophoteGuides")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| {
+                    let start_obj = g.get("start")?;
+                    let end_obj = g.get("end")?;
+                    let sx = start_obj.get("x")?.as_f64()? as f32;
+                    let sy = start_obj.get("y")?.as_f64()? as f32;
+                    let ex = end_obj.get("x")?.as_f64()? as f32;
+                    let ey = end_obj.get("y")?.as_f64()? as f32;
+                    let feather = g.get("feather").and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
+                    Some(IsophoteGuideLine::new((sx, sy), (ex, ey), feather))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut color_pixels = vec![0u8; (crop_w * crop_h * 3) as usize];
     let crop_w_i32 = crop_w as i32;
     let crop_h_i32 = crop_h as i32;
@@ -1322,10 +1399,32 @@ pub async fn generate_retouch_patch(
                     let dy = ny - y_i32;
                     let wy_offset = (dy + r) as usize * window_size;
                     let row_offset = (ny as usize) * crop_w_usize;
+                    let global_ny = ny as f32 + min_y_u32 as f32;
 
                     for nx in x_min..=x_max {
+                        let global_nx = nx as f32 + min_x_u32 as f32;
+                        if is_point_shielded(global_nx, global_ny) {
+                            continue;
+                        }
+
                         let dx = nx - x_i32;
-                        let spatial_w = spatial_weights[wy_offset + (dx + r) as usize];
+                        let mut spatial_w = spatial_weights[wy_offset + (dx + r) as usize];
+
+                        if !isophote_guides.is_empty() {
+                            let global_x = x_i32 as f32 + min_x_u32 as f32;
+                            let global_y = y_i32 as f32 + min_y_u32 as f32;
+                            let dist_s = ((dx * dx + dy * dy) as f32).max(1e-4);
+                            let dist = dist_s.sqrt();
+
+                            for guide in &isophote_guides {
+                                let gw = guide.evaluate_weight(global_x, global_y);
+                                if gw > 0.01 {
+                                    let align = ((dx as f32 * guide.tangent.0 + dy as f32 * guide.tangent.1).abs() / dist).clamp(0.0, 1.0);
+                                    let boost = 1.0 + gw * (align * 2.5);
+                                    spatial_w *= boost;
+                                }
+                            }
+                        }
 
                         let n_idx = (row_offset + nx as usize) * 3;
                         let pr = orig_raw[n_idx] as i32;
@@ -1346,9 +1445,9 @@ pub async fn generate_retouch_patch(
                     }
                 }
 
-                let base_r = sum_r / sum_w;
-                let base_g = sum_g / sum_w;
-                let base_b = sum_b / sum_w;
+                let base_r = if sum_w > 1e-6 { sum_r / sum_w } else { ctr_r as f32 };
+                let base_g = if sum_w > 1e-6 { sum_g / sum_w } else { ctr_g as f32 };
+                let base_b = if sum_w > 1e-6 { sum_b / sum_w } else { ctr_b as f32 };
 
                 row_out[x * 3] = ((ctr_r as f32) * (1.0 - blend_factor) + base_r * blend_factor)
                     .clamp(0.0, 255.0) as u8;
@@ -1373,4 +1472,134 @@ pub async fn generate_retouch_patch(
         100,
         false,
     )
+}
+
+
+// =========================================================================
+//  AKVIS Retoucher & SoftOrbits Photo Retoucher Reverse-Engineered Tools
+// =========================================================================
+
+/// AKVIS Retoucher parity: Directional Isophote Guiding Lines (`LinePen`).
+/// Guides pixel synthesis across missing structures by projecting gradient tangents.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IsophoteGuideLine {
+    pub start: (f32, f32),
+    pub end: (f32, f32),
+    pub tangent: (f32, f32),
+    pub feather: f32,
+}
+
+impl IsophoteGuideLine {
+    pub fn new(start: (f32, f32), end: (f32, f32), feather: f32) -> Self {
+        let dx = end.0 - start.0;
+        let dy = end.1 - start.1;
+        let len = (dx * dx + dy * dy).sqrt().max(1e-4);
+        Self {
+            start,
+            end,
+            tangent: (dx / len, dy / len),
+            feather,
+        }
+    }
+
+    /// Evaluates influence weight of this isophote guide line at coordinate (x, y)
+    pub fn evaluate_weight(&self, x: f32, y: f32) -> f32 {
+        let vx = x - self.start.0;
+        let vy = y - self.start.1;
+        let proj = (vx * self.tangent.0 + vy * self.tangent.1).max(0.0);
+        let px = self.start.0 + self.tangent.0 * proj;
+        let py = self.start.1 + self.tangent.1 * proj;
+        let dist = ((x - px) * (x - px) + (y - py) * (y - py)).sqrt();
+        (1.0 - (dist / self.feather.max(1.0))).clamp(0.0, 1.0)
+    }
+}
+
+/// AKVIS Retoucher parity: Exemplar Sampling Protection Shield (`ShieldMask`).
+/// Marks regions strictly forbidden from donor patch sampling during synthesis.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExemplarSamplingShield {
+    pub mask: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ExemplarSamplingShield {
+    pub fn is_forbidden(&self, x: u32, y: u32) -> bool {
+        if x < self.width && y < self.height {
+            self.mask[(y * self.width + x) as usize] > 128
+        } else {
+            false
+        }
+    }
+}
+
+/// AKVIS Retoucher parity: Fast 1-pass variance filter for automatic dust & scratch defect detection.
+/// Evaluates local neighborhood luminance variance, identifying isolated impulse defects.
+pub fn detect_small_defects_fast_variance(
+    img: &image::RgbImage,
+    variance_threshold: f32,
+    radius: usize,
+) -> image::GrayImage {
+    let (w, h) = img.dimensions();
+    let mut mask = image::GrayImage::new(w, h);
+    let r = (radius as i32).clamp(1, 5);
+
+    mask.enumerate_pixels_mut().par_bridge().for_each(|(x, y, p)| {
+        let xi = x as i32;
+        let yi = y as i32;
+        let mut sum = 0.0f32;
+        let mut sum_sq = 0.0f32;
+        let mut count = 0.0f32;
+
+        let center = img.get_pixel(x, y);
+        let center_luma = 0.2126 * center[0] as f32 + 0.7152 * center[1] as f32 + 0.0722 * center[2] as f32;
+
+        for dy in -r..=r {
+            let ny = (yi + dy).clamp(0, h as i32 - 1) as u32;
+            for dx in -r..=r {
+                if dx == 0 && dy == 0 { continue; }
+                let nx = (xi + dx).clamp(0, w as i32 - 1) as u32;
+                let c = img.get_pixel(nx, ny);
+                let l = 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+                sum += l;
+                sum_sq += l * l;
+                count += 1.0;
+            }
+        }
+
+        let mean = sum / count;
+        let variance = (sum_sq / count - mean * mean).max(0.0);
+        let std_dev = variance.sqrt();
+        let deviation = (center_luma - mean).abs();
+
+        if deviation > std_dev * variance_threshold && std_dev < 30.0 {
+            *p = image::Luma([255u8]);
+        } else {
+            *p = image::Luma([0u8]);
+        }
+    });
+
+    mask
+}
+
+/// SoftOrbits Photo Retoucher parity: Native uint8 DirectML tensor format preparation.
+/// Formats image as planar [1, 3, H, W] uint8 and mask as [1, 1, H, W] uint8.
+/// Bypasses FP32 conversion overhead, reducing RAM and PCIe/VRAM bandwidth by 75%.
+pub fn prepare_migan_uint8_tensors(
+    img: &image::RgbImage,
+    mask: &image::GrayImage,
+) -> (Vec<u8>, Vec<u8>) {
+    let (w, h) = img.dimensions();
+    let num_px = (w * h) as usize;
+    let mut img_tensor = vec![0u8; num_px * 3];
+    let raw_img = img.as_raw();
+
+    for i in 0..num_px {
+        img_tensor[i] = raw_img[i * 3];
+        img_tensor[num_px + i] = raw_img[i * 3 + 1];
+        img_tensor[2 * num_px + i] = raw_img[i * 3 + 2];
+    }
+
+    let mask_tensor = mask.as_raw().clone();
+    (img_tensor, mask_tensor)
 }

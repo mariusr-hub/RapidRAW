@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { RotateCcw, Copy, ClipboardPaste, Spline, Settings2 } from 'lucide-react';
+import { RotateCcw, Copy, ClipboardPaste, Spline, Settings2, Activity } from 'lucide-react';
+import SupercontrastCurve from './SupercontrastCurve';
 import { useTranslation } from 'react-i18next';
 import {
   ActiveChannel,
@@ -37,7 +38,7 @@ interface CurveGraphProps {
   adjustments: Adjustments | any;
   histogram: ChannelConfig | null;
   isForMask?: boolean;
-  setAdjustments(updater: (prev: any) => any): void;
+  setAdjustments: (adjustments: any) => void;
   theme: string;
   onDragStateChange?: (isDragging: boolean) => void;
 }
@@ -250,7 +251,9 @@ export default function CurveGraph({
 }: CurveGraphProps) {
   const { t } = useTranslation();
   const { showContextMenu } = useContextMenu();
-  const [curveMode, setCurveMode] = useState<'point' | 'parametric'>(adjustments.curveMode || 'point');
+  const [curveMode, setCurveMode] = useState<'point' | 'parametric' | 'supercontrast'>(
+    (adjustments.curveMode as any) || 'point',
+  );
   const [activeChannel, setActiveChannel] = useState<ActiveChannel>(ActiveChannel.Luma);
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [draggingSplitKey, setDraggingSplitKey] = useState<'split1' | 'split2' | 'split3' | null>(null);
@@ -278,18 +281,23 @@ export default function CurveGraph({
   }, [parametricCurves]);
 
   useEffect(() => {
-    setCurveMode(adjustments.curveMode || 'point');
+    setCurveMode((adjustments.curveMode as any) || 'point');
   }, [adjustments.curveMode]);
 
   const activeParametricSettings =
     (draggingSplitKey ? localParametricSettings : null) ?? parametricCurves[activeChannel];
 
-  const handleToggleMode = (newMode: 'point' | 'parametric') => {
+  const handleToggleMode = (newMode: 'point' | 'parametric' | 'supercontrast') => {
     if (newMode === curveMode) return;
     setCurveMode(newMode);
 
     setAdjustments((prev: any) => {
-      if (newMode === 'parametric') {
+      if (newMode === 'supercontrast') {
+        return {
+          ...prev,
+          curveMode: 'supercontrast',
+        };
+      } else if (newMode === 'parametric') {
         const pC = prev.parametricCurve || DEFAULT_PARAMETRIC_CURVE;
         return {
           ...prev,
@@ -814,7 +822,7 @@ export default function CurveGraph({
         <div className="flex items-center gap-1 p-1 rounded-lg bg-surface-secondary shrink-0">
           <button
             className={`w-8 h-8 rounded-md flex items-center justify-center transition-all ${
-              !isParametricMode ? 'bg-surface text-text-primary' : 'text-text-secondary hover:text-text-primary'
+              curveMode === 'point' ? 'bg-surface text-text-primary' : 'text-text-secondary hover:text-text-primary'
             }`}
             onClick={() => handleToggleMode('point')}
             data-tooltip={t('adjustments.curves.pointCurve')}
@@ -824,7 +832,7 @@ export default function CurveGraph({
           </button>
           <button
             className={`w-8 h-8 rounded-md flex items-center justify-center transition-all ${
-              isParametricMode ? 'bg-surface text-text-primary' : 'text-text-secondary hover:text-text-primary'
+              curveMode === 'parametric' ? 'bg-surface text-text-primary' : 'text-text-secondary hover:text-text-primary'
             }`}
             onClick={() => handleToggleMode('parametric')}
             data-tooltip={t('adjustments.curves.parametricCurve')}
@@ -832,36 +840,57 @@ export default function CurveGraph({
           >
             <Settings2 size={16} />
           </button>
+          <button
+            className={`w-8 h-8 rounded-md flex items-center justify-center transition-all ${
+              curveMode === 'supercontrast' ? 'bg-surface text-text-primary' : 'text-text-secondary hover:text-text-primary'
+            }`}
+            onClick={() => handleToggleMode('supercontrast')}
+            data-tooltip="Tonal Dynamics (3-Band Contrast Balance)"
+            type="button"
+          >
+            <Activity size={16} />
+          </button>
         </div>
 
-        <div className="flex items-center gap-1 shrink-0">
-          {(Object.keys(channelConfig) as Array<ActiveChannel>).map((channel) => {
-            const selected = activeChannel === channel;
-            const channelLabel = String((t as any)(`adjustments.curves.channels.${channel}`));
-            return (
-              <button
-                key={channel}
-                className={`w-7 h-7 rounded-full flex items-center justify-center transition-all ${
-                  selected ? 'ring-2 ring-offset-2 ring-offset-surface ring-accent' : 'bg-surface-secondary'
-                } ${channel === ActiveChannel.Luma ? 'text-text-primary' : ''}`}
-                onClick={() => setActiveChannel(channel)}
-                type="button"
-                style={{
-                  backgroundColor:
-                    channel !== ActiveChannel.Luma && !selected ? channelConfig[channel].color + '40' : undefined,
-                }}
-                title={t('adjustments.curves.channelTitle', { channel: channelLabel })}
-              >
-                <Text variant={TextVariants.small} color={TextColors.primary} weight={TextWeights.bold}>
-                  {channelLabel.charAt(0).toUpperCase()}
-                </Text>
-              </button>
-            );
-          })}
-        </div>
+        {curveMode !== 'supercontrast' && (
+          <div className="flex items-center gap-1 shrink-0">
+            {(Object.keys(channelConfig) as Array<ActiveChannel>).map((channel) => {
+              const selected = activeChannel === channel;
+              const channelLabel = String((t as any)(`adjustments.curves.channels.${channel}`));
+              return (
+                <button
+                  key={channel}
+                  className={`w-7 h-7 rounded-full flex items-center justify-center transition-all ${
+                    selected ? 'ring-2 ring-offset-2 ring-offset-surface ring-accent' : 'bg-surface-secondary'
+                  } ${channel === ActiveChannel.Luma ? 'text-text-primary' : ''}`}
+                  onClick={() => setActiveChannel(channel)}
+                  type="button"
+                  style={{
+                    backgroundColor:
+                      channel !== ActiveChannel.Luma && !selected ? channelConfig[channel].color + '40' : undefined,
+                  }}
+                  title={t('adjustments.curves.channelTitle', { channel: channelLabel })}
+                >
+                  <Text variant={TextVariants.small} color={TextColors.primary} weight={TextWeights.bold}>
+                    {channelLabel.charAt(0).toUpperCase()}
+                  </Text>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
-      <div className="relative">
+      {curveMode === 'supercontrast' ? (
+        <SupercontrastCurve
+          adjustments={adjustments}
+          setAdjustments={setAdjustments}
+          onDragStateChange={onDragStateChange}
+          theme={theme}
+        />
+      ) : (
+        <>
+          <div className="relative">
         <div
           className="w-full aspect-square bg-surface-secondary p-1 rounded-md relative touch-none"
           onMouseDown={handleContainerStart}
@@ -1111,6 +1140,8 @@ export default function CurveGraph({
           </motion.div>
         )}
       </AnimatePresence>
+        </>
+      )}
     </div>
   );
 }

@@ -659,6 +659,7 @@ pub fn stitch_hdr_panels_with_optics(
                             homography: h_full,
                             inliers: inliers.len(),
                             inlier_matches: inliers,
+                            is_subpixel: false,
                         });
                     }
                 }
@@ -712,6 +713,7 @@ pub fn stitch_hdr_panels_with_optics(
                                 homography: h_full,
                                 inliers: hd_inliers.len(),
                                 inlier_matches: hd_inliers,
+                                is_subpixel: false,
                             });
                         }
                     }
