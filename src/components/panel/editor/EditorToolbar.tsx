@@ -9,13 +9,16 @@ import {
   LucideIcon,
   Maximize,
   Redo,
+  RotateCcw,
   SquareSplitHorizontal,
   SquareSplitVertical,
   Sun,
   Undo,
 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
+import { Invokes } from '../../../types/invokes';
 import { CompareMode, GroupingMode } from '../../../types/settings';
 import { SelectedImage } from '../../../types/editor';
 import { ToolbarMenu, ToolbarMenuItem, useMenuDismiss } from './ToolbarMenu';
@@ -634,6 +637,7 @@ const EditorToolbar = memo(
             onSelectMode={onSelectCompareMode}
             onToggle={onToggleCompare}
           />
+          <SplitCompareToggle onKeyDown={handleButtonKeyDown} />
           <MatrixCompareToggle onKeyDown={handleButtonKeyDown} />
           {isHdrAvailable && <HdrButton onKeyDown={handleButtonKeyDown} />}
           <button
@@ -651,6 +655,67 @@ const EditorToolbar = memo(
     );
   },
 );
+
+function SplitCompareToggle({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HTMLButtonElement>): void }) {
+  const { t } = useTranslation();
+  const compareMode = useEditorStore((state) => state.compareMode);
+  const pendingAutoEdit = useEditorStore((state) => state.pendingAutoEdit);
+  const selectedImagePath = useEditorStore((state) => state.selectedImage?.path);
+  const setEditor = useEditorStore((state) => state.setEditor);
+  const isSplit = compareMode === 'vertical_split' || compareMode === 'horizontal_split';
+
+  const handleQuickRejectAuto = () => {
+    if (!pendingAutoEdit) return;
+    const prev = pendingAutoEdit.previousAdjustments;
+    const scene = pendingAutoEdit.scene;
+    useEditorStore.getState().pushHistory(prev, 'Reject Auto Changes');
+    setEditor({
+      adjustments: prev,
+      pendingAutoEdit: null,
+      compareMode: 'none',
+    });
+    invoke(Invokes.RecordAutoEditRejection, {
+      path: selectedImagePath ?? null,
+      scene,
+    }).catch(() => {});
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        className={clsx(
+          'p-2 rounded-full transition-colors',
+          isSplit
+            ? 'bg-accent text-button-text hover:bg-accent/90'
+            : 'bg-surface hover:bg-card-active text-text-primary',
+        )}
+        onClick={() =>
+          setEditor(
+            isSplit
+              ? { compareMode: 'none' }
+              : { compareMode: 'vertical_split', compareView: 'off', showOriginal: false, previewOverride: null },
+          )
+        }
+        onKeyDown={onKeyDown}
+        data-tooltip={t('editor.toolbar.tooltips.splitCompare', 'Before / After Split Slider')}
+      >
+        <SquareSplitHorizontal size={20} />
+      </button>
+      {pendingAutoEdit && (
+        <button
+          type="button"
+          className="p-2 rounded-full bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/40 transition-colors"
+          onClick={handleQuickRejectAuto}
+          onKeyDown={onKeyDown}
+          data-tooltip="Reject Auto Changes (1-Click Revert)"
+        >
+          <RotateCcw size={18} />
+        </button>
+      )}
+    </>
+  );
+}
 
 function MatrixCompareToggle({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HTMLButtonElement>): void }) {
   const compareMode = useEditorStore((state) => state.compareMode);

@@ -103,6 +103,7 @@ export const useAppInitialization = ({
     expandedFolders,
     activeAlbumId,
     expandedAlbumGroups,
+    libraryActivePath,
     setSortCriteria,
     setFilterCriteria,
     setLibrary,
@@ -114,15 +115,17 @@ export const useAppInitialization = ({
       expandedFolders: state.expandedFolders,
       activeAlbumId: state.activeAlbumId,
       expandedAlbumGroups: state.expandedAlbumGroups,
+      libraryActivePath: state.libraryActivePath,
       setSortCriteria: state.setSortCriteria,
       setFilterCriteria: state.setFilterCriteria,
       setLibrary: state.setLibrary,
     })),
   );
 
-  const { setEditor } = useEditorStore(
+  const { setEditor, selectedImagePath } = useEditorStore(
     useShallow((state) => ({
       setEditor: state.setEditor,
+      selectedImagePath: state.selectedImage?.path ?? null,
     })),
   );
 
@@ -385,15 +388,22 @@ export const useAppInitialization = ({
       expandedFolders: [],
       activeAlbumId: null,
       expandedAlbumGroups: [],
+      activePhotoPath: null,
+      viewMode: 'library',
     };
+
+    const activePhotoPath = selectedImagePath ?? libraryActivePath ?? null;
+    const viewMode = selectedImagePath ? 'editor' : 'library';
 
     const pathChanged = prevFolderState.currentFolderPath !== currentFolderPath;
     const expandedChanged = JSON.stringify(prevFolderState.expandedFolders || []) !== JSON.stringify(currentExpanded);
     const albumChanged = prevFolderState.activeAlbumId !== activeAlbumId;
     const albumExpandedChanged =
       JSON.stringify(prevFolderState.expandedAlbumGroups || []) !== JSON.stringify(currentExpandedAlbums);
+    const photoChanged = (prevFolderState.activePhotoPath ?? null) !== activePhotoPath;
+    const viewModeChanged = (prevFolderState.viewMode ?? 'library') !== viewMode;
 
-    if (pathChanged || expandedChanged || albumChanged || albumExpandedChanged) {
+    if (pathChanged || expandedChanged || albumChanged || albumExpandedChanged || photoChanged || viewModeChanged) {
       handleSettingsChange({
         ...appSettings,
         lastFolderState: {
@@ -401,10 +411,21 @@ export const useAppInitialization = ({
           expandedFolders: currentExpanded,
           activeAlbumId,
           expandedAlbumGroups: currentExpandedAlbums,
+          activePhotoPath,
+          viewMode,
         },
       });
     }
-  }, [currentFolderPath, expandedFolders, activeAlbumId, expandedAlbumGroups, appSettings, handleSettingsChange]);
+  }, [
+    currentFolderPath,
+    expandedFolders,
+    activeAlbumId,
+    expandedAlbumGroups,
+    selectedImagePath,
+    libraryActivePath,
+    appSettings,
+    handleSettingsChange,
+  ]);
 
   useEffect(() => {
     if (!appSettings) return;

@@ -27,6 +27,7 @@ import {
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useProductivityActions } from '../../hooks/useProductivityActions';
+import { useUnifiedDropzone } from '../hooks/useUnifiedDropzone';
 import { Invokes } from '../../types/invokes';
 import { ImageFlag } from '../../types/library';
 import Text from '../../components/ui/Text';
@@ -302,6 +303,11 @@ export default function StockPrepDropzone() {
     }
   };
 
+  const { ref: dropzoneRef, isDragActive } = useUnifiedDropzone({
+    id: 'dropzone-stock-prep',
+    onDropPaths: addPaths,
+  });
+
   return (
     <div className="flex flex-col gap-3 p-3 bg-surface/50 rounded-xl border border-border-color/30 text-text-primary">
       {/* Header */}
@@ -330,6 +336,7 @@ export default function StockPrepDropzone() {
 
       {/* Dropzone */}
       <div
+        ref={dropzoneRef}
         onDragOver={(e) => {
           e.preventDefault();
           setIsDragOver(true);
@@ -338,7 +345,7 @@ export default function StockPrepDropzone() {
         onDrop={handleDrop}
         className={clsx(
           'flex flex-col items-center justify-center p-3 rounded-lg border-2 border-dashed transition-all',
-          isDragOver
+          isDragOver || isDragActive
             ? 'border-emerald-500 bg-emerald-500/10 scale-[1.01]'
             : 'border-border-color/40 bg-card/40 hover:border-emerald-500/40',
         )}

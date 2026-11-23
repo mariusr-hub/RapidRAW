@@ -549,33 +549,68 @@ export default function CropPanel() {
     setOverlay('thirds');
 
     const defaults = await getOpenImageDefaults();
-    setAdjustments((prev: Adjustments) => ({
-      ...prev,
-      aspectRatio: defaults.aspectRatio,
-      crop: defaults.crop,
-      flipHorizontal: defaults.flipHorizontal ?? false,
-      flipVertical: defaults.flipVertical ?? false,
-      orientationSteps: defaults.orientationSteps ?? 0,
-      rotation: defaults.rotation ?? 0,
-      transformDistortion: defaults.transformDistortion ?? 0,
-      transformVertical: defaults.transformVertical ?? 0,
-      transformHorizontal: defaults.transformHorizontal ?? 0,
-      transformRotate: defaults.transformRotate ?? 0,
-      transformAspect: defaults.transformAspect ?? 0,
-      transformScale: defaults.transformScale ?? 100,
-      transformXOffset: defaults.transformXOffset ?? 0,
-      transformYOffset: defaults.transformYOffset ?? 0,
-      guidedPerspective: defaults.guidedPerspective,
-      lensMaker: defaults.lensMaker,
-      lensModel: defaults.lensModel,
-      lensDistortionAmount: defaults.lensDistortionAmount,
-      lensVignetteAmount: defaults.lensVignetteAmount,
-      lensTcaAmount: defaults.lensTcaAmount,
-      lensDistortionEnabled: defaults.lensDistortionEnabled,
-      lensTcaEnabled: defaults.lensTcaEnabled,
-      lensVignetteEnabled: defaults.lensVignetteEnabled,
-      lensCorrectionMode: defaults.lensCorrectionMode,
-    }));
+      setAdjustments((prev: Adjustments) => ({
+        ...prev,
+        aspectRatio: defaults.aspectRatio,
+        crop: defaults.crop,
+        flipHorizontal: defaults.flipHorizontal ?? false,
+        flipVertical: defaults.flipVertical ?? false,
+        orientationSteps: defaults.orientationSteps ?? 0,
+        rotation: defaults.rotation ?? 0,
+        transformDistortion: defaults.transformDistortion ?? 0,
+        transformVertical: defaults.transformVertical ?? 0,
+        transformHorizontal: defaults.transformHorizontal ?? 0,
+        transformRotate: defaults.transformRotate ?? 0,
+        transformAspect: defaults.transformAspect ?? 0,
+        transformScale: defaults.transformScale ?? 100,
+        transformXOffset: defaults.transformXOffset ?? 0,
+        transformYOffset: defaults.transformYOffset ?? 0,
+        guidedPerspective: defaults.guidedPerspective,
+        lensMaker: defaults.lensMaker,
+        lensModel: defaults.lensModel,
+        lensDistortionAmount: defaults.lensDistortionAmount,
+        lensVignetteAmount: defaults.lensVignetteAmount,
+        lensTcaAmount: defaults.lensTcaAmount,
+        lensDistortionEnabled: defaults.lensDistortionEnabled,
+        lensTcaEnabled: defaults.lensTcaEnabled,
+        lensVignetteEnabled: defaults.lensVignetteEnabled,
+        lensCorrectionMode: defaults.lensCorrectionMode,
+      }));
+  };
+
+  const handleAutoCrop = async () => {
+    if (!selectedImage) return;
+    try {
+      const targetRatio = resolveAspectRatio(aspectRatio, selectedImage, orientationSteps) ?? 0;
+      const res = await invoke<{
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        target_aspect_ratio?: number;
+      }>(Invokes.GetSaliencyCropRecommendation, {
+        aspectRatio: targetRatio,
+        orientationSteps,
+        flipHorizontal: !!adjustments.flipHorizontal,
+        flipVertical: !!adjustments.flipVertical,
+      });
+      if (!res || res.width <= 0 || res.height <= 0) return;
+      const { width: orientedW, height: orientedH } = getOrientedDimensions(
+        selectedImage.width,
+        selectedImage.height,
+        orientationSteps,
+      );
+      const nextCrop: Crop = {
+        unit: 'px',
+        x: Math.round((res.x / 100) * orientedW),
+        y: Math.round((res.y / 100) * orientedH),
+        width: Math.max(16, Math.round((res.width / 100) * orientedW)),
+        height: Math.max(16, Math.round((res.height / 100) * orientedH)),
+      };
+      setAdjustments((prev: Adjustments) => ({ ...prev, crop: nextCrop }));
+    } catch (err) {
+      toast.error(`Auto Crop failed: ${String(err)}`);
+    }
   };
 
   const isPresetActive = (preset: CropPreset) => preset === selectedPreset;
@@ -777,13 +812,26 @@ export default function CropPanel() {
     <div className="flex flex-col h-full">
       <div className="p-3 flex justify-between items-center shrink-0 border-b border-surface">
         <Text variant={TextVariants.title}>{t('editor.crop.title')}</Text>
-        <button
-          className="p-2 rounded-full hover:bg-surface transition-colors"
-          onClick={handleReset}
-          data-tooltip={t('editor.crop.resetTooltip')}
-        >
-          <RotateCcw size={18} />
-        </button>
+        <div className="flex items-center gap-1.5">
+          {selectedImage && (
+            <button
+              type="button"
+              className="px-2.5 py-1.5 rounded-full bg-accent/15 hover:bg-accent/25 text-accent text-xs font-medium flex items-center gap-1 transition-colors"
+              onClick={handleAutoCrop}
+              data-tooltip={t('editor.crop.autoCropTooltip', 'Saliency Auto Crop')}
+            >
+              <Scan size={14} />
+              <span>{t('editor.crop.autoCrop', 'Auto Crop')}</span>
+            </button>
+          )}
+          <button
+            className="p-2 rounded-full hover:bg-surface transition-colors"
+            onClick={handleReset}
+            data-tooltip={t('editor.crop.resetTooltip')}
+          >
+            <RotateCcw size={18} />
+          </button>
+        </div>
       </div>
 
       <div className="grow overflow-y-auto p-3 space-y-6 custom-scrollbar">

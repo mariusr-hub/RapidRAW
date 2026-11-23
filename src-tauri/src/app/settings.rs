@@ -74,6 +74,10 @@ pub struct LastFolderState {
     pub active_album_id: Option<String>,
     #[serde(default)]
     pub expanded_album_groups: Vec<String>,
+    #[serde(default)]
+    pub active_photo_path: Option<String>,
+    #[serde(default)]
+    pub view_mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

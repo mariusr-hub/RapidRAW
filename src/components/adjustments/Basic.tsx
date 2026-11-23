@@ -314,6 +314,13 @@ function BasicAdjustments({
           ...prev,
           ...adj,
         }));
+        useEditorStore.getState().setEditor({
+          pendingAutoEdit: {
+            path: selectedImage?.path ?? '',
+            scene: res.sceneName || 'Smart Tone',
+            previousAdjustments: current,
+          },
+        });
         useEditorStore.getState().pushHistory(next, 'Smart Tone');
       }
     } catch (err) {
@@ -334,6 +341,13 @@ function BasicAdjustments({
           if (typeof results.vibrance === 'number') patch.vibrance = results.vibrance;
           if (typeof results.vignetteAmount === 'number') patch.vignetteAmount = results.vignetteAmount;
           setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, ...patch }));
+          useEditorStore.getState().setEditor({
+            pendingAutoEdit: {
+              path: selectedImage?.path ?? '',
+              scene: 'Auto Enhance',
+              previousAdjustments: current,
+            },
+          });
           useEditorStore.getState().pushHistory({ ...current, ...patch }, 'Auto Enhance');
         }
       } catch (e) {

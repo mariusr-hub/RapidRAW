@@ -14,6 +14,7 @@ import {
 import { useUIStore } from '../../store/useUIStore';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useProductivityActions } from '../../hooks/useProductivityActions';
+import { useUnifiedDropzone } from '../hooks/useUnifiedDropzone';
 import Text from '../../components/ui/Text';
 import { TextVariants, TextWeights } from '../../types/typography';
 
@@ -56,6 +57,11 @@ export default function FocusStackDropzone() {
   const clearAll = useCallback(() => {
     setLocalPaths([]);
   }, []);
+
+  const { ref: dropzoneRef, isDragActive } = useUnifiedDropzone({
+    id: 'dropzone-focus-stack',
+    onDropPaths: addPaths,
+  });
 
   const handleBrowseFiles = async () => {
     try {
@@ -147,6 +153,7 @@ export default function FocusStackDropzone() {
       </div>
 
       <div
+        ref={dropzoneRef}
         onDragOver={(e) => {
           e.preventDefault();
           setIsDragOver(true);
@@ -155,7 +162,7 @@ export default function FocusStackDropzone() {
         onDrop={handleDrop}
         className={clsx(
           'flex flex-col items-center justify-center p-3 rounded-lg border-2 border-dashed transition-all',
-          isDragOver
+          isDragOver || isDragActive
             ? 'border-indigo-500 bg-indigo-500/10 scale-[1.01]'
             : 'border-border-color/40 bg-card/40 hover:border-indigo-500/40',
         )}

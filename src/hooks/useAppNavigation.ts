@@ -705,6 +705,18 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       } else {
         await handleSelectSubfolder(pathToSelect, false, preloadedImages, false);
       }
+
+      const targetPhotoPath = folderState?.activePhotoPath;
+      if (targetPhotoPath) {
+        const currentImages = useLibraryStore.getState().imageList;
+        const matchedImage = currentImages.find((img) => img.path === targetPhotoPath);
+        if (matchedImage) {
+          useLibraryStore.getState().setLibrary({ libraryActivePath: matchedImage.path });
+          if (folderState?.viewMode === 'editor') {
+            handleImageSelect(matchedImage.path);
+          }
+        }
+      }
     };
 
     restore().catch((err) => {

@@ -19,6 +19,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useEditorStore } from '../../store/useEditorStore';
 import { useProductivityActions } from '../../hooks/useProductivityActions';
+import { useUnifiedDropzone } from '../hooks/useUnifiedDropzone';
 import { Invokes } from '../../types/invokes';
 import Text from '../../components/ui/Text';
 import { TextVariants, TextWeights } from '../../types/typography';
@@ -99,6 +100,11 @@ export default function NightSkyDropzone() {
       },
     }));
   }, [setUI]);
+
+  const { ref: dropzoneRef, isDragActive } = useUnifiedDropzone({
+    id: 'dropzone-night-sky',
+    onDropPaths: addPaths,
+  });
 
   const handleBrowseFiles = async () => {
     try {
@@ -212,13 +218,14 @@ export default function NightSkyDropzone() {
     <div className="flex flex-col gap-2 p-2 bg-surface/40 rounded-lg border border-surface text-sm my-1">
       {/* Dropzone container */}
       <div
+        ref={dropzoneRef}
         onDragOver={handleDragOver}
         onDragEnter={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         className={clsx(
           'relative flex flex-col items-center justify-center p-3 rounded-lg border-2 border-dashed transition-all duration-200 cursor-pointer text-center',
-          isDragOver
+          isDragOver || isDragActive
             ? 'border-accent bg-accent/15 scale-[0.99]'
             : 'border-accent/40 bg-bg-secondary/70 hover:border-accent/70 hover:bg-bg-secondary',
         )}

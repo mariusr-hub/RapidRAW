@@ -906,6 +906,13 @@ function App() {
         });
     }
 
+    if (active.data.current?.type === 'library-image' && over?.data.current?.type === 'enhanced-dropzone') {
+      const sourcePaths = activeImageDragItem?.paths || (active.data.current.path ? [active.data.current.path] : []);
+      if (sourcePaths.length > 0 && typeof over.data.current.onDropPaths === 'function') {
+        over.data.current.onDropPaths(sourcePaths);
+      }
+    }
+
     if (active.data.current?.type === 'library-image' && over?.data.current?.type === 'album') {
       const targetAlbumId = over.data.current.id;
       const sourcePaths = activeImageDragItem?.paths || [active.data.current.path];

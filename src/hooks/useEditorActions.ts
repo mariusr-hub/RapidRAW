@@ -257,9 +257,17 @@ export function useEditorActions() {
       const selectedImage = useEditorStore.getState().selectedImage;
       if (!selectedImage?.isReady) return;
       try {
+        const previousAdjustments = useEditorStore.getState().adjustments;
         const autoAdjustments: Adjustments = await invoke(Invokes.CalculateAutoAdjustments, {
-          jsAdjustments: useEditorStore.getState().adjustments,
+          jsAdjustments: previousAdjustments,
           mode,
+        });
+        setEditor({
+          pendingAutoEdit: {
+            path: selectedImage.path,
+            scene: mode === AutoAdjustMode.Normal ? 'Auto Adjust' : String(mode),
+            previousAdjustments,
+          },
         });
         setAdjustments(
           (prev: Adjustments) => ({

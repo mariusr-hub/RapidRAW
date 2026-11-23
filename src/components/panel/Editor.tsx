@@ -192,6 +192,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const isLoading = useLibraryStore((s) => s.isViewLoading);
   const selectedImage = useEditorStore((s) => s.selectedImage);
   const adjustments = useEditorStore(useShallow((s) => omitTonalAdjustments(s.adjustments)));
+  const pendingAutoEdit = useEditorStore((s) => s.pendingAutoEdit);
   const adjustmentsHistory = useEditorStore((s) => s.history);
   const adjustmentsHistoryLabels = useEditorStore((s) => s.historyLabels);
   const adjustmentsHistoryIndex = useEditorStore((s) => s.historyIndex);
@@ -2866,6 +2867,60 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
           {straightenOverlay}
         </div>
         <SpeedEditOverlay />
+        {pendingAutoEdit && (
+          <div className="pointer-events-auto absolute bottom-5 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 px-3 py-1.5 rounded-full bg-surface/90 backdrop-blur-md border border-border-color/60 shadow-2xl text-xs">
+            <span className="px-2 py-0.5 rounded-full bg-accent/15 text-accent font-medium">
+              Auto: {pendingAutoEdit.scene}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                const isSplit =
+                  enhancedCompareMode === 'vertical_split' || enhancedCompareMode === 'horizontal_split';
+                setEditor(
+                  isSplit
+                    ? { compareMode: 'none' }
+                    : { compareMode: 'vertical_split', compareView: 'off', showOriginal: false, previewOverride: null },
+                );
+              }}
+              className={clsx(
+                'px-2.5 py-1 rounded-full transition-colors font-medium',
+                enhancedCompareMode === 'vertical_split' || enhancedCompareMode === 'horizontal_split'
+                  ? 'bg-accent text-button-text'
+                  : 'bg-bg-primary hover:bg-card-active text-text-primary',
+              )}
+            >
+              Split
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditor({ pendingAutoEdit: null })}
+              className="px-2.5 py-1 rounded-full bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-colors font-medium"
+            >
+              Keep Auto
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const prev = pendingAutoEdit.previousAdjustments;
+                const scene = pendingAutoEdit.scene;
+                useEditorStore.getState().pushHistory(prev, 'Reject Auto Changes');
+                setEditor({
+                  adjustments: prev,
+                  pendingAutoEdit: null,
+                  compareMode: 'none',
+                });
+                invoke(Invokes.RecordAutoEditRejection, {
+                  path: selectedImage?.path ?? null,
+                  scene,
+                }).catch(() => {});
+              }}
+              className="px-2.5 py-1 rounded-full bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/40 transition-colors font-medium"
+            >
+              Reject Auto Changes
+            </button>
+          </div>
+        )}
         {enhancedCompareMode === 'matrix_4way' && <VariantMatrix4Way />}
       </div>
     </div>

@@ -316,6 +316,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     set((state) => ({
       ...(restored ?? { history: [initialState], historyLabels: [''], historyIndex: 0 }),
       adjustments: initialState,
+      pendingAutoEdit: null,
       ...(state.cropSessionSnapshot
         ? {
             cropSessionSnapshot: {
