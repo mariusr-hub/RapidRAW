@@ -1,8 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import {
   CheckCircle,
+  Compass,
   Cylinder,
+  Expand,
   Globe,
   Images,
   Layers,
@@ -16,6 +19,7 @@ import {
   WandSparkles,
   XCircle,
 } from 'lucide-react';
+import { Invokes } from '../../types/invokes';
 import { AnimatePresence, motion } from 'framer-motion';
 import clsx from 'clsx';
 import Button from '../ui/Button';
@@ -83,10 +87,12 @@ function useToolText(kind: MergeKind, count: number): ToolText {
 }
 
 const PROJECTION_OPTIONS = [
-  { value: 'auto', label: 'modals.panorama.projectionAuto', icon: WandSparkles },
-  { value: 'spherical', label: 'modals.panorama.projectionSpherical', icon: Globe },
-  { value: 'cylindrical', label: 'modals.panorama.projectionCylindrical', icon: Cylinder },
-  { value: 'perspective', label: 'modals.panorama.projectionPerspective', icon: Square },
+  { value: 'auto', label: 'modals.panorama.projectionAuto', fallback: 'Auto', icon: WandSparkles },
+  { value: 'spherical', label: 'modals.panorama.projectionSpherical', fallback: 'Spherical', icon: Globe },
+  { value: 'cylindrical', label: 'modals.panorama.projectionCylindrical', fallback: 'Cylindrical', icon: Cylinder },
+  { value: 'perspective', label: 'modals.panorama.projectionPerspective', fallback: 'Perspective', icon: Square },
+  { value: 'panini', label: 'modals.panorama.projectionPanini', fallback: 'Panini (155°)', icon: Expand },
+  { value: 'stereographic', label: 'modals.panorama.projectionStereographic', fallback: 'Stereographic', icon: Compass },
 ] as const;
 
 const METHOD_OPTIONS = [
@@ -156,6 +162,12 @@ export default function MergeModal({
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [showOverlay, setShowOverlay] = useState(false);
   const [draftSettings, setDraftSettings] = useState<MergeSettings>(settings);
+  const [bracketInfo, setBracketInfo] = useState<{
+    isHdrBracketSet: boolean;
+    panelCount: number;
+    bracketSize: number;
+    summary: string;
+  } | null>(null);
 
   const mouseDownTarget = useRef<EventTarget | null>(null);
   const commitTimer = useRef<number | null>(null);
@@ -165,6 +177,29 @@ export default function MergeModal({
   useEffect(() => {
     setDraftSettings(settings);
   }, [settings]);
+
+  useEffect(() => {
+    if (!isOpen || kind !== 'panorama' || sourcePaths.length < 2) {
+      setBracketInfo(null);
+      return;
+    }
+    let active = true;
+    invoke<{
+      isHdrBracketSet: boolean;
+      panelCount: number;
+      bracketSize: number;
+      summary: string;
+    }>(Invokes.InspectPanoramaBrackets, { paths: sourcePaths })
+      .then((res) => {
+        if (active && res) setBracketInfo(res);
+      })
+      .catch(() => {
+        if (active) setBracketInfo(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isOpen, kind, sourcePaths]);
 
   useEffect(() => {
     if (isOpen) {
@@ -263,14 +298,16 @@ export default function MergeModal({
   );
 
   const renderPanoramaOptions = (panorama: PanoramaSettings) => {
-    const projectionLabel = (value: PanoramaProjectionMode) =>
-      t(PROJECTION_OPTIONS.find((option) => option.value === value)?.label ?? 'modals.panorama.projectionAuto');
+    const projectionLabel = (value: PanoramaProjectionMode) => {
+      const opt = PROJECTION_OPTIONS.find((option) => option.value === value);
+      return opt ? t(opt.label, opt.fallback) : t('modals.panorama.projectionAuto', 'Auto');
+    };
     if (!isUpdatingPreview) {
       const requested = (settings as PanoramaSettings).projection;
-      let note = null;
-      if (preview?.projection && requested === 'auto') {
+      let note: string | null = preview?.projectionNote ?? null;
+      if (!note && preview?.projection && requested === 'auto') {
         note = t('modals.panorama.autoProjectionUsed', { projection: projectionLabel(preview.projection) });
-      } else if (preview?.projection && requested !== preview.projection) {
+      } else if (!note && preview?.projection && requested !== preview.projection) {
         note = t('modals.panorama.projectionFallback', {
           requested: projectionLabel(requested),
           projection: projectionLabel(preview.projection),
@@ -284,7 +321,7 @@ export default function MergeModal({
           {t('modals.panorama.projection')}
         </Text>
         <Segmented
-          options={PROJECTION_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))}
+          options={PROJECTION_OPTIONS.map((option) => ({ ...option, label: t(option.label, option.fallback) }))}
           value={panorama.projection}
           onChange={(projection) => updateSettings({ projection })}
         />
@@ -314,6 +351,15 @@ export default function MergeModal({
           checked={panorama.exposureCompensation}
           onChange={(exposureCompensation) => updateSettings({ exposureCompensation })}
           tooltip={t('modals.panorama.exposureCompensationHint')}
+        />
+        <Switch
+          label={t('modals.panorama.fastDraft', 'Fast Draft (Half Size)')}
+          checked={!!(panorama.fastDraft ?? panorama.halfSize)}
+          onChange={(fastDraft) => updateSettings({ fastDraft, halfSize: fastDraft })}
+          tooltip={t(
+            'modals.panorama.fastDraftHint',
+            'Renders the interactive preview at half resolution for faster projection & crop tuning.',
+          )}
         />
       </div>,
     ];
@@ -436,15 +482,22 @@ export default function MergeModal({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
-            <Text variant={TextVariants.small}>
-              {isSaving && progressMessage
-                ? progressMessage
-                : t('modals.merge.outputInfo', {
-                    images: preview.imageCount,
-                    width: preview.width,
-                    height: preview.height,
-                  })}
-            </Text>
+            <div className="flex flex-wrap items-center gap-2">
+              <Text variant={TextVariants.small}>
+                {isSaving && progressMessage
+                  ? progressMessage
+                  : t('modals.merge.outputInfo', {
+                      images: preview.imageCount,
+                      width: preview.width,
+                      height: preview.height,
+                    })}
+              </Text>
+              {typeof preview.fovDeg === 'number' && (
+                <span className="px-2 py-0.5 rounded bg-bg-primary border border-border-color/40 text-[11px] font-mono text-text-secondary">
+                  FOV {Math.round(preview.fovDeg)}°
+                </span>
+              )}
+            </div>
             {(preview.excludedCount > 0 || preview.unalignedCount > 0) && (
               <Text
                 as="div"
@@ -531,14 +584,31 @@ export default function MergeModal({
 
     const ToolIcon = tool.icon;
     return (
-      <div className="flex flex-col items-center justify-center h-[460px]">
-        <div className="flex items-center justify-center mb-6">
-          <ToolIcon className="w-12 h-12 text-accent" />
+      <div className="w-full">
+        <div className="flex flex-col items-center justify-center py-6">
+          <div className="flex items-center justify-center mb-4">
+            <ToolIcon className="w-12 h-12 text-accent" />
+          </div>
+          <Text variant={TextVariants.title} className="mb-2 text-center">
+            {text.title}
+          </Text>
+          <Text className="text-center max-w-md leading-relaxed text-text-secondary">{text.description}</Text>
+          {bracketInfo?.isHdrBracketSet && (
+            <div className="mt-4 px-3.5 py-2 rounded-lg bg-accent/10 border border-accent/30 text-xs text-text-primary flex items-center gap-2 max-w-lg">
+              <TriangleAlert size={14} className="text-accent shrink-0" />
+              <span>{bracketInfo.summary}</span>
+            </div>
+          )}
         </div>
-        <Text variant={TextVariants.title} className="mb-3 text-center">
-          {text.title}
-        </Text>
-        <Text className="text-center max-w-md leading-relaxed text-text-secondary">{text.description}</Text>
+        {kind === 'panorama' && (
+          <div className="border-t border-border-color/40 pt-3">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {renderPanoramaOptions(draftSettings as PanoramaSettings).map((col) => (
+                <div key={col.key}>{col}</div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     );
   };

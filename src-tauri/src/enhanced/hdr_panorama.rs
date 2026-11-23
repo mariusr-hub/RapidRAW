@@ -879,6 +879,92 @@ pub fn inspect_hdr_pano_grouping(paths: Vec<String>) -> Result<HdrPanoGroupingRe
     })
 }
 
+#[tauri::command]
+pub fn inspect_panorama_brackets(paths: Vec<String>) -> serde_json::Value {
+    let (panels, excluded_outliers) = cluster_hdr_brackets_robust(&paths);
+    let panel_count = panels.len();
+    let bracket_size = panels.first().map(|p| p.paths.len()).unwrap_or(0);
+    let is_hdr_bracket_set = panel_count >= 2 && bracket_size >= 2;
+    let summary = if is_hdr_bracket_set {
+        format!(
+            "Detected {} panorama panels x {} exposure brackets ({} total frames){}",
+            panel_count,
+            bracket_size,
+            paths.len(),
+            if excluded_outliers.is_empty() {
+                String::new()
+            } else {
+                format!(", {} outlier(s)", excluded_outliers.len())
+            }
+        )
+    } else {
+        "Standard single-exposure panorama set".to_string()
+    };
+
+    serde_json::json!({
+        "isHdrBracketSet": is_hdr_bracket_set,
+        "panelCount": panel_count,
+        "bracketSize": bracket_size,
+        "excludedOutliers": excluded_outliers.len(),
+        "summary": summary,
+    })
+}
+
+#[tauri::command]
+pub async fn update_hdr_panorama_preview(
+    options: Option<crate::enhanced::hdr_fusion::HdrMergeOptions>,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let radiance_opt = state
+        .panorama_linear_radiance
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let radiance = radiance_opt.ok_or_else(|| "No HDR panorama radiance buffer available".to_string())?;
+    let opts = options.unwrap_or_default();
+    let app_handle_bg = app_handle.clone();
+    let pano_result_handle = state.hdr_panorama_result.clone();
+    let hdr_result_handle = state.hdr_result.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let tone_mapped = crate::enhanced::hdr_fusion::tone_map_radiance_image(
+            &radiance,
+            &opts,
+            Some(&app_handle_bg),
+        );
+        let dyn_img = DynamicImage::ImageRgb32F(tone_mapped);
+        *pano_result_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(dyn_img.clone());
+        *hdr_result_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(dyn_img.clone());
+
+        let rgb8 = dyn_img.to_rgb8();
+        let (w, h) = (rgb8.width(), rgb8.height());
+        let (nw, nh) = if w.max(h) <= 1600 {
+            (w.max(1), h.max(1))
+        } else if w > h {
+            (1600, ((1600.0 * h as f32 / w as f32).round() as u32).max(1))
+        } else {
+            (((1600.0 * w as f32 / h as f32).round() as u32).max(1), 1600)
+        };
+        let resized = if (nw, nh) == (w, h) {
+            rgb8
+        } else {
+            image::imageops::resize(&rgb8, nw, nh, image::imageops::FilterType::Triangle)
+        };
+        let jpeg_bytes = mozjpeg_rs::Encoder::new(mozjpeg_rs::Preset::BaselineFastest)
+            .quality(88)
+            .encode_rgb(&resized.into_raw(), nw, nh)
+            .map_err(|e| format!("Failed to encode HDR panorama preview: {}", e))?;
+        use base64::{Engine as _, engine::general_purpose};
+        Ok(format!(
+            "data:image/jpeg;base64,{}",
+            general_purpose::STANDARD.encode(jpeg_bytes)
+        ))
+    })
+    .await
+    .map_err(|e| format!("Failed to update HDR panorama preview: {}", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

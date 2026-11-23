@@ -90,7 +90,12 @@ impl MergeSession for PanoramaSession {
         self.prepare_plan(&settings)?;
         let plan = self.plan();
         let (w, h) = plan.output_size(1.0, self.alignment.orientation);
-        let scale = (PREVIEW_MAX_DIMENSION / w.max(h) as f64).min(plan.full_scale());
+        let target_max_dim = if settings.fast_draft {
+            PREVIEW_MAX_DIMENSION * 0.5
+        } else {
+            PREVIEW_MAX_DIMENSION
+        };
+        let scale = (target_max_dim / w.max(h) as f64).min(plan.full_scale());
         let image = srgb_decoded(render_composition(
             &self.scene(),
             plan,
@@ -106,6 +111,8 @@ impl MergeSession for PanoramaSession {
             image_count: self.sources.len(),
             excluded_count: self.excluded_count,
             projection: Some(plan.projection()),
+            fov_deg: Some(plan.fov_deg),
+            projection_note: plan.projection_note.clone(),
             ..Default::default()
         })
     }

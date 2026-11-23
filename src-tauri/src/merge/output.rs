@@ -121,6 +121,8 @@ pub struct MergePreview {
     pub excluded_count: usize,
     pub unaligned_count: usize,
     pub projection: Option<Projection>,
+    pub fov_deg: Option<f32>,
+    pub projection_note: Option<String>,
 }
 
 pub fn encode_jpeg_base64(image: &RgbImage) -> Result<String, String> {

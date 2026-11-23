@@ -1,7 +1,7 @@
 use super::camera::{Camera, Lens, Orientation};
 use super::layout::{OutputLayout, plan_layout};
 use super::photometric::Photometric;
-use super::projection::{Projection, ProjectionMode, plan_canvas};
+use super::projection::{Projection, ProjectionMode, plan_canvas_with_info};
 use super::seams::{NO_LABEL, SeamLayer, find_seams};
 use crate::merge::blending::{MultiBandBlender, band_count};
 use crate::merge::raster::{Raster, Rect, push_pull_fill};
@@ -23,6 +23,8 @@ pub struct StitchSettings {
     pub boundary_warp: f64,
     pub auto_crop: bool,
     pub exposure_compensation: bool,
+    #[serde(default, alias = "halfSize")]
+    pub fast_draft: bool,
 }
 
 impl Default for StitchSettings {
@@ -32,6 +34,7 @@ impl Default for StitchSettings {
             boundary_warp: 0.0,
             auto_crop: true,
             exposure_compensation: true,
+            fast_draft: false,
         }
     }
 }
@@ -61,6 +64,8 @@ pub struct CompositionPlan {
     layers: Vec<PlannedLayer>,
     labels: Vec<u16>,
     photometric: Photometric,
+    pub fov_deg: f32,
+    pub projection_note: Option<String>,
 }
 
 impl CompositionPlan {
@@ -230,7 +235,8 @@ pub fn plan_composition(
     scene: &Scene,
     settings: &StitchSettings,
 ) -> Result<CompositionPlan, String> {
-    let canvas = plan_canvas(scene.cameras, &scene.lens, settings.projection);
+    let (canvas, fov_deg, projection_note) =
+        plan_canvas_with_info(scene.cameras, &scene.lens, settings.projection);
     let canvas_area = canvas.width * canvas.height;
     let seam_scale = (SEAM_MEGAPIXELS * 1.0e6 / canvas_area).sqrt().min(1.0);
     let layout = plan_layout(
@@ -303,6 +309,8 @@ pub fn plan_composition(
         layers,
         labels,
         photometric,
+        fov_deg,
+        projection_note,
     })
 }
 

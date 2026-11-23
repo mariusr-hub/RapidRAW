@@ -338,7 +338,7 @@ pub fn plan_layout(
         union.at_canvas(cx, cy)
     });
 
-    let rect = match (auto_crop, layout.canvas.wraps) {
+    let mut rect = match (auto_crop, layout.canvas.wraps) {
         (true, true) => full_width_rows(&output),
         (true, false) => {
             largest_rectangle(&output.data, output.width, output.height).map(|(x, y, w, h)| {
@@ -349,6 +349,9 @@ pub fn plan_layout(
         }
         (false, _) => bounding_box(&output),
     };
+    if rect.is_none() || matches!(rect, Some((_, _, w, h)) if w == 0 || h == 0) {
+        rect = bounding_box(&output);
+    }
     let (x, y, w, h) = rect.ok_or_else(|| "The panorama has no visible area.".to_string())?;
 
     let (cx, cw) = if layout.canvas.wraps {
@@ -363,4 +366,31 @@ pub fn plan_layout(
         height: (h as f64 / grid_scale).min(layout.canvas.height),
     };
     Ok(layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sparse_wraps_mask_falls_back_to_bounding_box() {
+        // Mask where full_width_rows is empty (gaps at ends) yet visible pixels exist
+        let width = 12;
+        let height = 8;
+        let mut data = vec![false; width * height];
+        for y in 2..6 {
+            for x in 2..9 {
+                data[y * width + x] = true;
+            }
+        }
+        let mask = Mask {
+            data,
+            width,
+            height,
+            scale: 1.0,
+        };
+        assert!(full_width_rows(&mask).is_none());
+        let bbox = bounding_box(&mask);
+        assert_eq!(bbox, Some((2, 2, 7, 4)));
+    }
 }

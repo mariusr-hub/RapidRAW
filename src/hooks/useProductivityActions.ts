@@ -52,13 +52,17 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
 
   const handleMergeSettingsChange = useCallback(
     async (settings: MergeSettings) => {
+      const { preview, isProcessing, settings: previousSettings } = useUIStore.getState().mergeModalState;
+      if (!preview || isProcessing) {
+        updateMerge({ settings });
+        return;
+      }
       const request = ++mergeRequest.current;
-      const previousSettings = useUIStore.getState().mergeModalState.settings;
       updateMerge({ isUpdatingPreview: true, settings });
       try {
-        const preview: MergePreview = await invoke(Invokes.UpdateMergePreview, { settings });
+        const nextPreview: MergePreview = await invoke(Invokes.UpdateMergePreview, { settings });
         if (request !== mergeRequest.current) return;
-        updateMerge({ isUpdatingPreview: false, preview });
+        updateMerge({ isUpdatingPreview: false, preview: nextPreview });
       } catch (err) {
         if (request !== mergeRequest.current) return;
         console.error('Failed to update the merge preview:', err);

@@ -842,6 +842,8 @@ pub fn run() {
             enhanced::geometry_preview::preview_geometry_transform,
             enhanced::hdr_panorama::stitch_hdr_panorama,
             enhanced::hdr_panorama::inspect_hdr_pano_grouping,
+            enhanced::hdr_panorama::inspect_panorama_brackets,
+            enhanced::hdr_panorama::update_hdr_panorama_preview,
             enhanced::hero_curator::curate_hero_shots,
             enhanced::negative_conversion::sample_negative_border_mask,
             enhanced::negative_conversion::auto_detect_negative_border_mask,

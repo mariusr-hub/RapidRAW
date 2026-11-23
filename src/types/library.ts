@@ -160,10 +160,12 @@ export const DEFAULT_MERGE_SETTINGS: MergeSettingsByKind = {
 export interface MergePreview {
   base64: string;
   excludedCount: number;
+  fovDeg?: number | null;
   height: number;
   imageCount: number;
   overlayBase64: string | null;
   projection: PanoramaProjection | null;
+  projectionNote?: string | null;
   unalignedCount: number;
   width: number;
 }

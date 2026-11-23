@@ -9,6 +9,8 @@ const PERSPECTIVE_MAX_ANGLE: f64 = 80.0 * PI / 180.0;
 const PERSPECTIVE_AUTO_MAX_FOV: f64 = 100.0 * PI / 180.0;
 const CYLINDRICAL_MAX_LATITUDE: f64 = 75.0 * PI / 180.0;
 const CYLINDRICAL_AUTO_MAX_VFOV: f64 = 70.0 * PI / 180.0;
+const PANINI_MAX_FOV: f64 = 155.0 * PI / 180.0;
+const STEREOGRAPHIC_MAX_FOV: f64 = 150.0 * PI / 180.0;
 const MAX_CANVAS_SIDE: f64 = 65_000.0;
 const MAX_CANVAS_PIXELS: f64 = 1.0e9;
 
@@ -18,6 +20,8 @@ pub enum Projection {
     Perspective,
     Cylindrical,
     Spherical,
+    Panini,
+    Stereographic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -28,6 +32,8 @@ pub enum ProjectionMode {
     Perspective,
     Cylindrical,
     Spherical,
+    Panini,
+    Stereographic,
 }
 
 impl Projection {
@@ -44,6 +50,25 @@ impl Projection {
             Projection::Spherical => {
                 let rho = ray.x.hypot(ray.z);
                 Some(Vector2::new(ray.x.atan2(ray.z), ray.y.atan2(rho)))
+            }
+            Projection::Panini => {
+                let rho = ray.x.hypot(ray.z);
+                if rho <= 1e-9 {
+                    return None;
+                }
+                let denom = 1.0 + ray.z / rho;
+                (denom > 1e-4).then(|| {
+                    let s = 2.0 / denom;
+                    Vector2::new(s * (ray.x / rho), s * (ray.y / rho))
+                })
+            }
+            Projection::Stereographic => {
+                let r = ray.normalize();
+                let denom = 1.0 + r.z;
+                (denom > 1e-4).then(|| {
+                    let k = 2.0 / denom;
+                    Vector2::new(k * r.x, k * r.y)
+                })
             }
         }
     }
@@ -63,6 +88,25 @@ impl Projection {
                 let (su, cu) = u.sin_cos();
                 let (sv, cv) = v.sin_cos();
                 Some(Vector3::new(su * cv, sv, cu * cv))
+            }
+            Projection::Panini => {
+                let lambda = 2.0 * (u * 0.5).atan();
+                let (sin_l, cos_l) = lambda.sin_cos();
+                let denom = 1.0 + cos_l;
+                if denom <= 1e-4 {
+                    return None;
+                }
+                let s = 2.0 / denom;
+                let vy = v / s;
+                Some(Vector3::new(sin_l, vy, cos_l).normalize())
+            }
+            Projection::Stereographic => {
+                let r2 = u * u + v * v;
+                let denom = 4.0 + r2;
+                if denom <= 1e-9 {
+                    return None;
+                }
+                Some(Vector3::new(4.0 * u / denom, 4.0 * v / denom, (4.0 - r2) / denom).normalize())
             }
         }
     }
@@ -203,42 +247,86 @@ fn field_of_view(cameras: &[Camera], lens: &Lens) -> FieldOfView {
     }
 }
 
-fn resolve_projection(mode: ProjectionMode, fov: &FieldOfView) -> Projection {
+fn resolve_projection_with_info(mode: ProjectionMode, fov: &FieldOfView) -> (Projection, f32, Option<String>) {
+    let fov_deg = (fov.longitude_span.to_degrees() as f32).max(1.0);
     let perspective_ok = !fov.full_circle && fov.max_axis_angle < PERSPECTIVE_MAX_ANGLE;
     let cylindrical_ok = !fov.pole_visible
         && fov.latitude_min > -CYLINDRICAL_MAX_LATITUDE
         && fov.latitude_max < CYLINDRICAL_MAX_LATITUDE;
+    let panini_ok =
+        !fov.full_circle && fov.longitude_span <= PANINI_MAX_FOV && !fov.pole_visible;
+    let stereographic_ok =
+        !fov.full_circle && fov.longitude_span <= STEREOGRAPHIC_MAX_FOV && fov.max_axis_angle < 130.0 * PI / 180.0;
     let vfov = fov.latitude_max - fov.latitude_min;
     let fallback = if cylindrical_ok && vfov <= CYLINDRICAL_AUTO_MAX_VFOV {
         Projection::Cylindrical
     } else {
         Projection::Spherical
     };
-    match mode {
-        ProjectionMode::Perspective if perspective_ok => Projection::Perspective,
-        ProjectionMode::Cylindrical if cylindrical_ok => Projection::Cylindrical,
-        ProjectionMode::Spherical => Projection::Spherical,
+    let (projection, mut note) = match mode {
+        ProjectionMode::Perspective if perspective_ok => (Projection::Perspective, None),
+        ProjectionMode::Perspective => (
+            fallback,
+            Some(format!(
+                "Horizontal FOV (~{:.0}°) exceeds rectilinear Perspective limit (~100°); switched to {}.",
+                fov_deg,
+                if fallback == Projection::Cylindrical { "Cylindrical" } else { "Spherical" }
+            )),
+        ),
+        ProjectionMode::Cylindrical if cylindrical_ok => (Projection::Cylindrical, None),
+        ProjectionMode::Cylindrical => (
+            Projection::Spherical,
+            Some("Vertical pitch approaches zenith/nadir pole; switched to Spherical.".to_string()),
+        ),
+        ProjectionMode::Spherical => (Projection::Spherical, None),
+        ProjectionMode::Panini if panini_ok => (Projection::Panini, None),
+        ProjectionMode::Panini => (
+            Projection::Spherical,
+            Some(format!(
+                "Horizontal FOV (~{:.0}°) exceeds Panini 155° span; clamped to Spherical.",
+                fov_deg
+            )),
+        ),
+        ProjectionMode::Stereographic if stereographic_ok => (Projection::Stereographic, None),
+        ProjectionMode::Stereographic => (
+            Projection::Spherical,
+            Some(format!(
+                "Horizontal FOV (~{:.0}°) exceeds Stereographic 150° span; clamped to Spherical.",
+                fov_deg
+            )),
+        ),
         ProjectionMode::Auto
             if perspective_ok
                 && fov.longitude_span <= PERSPECTIVE_AUTO_MAX_FOV
                 && vfov <= PERSPECTIVE_AUTO_MAX_FOV =>
         {
-            Projection::Perspective
+            (Projection::Perspective, None)
         }
-        _ => fallback,
+        ProjectionMode::Auto => (fallback, None),
+    };
+    if note.is_none() && fov_deg < 45.0 && mode != ProjectionMode::Auto {
+        note = Some(format!(
+            "Narrow horizontal FOV ({:.0}°): projections converge closely when span is under 45°.",
+            fov_deg
+        ));
     }
+    (projection, fov_deg, note)
 }
 
-pub fn plan_canvas(cameras: &[Camera], lens: &Lens, mode: ProjectionMode) -> Canvas {
+pub fn plan_canvas_with_info(
+    cameras: &[Camera],
+    lens: &Lens,
+    mode: ProjectionMode,
+) -> (Canvas, f32, Option<String>) {
     let fov = field_of_view(cameras, lens);
-    let projection = resolve_projection(mode, &fov);
+    let (projection, fov_deg, note) = resolve_projection_with_info(mode, &fov);
 
     let mut focals: Vec<f64> = cameras.iter().map(|c| c.focal).collect();
     focals.sort_by(|a, b| a.total_cmp(b));
     let mut scale = focals[focals.len() / 2];
 
     let (min, max) = match projection {
-        Projection::Perspective => {
+        Projection::Perspective | Projection::Panini | Projection::Stereographic => {
             let mut min = Vector2::new(f64::MAX, f64::MAX);
             let mut max = Vector2::new(f64::MIN, f64::MIN);
             for camera in cameras {
@@ -271,12 +359,76 @@ pub fn plan_canvas(cameras: &[Camera], lens: &Lens, mode: ProjectionMode) -> Can
     let area_limit = (MAX_CANVAS_PIXELS / (extent.x * extent.y * scale * scale)).sqrt();
     scale *= side_limit.min(area_limit).min(1.0);
 
-    Canvas {
-        projection,
-        scale,
-        origin: min,
-        width: (extent.x * scale).ceil().max(1.0),
-        height: (extent.y * scale).ceil().max(1.0),
-        wraps: fov.full_circle,
+    (
+        Canvas {
+            projection,
+            scale,
+            origin: min,
+            width: (extent.x * scale).ceil().max(1.0),
+            height: (extent.y * scale).ceil().max(1.0),
+            wraps: fov.full_circle,
+        },
+        fov_deg,
+        note,
+    )
+}
+
+pub fn plan_canvas(cameras: &[Camera], lens: &Lens, mode: ProjectionMode) -> Canvas {
+    plan_canvas_with_info(cameras, lens, mode).0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_panini_and_stereographic_roundtrip() {
+        let ray = Vector3::new(0.45, -0.2, 0.87).normalize();
+        for proj in [Projection::Panini, Projection::Stereographic] {
+            let uv = proj.project(&ray).expect("should project front-hemisphere ray");
+            let unproj = proj.unproject(uv.x, uv.y).expect("should unproject uv");
+            assert!(
+                (unproj - ray).norm() < 1e-6,
+                "Round-trip mismatch: {:?} vs {:?}",
+                unproj,
+                ray
+            );
+        }
+    }
+
+    #[test]
+    fn test_projection_fov_clamp_and_narrow_notes() {
+        let wide_fov = FieldOfView {
+            longitude_start: -1.6,
+            longitude_span: 170.0_f64.to_radians(),
+            latitude_min: -0.3,
+            latitude_max: 0.3,
+            full_circle: false,
+            pole_visible: false,
+            max_axis_angle: 1.5,
+        };
+        let (p_panini, _, note_panini) = resolve_projection_with_info(ProjectionMode::Panini, &wide_fov);
+        assert_eq!(p_panini, Projection::Spherical);
+        assert!(note_panini.as_deref().unwrap_or("").contains("155°"));
+
+        let (p_stereo, _, note_stereo) =
+            resolve_projection_with_info(ProjectionMode::Stereographic, &wide_fov);
+        assert_eq!(p_stereo, Projection::Spherical);
+        assert!(note_stereo.as_deref().unwrap_or("").contains("150°"));
+
+        let narrow_fov = FieldOfView {
+            longitude_start: -0.25,
+            longitude_span: 32.0_f64.to_radians(),
+            latitude_min: -0.2,
+            latitude_max: 0.2,
+            full_circle: false,
+            pole_visible: false,
+            max_axis_angle: 0.35,
+        };
+        let (p_narrow, fov_deg, note_narrow) =
+            resolve_projection_with_info(ProjectionMode::Panini, &narrow_fov);
+        assert_eq!(p_narrow, Projection::Panini);
+        assert!(fov_deg < 45.0);
+        assert!(note_narrow.as_deref().unwrap_or("").contains("45°"));
     }
 }
