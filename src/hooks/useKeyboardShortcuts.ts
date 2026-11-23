@@ -742,7 +742,19 @@ export const useKeyboardShortcuts = ({
         state.ui.confirmModalState.isOpen ||
         state.ui.mergeModalState.isOpen ||
         state.ui.cullingModalState.isOpen ||
-        state.ui.collageModalState.isOpen;
+        state.ui.collageModalState.isOpen ||
+        state.ui.drizzleModalState.isOpen ||
+        state.ui.negativeModalState.isOpen ||
+        state.ui.denoiseModalState.isOpen ||
+        state.ui.batchPolishModalState.isOpen ||
+        state.ui.colorMatcherModalState.isOpen ||
+        state.ui.heroCuratorModalState.isOpen ||
+        state.ui.clientDeliveryModalState.isOpen ||
+        state.ui.bokehModalState.isOpen ||
+        state.ui.advancedExportModalState.isOpen ||
+        state.ui.speedCullerModalState.isOpen ||
+        state.ui.isLensCorrectionModalOpen ||
+        state.ui.isTransformModalOpen;
 
       if (isModalOpen) return;
 
@@ -757,7 +769,9 @@ export const useKeyboardShortcuts = ({
       const target = event.target;
       const isInputTarget =
         target instanceof HTMLTextAreaElement ||
-        (target instanceof HTMLInputElement && !NON_TEXT_INPUT_TYPES.has(target.type));
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLInputElement && !NON_TEXT_INPUT_TYPES.has(target.type)) ||
+        (target instanceof HTMLElement && target.isContentEditable);
       if (isInputTarget) return;
 
       for (const builtin of builtinShortcuts) {

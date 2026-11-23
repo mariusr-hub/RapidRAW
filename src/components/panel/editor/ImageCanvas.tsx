@@ -28,6 +28,8 @@ import { RenderSize } from '../../../hooks/useImageRenderSize';
 import { useDelayedLoading } from '../../../hooks/useDelayedLoading';
 import { useTranslation } from 'react-i18next';
 import { useEditorStore, WgpuPhase } from '../../../store/useEditorStore';
+import { useSettingsStore } from '../../../store/useSettingsStore';
+import { isDirectWgpuSwapchainActive } from '../../../utils/wgpuRenderer';
 import { MIXER_SAMPLE_SCREEN_SIZE, useHslMixerPicker } from '../../../hooks/useHslMixerPicker';
 import { isPanelVisible, useUIStore } from '../../../store/useUIStore';
 import CompositionOverlays from './overlays/CompositionOverlays';
@@ -35,6 +37,7 @@ import CropRotateArea from './overlays/CropRotateArea';
 import RelightLightShape, { RelightBasis } from './overlays/RelightLightShape';
 import CenterMarkerShape, { CENTER_MARKERS } from './overlays/CenterMarkerShape';
 import CloneSourceOverlay from './overlays/CloneSourceOverlay';
+import InpaintGuideOverlay from './overlays/InpaintGuideOverlay';
 import { countPatchesOfType, createSubMask, getStrokeCenter } from '../../../utils/maskUtils';
 import { calculateStraightenAngle, getCropViewLayout, resolveAspectRatio } from '../../../utils/cropUtils';
 import { toast } from 'react-toastify';
@@ -1451,6 +1454,10 @@ const ImageCanvas = memo(
     const isRelightPickerActive = useEditorStore((state) => state.isRelightPickerActive);
     const activeRelightLightId = useEditorStore((state) => state.activeRelightLightId);
     const activeCenterMarker = useEditorStore((state) => state.activeCenterMarker);
+    const inpaintGuideMode = useEditorStore((state) => state.inpaintGuideMode);
+    const isophoteGuides = useEditorStore((state) => state.isophoteGuides);
+    const shieldRegions = useEditorStore((state) => state.shieldRegions);
+    const activeInpaintGuideId = useEditorStore((state) => state.activeInpaintGuideId);
     const isCenterMarkerSectionOpen = useUIStore(
       (state) =>
         !!activeCenterMarker &&
@@ -1509,7 +1516,8 @@ const ImageCanvas = memo(
     const [isAltPressed, setIsAltPressed] = useState(false);
     const retainedPatchRef = useRef<typeof interactivePatch>(null);
 
-    const isWgpuActive = appSettings?.useWgpuRenderer !== false && wgpuPhase === 'live';
+    const osPlatform = useSettingsStore((s) => s.osPlatform);
+    const isWgpuActive = isDirectWgpuSwapchainActive(appSettings, osPlatform) && wgpuPhase === 'live';
 
     const [prevIsWgpuActive, setPrevIsWgpuActive] = useState(isWgpuActive);
     const [isWgpuHandoffFading, setIsWgpuHandoffFading] = useState(false);
@@ -3943,6 +3951,38 @@ const ImageCanvas = memo(
                                 onDragStateChange={(isDragging) => setEditor({ isSliderDragging: isDragging })}
                                 onHoverChange={setIsMaskHovered}
                                 onTouchInteraction={() => setIsMaskTouchInteracting(true)}
+                              />
+                            )}
+                            {inpaintGuideMode !== 'none' && (
+                              <InpaintGuideOverlay
+                                guideMode={inpaintGuideMode}
+                                isophoteGuides={isophoteGuides}
+                                shieldRegions={shieldRegions}
+                                zoomScale={effectiveZoomScale}
+                                activeGuideId={activeInpaintGuideId}
+                                onSelectGuide={(id) => setEditor({ activeInpaintGuideId: id })}
+                                onUpdateGuide={(g) =>
+                                  setEditor((s) => ({
+                                    isophoteGuides: s.isophoteGuides.map((x) => (x.id === g.id ? g : x)),
+                                  }))
+                                }
+                                onRemoveGuide={(id) =>
+                                  setEditor((s) => ({
+                                    isophoteGuides: s.isophoteGuides.filter((x) => x.id !== id),
+                                    activeInpaintGuideId: s.activeInpaintGuideId === id ? null : s.activeInpaintGuideId,
+                                  }))
+                                }
+                                onUpdateShield={(sh) =>
+                                  setEditor((s) => ({
+                                    shieldRegions: s.shieldRegions.map((x) => (x.id === sh.id ? sh : x)),
+                                  }))
+                                }
+                                onRemoveShield={(id) =>
+                                  setEditor((s) => ({
+                                    shieldRegions: s.shieldRegions.filter((x) => x.id !== id),
+                                    activeInpaintGuideId: s.activeInpaintGuideId === id ? null : s.activeInpaintGuideId,
+                                  }))
+                                }
                               />
                             )}
                             {isBrushActive && isCursorPreviewVisible && (

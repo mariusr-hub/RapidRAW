@@ -53,6 +53,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 import { useThumbnails } from './hooks/useThumbnails';
 import { ImageDimensions } from './hooks/useImageRenderSize';
+import { isDirectWgpuSwapchainActive } from './utils/wgpuRenderer';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useTauriListeners } from './hooks/useTauriListeners';
 import { transferFiles, useFileOperations } from './hooks/useFileOperations';
@@ -62,6 +63,7 @@ import { useImagePreloader } from './hooks/useImagePreloader';
 import { useAppNavigation } from './hooks/useAppNavigation';
 import { useExternalEditSession } from './hooks/useExternalEditSession';
 import ExternalEditBar from './components/panel/ExternalEditBar';
+import TonesPanel from './enhanced/panels/TonesPanel';
 import { Status } from './types/export';
 
 import { useEditorActions } from './hooks/useEditorActions';
@@ -436,8 +438,15 @@ function App() {
     sortedImageList,
   );
 
-  const { handleMergeSettingsChange, handleSaveCollage, handleSaveMerge, handleStartMerge } =
-    useProductivityActions(handleLibraryRefresh);
+  const {
+    handleMergeSettingsChange,
+    handleSaveCollage,
+    handleSaveMerge,
+    handleStartMerge,
+    handleApplyDenoise,
+    handleBatchDenoise,
+    handleSaveDenoisedImage,
+  } = useProductivityActions(handleLibraryRefresh);
 
   const {
     handleEditorContextMenu,
@@ -754,6 +763,8 @@ function App() {
           );
         case Panel.Metadata:
           return <MetadataPanel />;
+        case Panel.Tones:
+          return <TonesPanel />;
         case Panel.Crop:
           return (
             <AdjustmentSliderResetProvider>
@@ -820,7 +831,10 @@ function App() {
 
   const shouldHideFolderTree = useCompactPanels || useWidePanels;
   const isWgpuActive =
-    activeView === 'editor' && appSettings?.useWgpuRenderer !== false && !!selectedImage && wgpuPhase === 'live';
+    activeView === 'editor' &&
+    isDirectWgpuSwapchainActive(appSettings, osPlatform) &&
+    !!selectedImage &&
+    wgpuPhase === 'live';
   const useMacWindowShell = osPlatform === 'macos' && !appSettings?.decorations && !isWindowFullScreen && !isFullScreen;
 
   const layoutSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
@@ -1092,6 +1106,10 @@ function App() {
           handleMergeSettingsChange={handleMergeSettingsChange}
           handleSaveMerge={handleSaveMerge}
           handleStartMerge={handleStartMerge}
+          refreshImageList={handleLibraryRefresh}
+          handleApplyDenoise={handleApplyDenoise}
+          handleBatchDenoise={handleBatchDenoise}
+          handleSaveDenoisedImage={handleSaveDenoisedImage}
           handleCreateFolder={handleCreateFolder}
           handleRenameFolder={handleRenameFolder}
           handleSaveRename={handleSaveRename}

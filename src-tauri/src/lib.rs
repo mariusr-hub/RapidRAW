@@ -19,20 +19,21 @@ macro_rules! cli_eprintln {
     }};
 }
 
-mod adjustments;
-mod ai;
-mod app;
-mod decode;
-mod effects;
-mod export;
-mod integrations;
-mod library;
-mod masks;
-mod merge;
-mod metadata;
-mod platform;
-mod render;
-mod retouch;
+pub mod adjustments;
+pub mod ai;
+pub mod app;
+pub mod decode;
+pub mod effects;
+pub mod enhanced;
+pub mod export;
+pub mod integrations;
+pub mod library;
+pub mod masks;
+pub mod merge;
+pub mod metadata;
+pub mod platform;
+pub mod render;
+pub mod retouch;
 
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
@@ -277,7 +278,7 @@ pub fn run() {
                 });
             }
 
-            if let Ok(config_dir) = app_handle.path().app_config_dir() {
+            if let Ok(config_dir) = crate::app::settings::resolved_app_data_dir(&app_handle) {
                 let _ = std::fs::remove_file(config_dir.join(".gpu_init_crash_flag"));
             }
 
@@ -592,6 +593,17 @@ pub fn run() {
             export_task_token: Arc::new(Mutex::new(None)),
             merge_session: Arc::new(Mutex::new(None)),
             merge_generation: Arc::new(AtomicU64::new(0)),
+            hdr_result: Arc::new(Mutex::new(None)),
+            hdr_linear_radiance: Arc::new(Mutex::new(None)),
+            hdr_preview_radiance: Arc::new(Mutex::new(None)),
+            hdr_last_options: Arc::new(Mutex::new(None)),
+            hdr_tone_generation: Arc::new(AtomicU64::new(0)),
+            hdr_cancellation_token: Arc::new(AtomicBool::new(false)),
+            hdr_panorama_result: Arc::new(Mutex::new(None)),
+            panorama_linear_radiance: Arc::new(Mutex::new(None)),
+            panorama_cancellation_token: Arc::new(AtomicBool::new(false)),
+            critic_cache: Arc::new(Mutex::new(HashMap::new())),
+            denoise_result: Arc::new(Mutex::new(None)),
             indexing_task_handle: Mutex::new(None),
             lut_cache: Mutex::new(LutCache::new(LUT_CACHE_BUDGET_BYTES)),
             swatch_lut_cache: Mutex::new(LutCache::new(SWATCH_LUT_CACHE_BUDGET_BYTES)),
@@ -613,11 +625,11 @@ pub fn run() {
             patched_cache: Mutex::new(None),
             cleanup_source_cache: Mutex::new(None),
             working_cache: Mutex::new(None),
-            decoded_image_cache: Mutex::new(DecodedImageCache::new(5)),
+            decoded_image_cache: Mutex::new(DecodedImageCache::new(3)),
             decode_flights: Default::default(),
             image_preloader: Default::default(),
             thumbnail_manager: ThumbnailManager::new(),
-            memory_budget: crate::app::memory_budget::MemoryBudget::from_total_ram(0.6),
+            memory_budget: crate::app::memory_budget::MemoryBudget::from_total_ram(0.45),
             metadata_manager: MetadataManager::new(),
             disks_cache: Mutex::new(None),
             disks_cache_refreshing: AtomicBool::new(false),
@@ -750,6 +762,7 @@ pub fn run() {
             app::storage::clear_ai_maps_cache,
             app::storage::clear_metadata_cache,
             app::storage::clear_immich_cache,
+            app::storage::release_ai_sessions,
             app::storage::clear_ai_models,
             library::sidecars::set_color_label_for_paths,
             library::sidecars::set_rating_for_paths,
@@ -769,6 +782,9 @@ pub fn run() {
             adjustments::lens_correction::get_lensfun_makers,
             adjustments::lens_correction::get_lensfun_lenses_for_maker,
             adjustments::lens_correction::get_lens_correction_info,
+            adjustments::lens_correction::autodetect_lens,
+            adjustments::lens_correction::get_lens_distortion_params,
+            adjustments::lens_correction::solve_guided_upright,
             integrations::tethering::tether_list_cameras,
             integrations::tethering::tether_connect,
             integrations::tethering::tether_get_settings,
@@ -788,6 +804,57 @@ pub fn run() {
             integrations::immich::commands::immich_prepare_export,
             integrations::immich::commands::immich_remove_from_album,
             integrations::immich::commands::immich_timeline,
+            // ================================================================
+            // Enhanced Edition Commands (v1.7.1.1)
+            // ================================================================
+            enhanced::agency_uploader::dispatch_to_stock_agencies,
+            enhanced::astro_stacking::stack_astro_frames,
+            enhanced::astro_stacking::remove_active_light_pollution_gradient,
+            enhanced::astro_stacking::stack_star_trails,
+            enhanced::astro_stacking::apply_adc_active,
+            enhanced::astro_stacking::apply_adc_manual,
+            enhanced::auto_tune_loop::run_auto_tune_quality_loop,
+            enhanced::batch_export_engine::execute_advanced_batch_export,
+            enhanced::batch_export_engine::execute_multi_recipe_batch_export,
+            enhanced::bokeh_simulator::simulate_optical_bokeh,
+            enhanced::bokeh_simulator::simulate_tilt_shift,
+            enhanced::client_delivery::export_client_delivery_pack,
+            enhanced::client_delivery::generate_contact_sheet,
+            enhanced::color_matcher::steal_color_look,
+            enhanced::color_matcher::export_color_match_as_cube_lut,
+            enhanced::color_matcher::harmonize_photoshoot_series,
+            enhanced::compliance_inspector::scan_active_image_compliance,
+            enhanced::compliance_inspector::auto_inpaint_compliance_issues,
+            enhanced::compliance_inspector::export_stock_audit_report,
+            enhanced::defect_repair::detect_auto_horizon,
+            enhanced::defect_repair::get_saliency_crop_recommendation,
+            enhanced::defect_repair::auto_remove_dust_and_blemishes,
+            enhanced::defect_repair::batch_heal_sensor_dust,
+            enhanced::denoising::analyze_image_noise_profile,
+            enhanced::denoising::preview_denoised_roi,
+            enhanced::denoising::apply_denoising,
+            enhanced::denoising::batch_denoise_images,
+            enhanced::denoising::save_denoised_image,
+            enhanced::denoising::drizzle_super_resolution,
+            enhanced::denoising::save_drizzle_image,
+            enhanced::geometry_preview::preview_geometry_transform,
+            enhanced::hdr_panorama::stitch_hdr_panorama,
+            enhanced::hdr_panorama::inspect_hdr_pano_grouping,
+            enhanced::hero_curator::curate_hero_shots,
+            enhanced::negative_conversion::sample_negative_border_mask,
+            enhanced::negative_conversion::auto_detect_negative_border_mask,
+            enhanced::negative_conversion::preview_negative_conversion,
+            enhanced::negative_conversion::convert_negatives,
+            enhanced::photographic_critic::get_photographic_critic_report,
+            enhanced::semantic_auto_polish::analyze_and_polish_active_image,
+            enhanced::semantic_auto_polish::batch_polish_photoshoot,
+            enhanced::sky_sculptor::apply_ai_sky_sculpt,
+            enhanced::speed_culler::analyze_culling_frame,
+            enhanced::speed_culler::batch_auto_triage_cull,
+            enhanced::speed_culler::extract_green_cfa_focus_peaking,
+            enhanced::speed_culler::group_burst_photos,
+            enhanced::stock_prep::batch_stock_photo_prep,
+            enhanced::super_resolution::upscale_active_image,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

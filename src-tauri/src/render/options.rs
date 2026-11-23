@@ -15,7 +15,11 @@ pub fn resolve_tonemapper_override(settings: &AppSettings, is_raw: bool) -> Opti
             .as_deref()
             .unwrap_or("basic")
     };
-    Some(if tm == "agx" { 1 } else { 0 })
+    Some(match tm {
+        "agx" => 1,
+        "legacy" => 2,
+        _ => 0,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

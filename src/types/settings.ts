@@ -144,6 +144,10 @@ export interface AppSettings {
   waveformHeight?: number;
   activeWaveformChannel?: string;
   useWgpuRenderer?: boolean;
+  windowsWgpuRendererMigratedV1?: boolean;
+  curatedPresetsSeededV1?: boolean;
+  autoAnalyzeOnOpen?: boolean;
+  enableLocalAdaptiveLearning?: boolean;
   editorNeutralGreyBg?: boolean;
   canvasInputMode?: 'mouse' | 'trackpad';
   compareMode?: CompareMode;

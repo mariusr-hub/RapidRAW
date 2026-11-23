@@ -4,6 +4,8 @@ import { v4 as uuidv4 } from 'uuid';
 import clsx from 'clsx';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'react-toastify';
 import {
   DndContext,
   DragOverlay,
@@ -37,7 +39,9 @@ import {
   SwatchBook,
   SquaresIntersect,
   X,
+  CloudSun,
 } from 'lucide-react';
+import { Invokes } from '../../../types/invokes';
 
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import Switch from '../../ui/Switch';
@@ -2027,6 +2031,34 @@ function SettingsPanel({
   const isComponentMode = !!activeSubMask;
   const isTextMask = activeSubMask?.type === Mask.AiText;
   const isFaceMask = activeSubMask?.type === Mask.AiFace;
+  const isSkyMask =
+    activeSubMask?.type === Mask.AiSky || !!displayContainer?.subMasks?.some((sm: SubMask) => sm.type === Mask.AiSky);
+  const [skyPreset, setSkyPreset] = useState<'polarBlue' | 'sunsetGlow' | 'stormyDrama' | 'goldenHour' | 'gentleDehaze'>('polarBlue');
+  const [skyIntensity, setSkyIntensity] = useState(100);
+  const [isApplyingSky, setIsApplyingSky] = useState(false);
+
+  const handleApplySkySculpt = async (presetId: typeof skyPreset) => {
+    setSkyPreset(presetId);
+    setIsApplyingSky(true);
+    try {
+      const res = await invoke<{
+        preset_name: string;
+        mask_adjustments: Record<string, number>;
+        global_adjustments_patch?: Record<string, number> | null;
+      }>(Invokes.ApplyAiSkySculpt, { preset: presetId, intensity: skyIntensity });
+      updateContainer(container.id, {
+        adjustments: {
+          ...(container.adjustments || INITIAL_MASK_ADJUSTMENTS),
+          ...res.mask_adjustments,
+        } as Adjustments,
+      });
+      toast.success(`Sky Sculptor applied: ${res.preset_name}`);
+    } catch (err) {
+      toast.error(`AI Sky Sculptor failed: ${String(err)}`);
+    } finally {
+      setIsApplyingSky(false);
+    }
+  };
   const isTextMaskRunning = isTextMask && Boolean(activeAiTasks?.[activeSubMask.id]);
   const faceParts: Array<string> = activeSubMask?.parameters?.parts || [];
 
@@ -2265,6 +2297,52 @@ function SettingsPanel({
                 ))}
               </div>
             </>
+          )}
+
+          {isSkyMask && (
+            <div className="rounded-lg border border-sky-500/30 bg-sky-950/20 p-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-sky-300 text-xs font-medium">
+                  <CloudSun size={14} />
+                  <span>{t('editor.masks.settings.aiSkySculptor', 'AI Sky Sculptor')}</span>
+                </div>
+                <span className="text-[10px] text-text-secondary">{skyIntensity}%</span>
+              </div>
+              <Slider
+                min={20}
+                max={150}
+                step={5}
+                value={skyIntensity}
+                defaultValue={100}
+                label={t('editor.masks.settings.intensity', 'Intensity')}
+                onChange={(e: any) => setSkyIntensity(Number(e.target.value))}
+                fillOrigin="min"
+              />
+              <div className="grid grid-cols-2 gap-1.5">
+                {[
+                  { id: 'polarBlue' as const, label: 'Polar Blue' },
+                  { id: 'sunsetGlow' as const, label: 'Sunset Glow' },
+                  { id: 'stormyDrama' as const, label: 'Stormy Drama' },
+                  { id: 'goldenHour' as const, label: 'Golden Hour' },
+                  { id: 'gentleDehaze' as const, label: 'Horizon Dehaze' },
+                ].map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    disabled={isApplyingSky}
+                    onClick={() => handleApplySkySculpt(opt.id)}
+                    className={clsx(
+                      'px-2 py-1.5 text-[11px] rounded-md transition-colors cursor-pointer truncate',
+                      skyPreset === opt.id
+                        ? 'bg-sky-500 text-white font-medium'
+                        : 'bg-bg-primary text-text-secondary hover:bg-card-active hover:text-text-primary',
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
 
           <Switch

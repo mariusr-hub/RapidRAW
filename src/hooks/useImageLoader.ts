@@ -7,6 +7,7 @@ import { useEditorStore } from '../store/useEditorStore';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes } from '../types/invokes';
+import { isDirectWgpuSwapchainActive } from '../utils/wgpuRenderer';
 
 export function notifyEmbeddedPreview(loadImageResult: any) {
   if (loadImageResult?.is_embedded_preview) {
@@ -28,8 +29,9 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const resetHistory = useEditorStore((s) => s.resetHistory);
   const setLibrary = useLibraryStore((s) => s.setLibrary);
   const appSettings = useSettingsStore((s) => s.appSettings);
+  const osPlatform = useSettingsStore((s) => s.osPlatform);
 
-  const isWgpuActive = appSettings?.useWgpuRenderer !== false && selectedImage?.isReady && wgpuPhase === 'live';
+  const isWgpuActive = isDirectWgpuSwapchainActive(appSettings, osPlatform) && selectedImage?.isReady && wgpuPhase === 'live';
 
   const selectedPath = selectedImage?.path;
   useEffect(() => {

@@ -3,8 +3,158 @@ use crate::export::settings::{
 };
 use crate::export::watermark::apply_watermark;
 use crate::render::color_space::OutputColorSpace;
-use image::{DynamicImage, GenericImageView, ImageBuffer, imageops};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba, imageops};
+use rayon::prelude::*;
 use serde_json::Value;
+
+#[inline]
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn linear_to_srgb(v: f32) -> f32 {
+    let v = v.max(0.0);
+    if v <= 0.0031308 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Resizes an image in linear light using SIMD fast_resizer while preserving 8/16/32-bit depth.
+pub fn resize_in_linear_space(
+    image: &DynamicImage,
+    target_w: u32,
+    target_h: u32,
+) -> DynamicImage {
+    let (cur_w, cur_h) = image.dimensions();
+    if cur_w == target_w && cur_h == target_h {
+        return image.clone();
+    }
+
+    match image {
+        DynamicImage::ImageRgba32F(buf) => DynamicImage::ImageRgba32F(
+            crate::enhanced::fast_resizer::fast_resize_rgba32f(buf, target_w, target_h),
+        ),
+        DynamicImage::ImageRgb32F(buf) => DynamicImage::ImageRgb32F(
+            crate::enhanced::fast_resizer::fast_resize_rgb32f(buf, target_w, target_h),
+        ),
+        DynamicImage::ImageRgb16(buf) => {
+            let (w, h) = buf.dimensions();
+            let mut linear_buf = vec![0.0f32; (w * h * 3) as usize];
+            linear_buf
+                .par_chunks_exact_mut(3)
+                .zip(buf.as_raw().par_chunks_exact(3))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = srgb_to_linear(in_pix[0] as f32 / 65535.0);
+                    out_pix[1] = srgb_to_linear(in_pix[1] as f32 / 65535.0);
+                    out_pix[2] = srgb_to_linear(in_pix[2] as f32 / 65535.0);
+                });
+            let linear_img = ImageBuffer::<Rgb<f32>, Vec<f32>>::from_raw(w, h, linear_buf).unwrap();
+            let resized_linear =
+                crate::enhanced::fast_resizer::fast_resize_rgb32f(&linear_img, target_w, target_h);
+            let (rw, rh) = resized_linear.dimensions();
+            let mut srgb_buf = vec![0u16; (rw * rh * 3) as usize];
+            srgb_buf
+                .par_chunks_exact_mut(3)
+                .zip(resized_linear.as_raw().par_chunks_exact(3))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = (linear_to_srgb(in_pix[0]) * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                    out_pix[1] = (linear_to_srgb(in_pix[1]) * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                    out_pix[2] = (linear_to_srgb(in_pix[2]) * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                });
+            DynamicImage::ImageRgb16(ImageBuffer::from_raw(rw, rh, srgb_buf).unwrap())
+        }
+        DynamicImage::ImageRgba16(buf) => {
+            let (w, h) = buf.dimensions();
+            let mut linear_buf = vec![0.0f32; (w * h * 4) as usize];
+            linear_buf
+                .par_chunks_exact_mut(4)
+                .zip(buf.as_raw().par_chunks_exact(4))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = srgb_to_linear(in_pix[0] as f32 / 65535.0);
+                    out_pix[1] = srgb_to_linear(in_pix[1] as f32 / 65535.0);
+                    out_pix[2] = srgb_to_linear(in_pix[2] as f32 / 65535.0);
+                    out_pix[3] = in_pix[3] as f32 / 65535.0;
+                });
+            let linear_img = ImageBuffer::<Rgba<f32>, Vec<f32>>::from_raw(w, h, linear_buf).unwrap();
+            let resized_linear =
+                crate::enhanced::fast_resizer::fast_resize_rgba32f(&linear_img, target_w, target_h);
+            let (rw, rh) = resized_linear.dimensions();
+            let mut srgb_buf = vec![0u16; (rw * rh * 4) as usize];
+            srgb_buf
+                .par_chunks_exact_mut(4)
+                .zip(resized_linear.as_raw().par_chunks_exact(4))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = (linear_to_srgb(in_pix[0]) * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                    out_pix[1] = (linear_to_srgb(in_pix[1]) * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                    out_pix[2] = (linear_to_srgb(in_pix[2]) * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                    out_pix[3] = (in_pix[3] * 65535.0).clamp(0.0, 65535.0).round() as u16;
+                });
+            DynamicImage::ImageRgba16(ImageBuffer::from_raw(rw, rh, srgb_buf).unwrap())
+        }
+        DynamicImage::ImageRgb8(buf) => {
+            let (w, h) = buf.dimensions();
+            let mut linear_buf = vec![0.0f32; (w * h * 3) as usize];
+            linear_buf
+                .par_chunks_exact_mut(3)
+                .zip(buf.as_raw().par_chunks_exact(3))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = srgb_to_linear(in_pix[0] as f32 / 255.0);
+                    out_pix[1] = srgb_to_linear(in_pix[1] as f32 / 255.0);
+                    out_pix[2] = srgb_to_linear(in_pix[2] as f32 / 255.0);
+                });
+            let linear_img = ImageBuffer::<Rgb<f32>, Vec<f32>>::from_raw(w, h, linear_buf).unwrap();
+            let resized_linear =
+                crate::enhanced::fast_resizer::fast_resize_rgb32f(&linear_img, target_w, target_h);
+            let (rw, rh) = resized_linear.dimensions();
+            let mut srgb_buf = vec![0u8; (rw * rh * 3) as usize];
+            srgb_buf
+                .par_chunks_exact_mut(3)
+                .zip(resized_linear.as_raw().par_chunks_exact(3))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = (linear_to_srgb(in_pix[0]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[1] = (linear_to_srgb(in_pix[1]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[2] = (linear_to_srgb(in_pix[2]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                });
+            DynamicImage::ImageRgb8(ImageBuffer::from_raw(rw, rh, srgb_buf).unwrap())
+        }
+        _ => {
+            let rgba8 = image.to_rgba8();
+            let (w, h) = rgba8.dimensions();
+            let mut linear_buf = vec![0.0f32; (w * h * 4) as usize];
+            linear_buf
+                .par_chunks_exact_mut(4)
+                .zip(rgba8.as_raw().par_chunks_exact(4))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = srgb_to_linear(in_pix[0] as f32 / 255.0);
+                    out_pix[1] = srgb_to_linear(in_pix[1] as f32 / 255.0);
+                    out_pix[2] = srgb_to_linear(in_pix[2] as f32 / 255.0);
+                    out_pix[3] = in_pix[3] as f32 / 255.0;
+                });
+            let linear_img = ImageBuffer::<Rgba<f32>, Vec<f32>>::from_raw(w, h, linear_buf).unwrap();
+            let resized_linear =
+                crate::enhanced::fast_resizer::fast_resize_rgba32f(&linear_img, target_w, target_h);
+            let (rw, rh) = resized_linear.dimensions();
+            let mut srgb_buf = vec![0u8; (rw * rh * 4) as usize];
+            srgb_buf
+                .par_chunks_exact_mut(4)
+                .zip(resized_linear.as_raw().par_chunks_exact(4))
+                .for_each(|(out_pix, in_pix)| {
+                    out_pix[0] = (linear_to_srgb(in_pix[0]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[1] = (linear_to_srgb(in_pix[1]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[2] = (linear_to_srgb(in_pix[2]) * 255.0).clamp(0.0, 255.0).round() as u8;
+                    out_pix[3] = (in_pix[3] * 255.0).clamp(0.0, 255.0).round() as u8;
+                });
+            DynamicImage::ImageRgba8(ImageBuffer::from_raw(rw, rh, srgb_buf).unwrap())
+        }
+    }
+}
 
 const PAD_RATIO_EPSILON: f64 = 0.001;
 

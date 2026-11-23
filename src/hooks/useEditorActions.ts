@@ -305,7 +305,7 @@ export function useEditorActions() {
     setEditor((state) =>
       state.showOriginal || state.compareView !== 'off'
         ? { showOriginal: false, previewOverride: null, compareView: 'off' }
-        : getCompareState(mode, state.adjustments),
+        : { ...getCompareState(mode, state.adjustments), compareMode: 'none' },
     );
   }, [setEditor]);
 
@@ -313,7 +313,7 @@ export function useEditorActions() {
     (mode: CompareMode) => {
       const { appSettings, handleSettingsChange } = useSettingsStore.getState();
       if (appSettings) handleSettingsChange({ ...appSettings, compareMode: mode });
-      setEditor((state) => getCompareState(mode, state.adjustments));
+      setEditor((state) => ({ ...getCompareState(mode, state.adjustments), compareMode: 'none' }));
     },
     [setEditor],
   );

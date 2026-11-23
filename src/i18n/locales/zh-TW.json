@@ -10,7 +10,9 @@
         "agx": "AgX",
         "agxDesc": "電影感色調映射",
         "basic": "基礎",
-        "basicDesc": "標準色調映射"
+        "basicDesc": "標準色調映射",
+        "legacy": "Legacy",
+        "legacyDesc": "Classic v1.x Tonemapping"
       },
       "reset": "重置",
       "shadows": "陰影",
@@ -173,7 +175,8 @@
       "sharpness": "銳度",
       "structure": "結構",
       "superResolution": "RapidRes",
-      "threshold": "臨界值"
+      "threshold": "臨界值",
+      "contrastCleaner": "Halo Contrast Cleaner"
     },
     "effects": {
       "amount": "數量",
@@ -244,6 +247,18 @@
       "size": "大小",
       "spatial": "空間",
       "vignette": "暗角"
+    },
+    "lights": {
+      "brightness": "Highlights Brightness",
+      "contrast": "Highlights Contrast",
+      "desc": "Dedicated highlight recovery & micro-texture",
+      "details": "Highlights Structure",
+      "reset": "Reset Highlights Pipeline",
+      "saturation": "Highlights Saturation",
+      "temperature": "Highlights Warmth",
+      "tint": "Highlights Tint",
+      "title": "Shadow & Highlight Recovery",
+      "vibrance": "Highlights Vibrance"
     }
   },
   "contextMenus": {
@@ -1738,7 +1753,8 @@
       "title": "鏡頭校正",
       "vignetting": "暗角",
       "zoomInTooltip": "放大",
-      "zoomOutTooltip": "縮小"
+      "zoomOutTooltip": "縮小",
+      "waitingAutoDetect": "Waiting for auto detection..."
     },
     "merge": {
       "autoCrop": "自動裁切",
@@ -1778,7 +1794,15 @@
       "projectionPerspective": "透視",
       "projectionSpherical": "球面",
       "savedSuccess": "全景圖儲存成功！",
-      "title": "拼接全景圖"
+      "title": "拼接全景圖",
+      "autoCrop": "自動裁切",
+      "excludedImages": "{{count}} 張影像無法比對，已被排除",
+      "excludedImages_one": "{{count}} 張影像無法比對，已被排除",
+      "excludedImages_other": "{{count}} 張影像無法比對，已被排除",
+      "outputInfo": "{{images}} 張影像 · {{width}} × {{height}} 像素",
+      "saving": "正在儲存…",
+      "projectionPanini": "Panini",
+      "projectionStereographic": "Stereographic"
     },
     "renameAlbum": {
       "placeholder": "輸入新的相簿名稱..."
@@ -1830,6 +1854,49 @@
       "yAxis": "Y 軸",
       "zoomInTooltip": "放大",
       "zoomOutTooltip": "縮小"
+    },
+    "denoise": {
+      "batchProgressText": "Denoising {{current}} of {{total}}...",
+      "btnBatchDenoise": "Batch Denoise",
+      "btnRetry": "Retry",
+      "btnSave": "Save",
+      "btnStart": "Start Denoise",
+      "cancel": "Cancel",
+      "close": "Close",
+      "descBatch": "Batch denoise selected images",
+      "downloadingText": "Downloading AI Model ({{status}})...",
+      "initializing": "Initializing...",
+      "methodAi": "AI Denoise",
+      "methodBm3d": "Classic (BM3D)",
+      "methodLabel": "Method",
+      "methodRaw9": "Apple RAW 9",
+      "openInEditor": "Open in Editor",
+      "processingFailed": "Denoise Failed",
+      "saveSuccess": "Saved successfully",
+      "titleBatch": "Batch RAW Denoise",
+      "waitText": "This may take a moment depending on resolution..."
+    },
+    "negativeConversion": {
+      "blueWeight": "Blue Weight",
+      "cancel": "Cancel",
+      "colorTiming": "Color Timing",
+      "compareTooltip": "Hold to Compare",
+      "contrast": "Contrast",
+      "convertAndSave": "Convert & Save",
+      "convertAndSaveAll": "Convert & Save All ({{count}})",
+      "converting": "Converting...",
+      "convertingProgress": "Converting {{current}} / {{total}}...",
+      "exposure": "Exposure",
+      "greenWeight": "Green Weight",
+      "noticeText": "Inversion logic inspired by <1>NegPy</1> created by marcinz606 (<3>GPL-3.0</3>).",
+      "originalLabel": "Original",
+      "printGrade": "Print Grade",
+      "redWeight": "Red Weight",
+      "resetTooltip": "Reset Parameters",
+      "resetViewTooltip": "Reset View",
+      "title": "Film Negative Conversion",
+      "zoomInTooltip": "Zoom In",
+      "zoomOutTooltip": "Zoom Out"
     }
   },
   "settings": {
@@ -2343,7 +2410,8 @@
       "wgpuDescRecommended": "繞過瀏覽器編碼，實現即時回應的即時預覽。強烈推薦以獲得最佳效能。",
       "wgpuLabel": "啟用直接 WGPU 渲染",
       "workerThreads": "縮圖工作執行緒數",
-      "workerThreadsDesc": "用於生成縮圖的並行執行緒數。較高的值可加快相簿載入速度，但會佔用更多 CPU 和記憶體。"
+      "workerThreadsDesc": "用於生成縮圖的並行執行緒數。較高的值可加快相簿載入速度，但會佔用更多 CPU 和記憶體。",
+      "wgpuDescWindows": "Intel Iris Xe GPU compute stays active via flicker-free WebView2 compositing (direct swapchain transparency disabled on Windows)."
     },
     "tagging": {
       "addCustomPlaceholder": "新增自定義 AI 標籤（逗號分隔）...",

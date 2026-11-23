@@ -127,9 +127,9 @@ impl FaceFrame {
 
 pub struct DetectedFace {
     landmarks: Vec<[f32; 2]>,
-    center: [f32; 2],
+    pub center: [f32; 2],
     angle: f32,
-    size: f32,
+    pub size: f32,
     segment_frame: FaceFrame,
     hair: Vec<f32>,
     skin: Vec<f32>,

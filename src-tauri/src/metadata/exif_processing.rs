@@ -889,3 +889,112 @@ pub fn truncate_large_exif(value: &str) -> String {
 
     value.to_string()
 }
+
+pub fn read_f_number(path: &str, file_bytes: &[u8]) -> Option<f32> {
+    if let Some(map) = read_rrexif_sidecar(Path::new(path))
+        && let Some(val_str) = map.get("FNumber").or(map.get("ApertureValue"))
+    {
+        let cleaned = val_str.replace("f/", "").replace("F/", "").trim().to_string();
+        if let Ok(val) = cleaned.parse::<f32>()
+            && val > 0.1
+            && val < 128.0
+        {
+            return Some(val);
+        }
+    }
+
+    if is_raw_file(path)
+        && let Some(meta) = read_raw_metadata(file_bytes)
+    {
+        if let Some(r) = meta.exif.fnumber
+            && r.d != 0
+        {
+            let val = r.n as f32 / r.d as f32;
+            if val > 0.1 && val < 128.0 {
+                return Some(val);
+            }
+        } else if let Some(r) = meta.exif.aperture_value
+            && r.d != 0
+        {
+            let apex = r.n as f32 / r.d as f32;
+            let val = (2.0f32).powf(apex / 2.0);
+            if val > 0.1 && val < 128.0 {
+                return Some(val);
+            }
+        }
+    }
+
+    if let Some(exif) = read_exif(file_bytes) {
+        if let Some(f_field) = exif.get_field(exif::Tag::FNumber, In::PRIMARY) {
+            if let Value::Rational(ref r) = f_field.value
+                && let Some(val) = r.first()
+                && val.denom != 0
+            {
+                let res = val.num as f32 / val.denom as f32;
+                if res > 0.1 && res < 128.0 {
+                    return Some(res);
+                }
+            }
+        } else if let Some(a_field) = exif.get_field(exif::Tag::ApertureValue, In::PRIMARY)
+            && let Value::Rational(ref r) = a_field.value
+            && let Some(val) = r.first()
+            && val.denom != 0
+        {
+            let apex = val.num as f32 / val.denom as f32;
+            let res = (2.0f32).powf(apex / 2.0);
+            if res > 0.1 && res < 128.0 {
+                return Some(res);
+            }
+        }
+    }
+    None
+}
+
+pub fn read_camera_make_model(path: &str, file_bytes: &[u8]) -> Option<(String, String)> {
+    if let Some(map) = read_rrexif_sidecar(Path::new(path)) {
+        let make = map.get("Make").cloned().unwrap_or_default();
+        let model = map.get("Model").cloned().unwrap_or_default();
+        if !make.is_empty() || !model.is_empty() {
+            return Some((make, model));
+        }
+    }
+
+    if is_raw_file(path)
+        && let Some(meta) = read_raw_metadata(file_bytes)
+        && (!meta.make.is_empty() || !meta.model.is_empty())
+    {
+        return Some((meta.make.clone(), meta.model.clone()));
+    }
+
+    if let Some(exif) = read_exif(file_bytes) {
+        let make = exif
+            .get_field(exif::Tag::Make, In::PRIMARY)
+            .map(|f| f.display_value().to_string().replace('"', "").trim().to_string())
+            .unwrap_or_default();
+        let model = exif
+            .get_field(exif::Tag::Model, In::PRIMARY)
+            .map(|f| f.display_value().to_string().replace('"', "").trim().to_string())
+            .unwrap_or_default();
+        if !make.is_empty() || !model.is_empty() {
+            return Some((make, model));
+        }
+    }
+    None
+}
+
+pub fn extract_focal_length_from_file(original_path: &Path) -> Option<f64> {
+    if let Ok(raw_source) = rawler::rawsource::RawSource::new(original_path) {
+        let loader = rawler::RawLoader::new();
+        if let Ok(decoder) = loader.get_decoder(&raw_source)
+            && let Ok(meta) = decoder.raw_metadata(&raw_source, &Default::default())
+            && let Some(fl) = meta.exif.focal_length
+            && fl.d > 0
+        {
+            return Some(fl.n as f64 / fl.d as f64);
+        }
+    }
+    if let Ok(bytes) = std::fs::read(original_path) {
+        return read_focal_length_35mm(&bytes).map(f64::from);
+    }
+    None
+}

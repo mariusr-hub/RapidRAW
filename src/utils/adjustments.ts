@@ -4,6 +4,7 @@ import { SubMask, SubMaskMode } from '../types/masks';
 import type { AdjustmentLayout, AppSettings } from '../types/settings';
 import type { WhiteBalance } from './whiteBalance';
 import defaultAdjustments from './defaultAdjustments.json';
+import type { EnhancedAdjustments } from '../types/enhanced';
 import type { ParseKeys } from 'i18next';
 
 export enum ActiveChannel {
@@ -300,7 +301,7 @@ export interface ParametricCurve {
   red: ParametricCurveSettings;
 }
 
-export interface Adjustments {
+export interface Adjustments extends EnhancedAdjustments {
   activeTools: ActiveTools;
   [index: string]: any;
   aiDenoiseAmount: number;
@@ -417,7 +418,7 @@ export interface Adjustments {
   structure: number;
   temperature: number;
   tint: number;
-  toneMapper: 'agx' | 'basic';
+  toneMapper: 'agx' | 'basic' | 'legacy';
   transformDistortion: number;
   transformVertical: number;
   transformHorizontal: number;
@@ -1133,6 +1134,8 @@ export const SPEED_EDIT_ADJUSTMENTS = [
   { id: DetailsAdjustment.Clarity, label: 'adjustments.details.clarity' },
   { id: DetailsAdjustment.Dehaze, label: 'adjustments.details.dehaze' },
   { id: DetailsAdjustment.Structure, label: 'adjustments.details.structure' },
+  { id: 'lightsBrightness', label: 'adjustments.lights.brightness' },
+  { id: 'contrastCleaner', label: 'adjustments.details.contrastCleaner' },
   { id: Effect.VignetteAmount, label: 'adjustments.effects.vignette' },
   { id: 'rotation', label: 'editor.crop.rotationHeading' },
 ] as const;
@@ -1162,6 +1165,17 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     BasicAdjustment.Blacks,
     BasicAdjustment.Exposure,
     'toneMapper',
+    'lightsBrightness',
+    'lightsContrast',
+    'lightsDetails',
+    'lightsTemperature',
+    'lightsTint',
+    'lightsSaturation',
+    'lightsVibrance',
+    'supercontrastShadows',
+    'supercontrastMidtones',
+    'supercontrastHighlights',
+    'supercontrastPivots',
   ],
   curves: ['curves', 'pointCurves', 'parametricCurve', 'curveMode'],
   color: [
@@ -1174,6 +1188,7 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     ColorAdjustment.ColorGrading,
     'colorCalibration',
     ColorAdjustment.Hue,
+    'foliageEnhancer',
     ...MONOCHROME_ADJUSTMENT_KEYS,
   ],
   details: [
@@ -1183,6 +1198,14 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     DetailsAdjustment.Centré,
     DetailsAdjustment.CentréX,
     DetailsAdjustment.CentréY,
+    'contrastCleaner',
+    'skinShield',
+    'clearView',
+    'microContrast',
+    'cornerSharpnessBoost',
+    'bokehMaskProtection',
+    'hlrEnabled',
+    'hlrClipCeiling',
     DetailsAdjustment.Sharpness,
     DetailsAdjustment.SharpnessThreshold,
     DetailsAdjustment.LumaNoiseReduction,
@@ -1206,6 +1229,7 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     CreativeAdjustment.GlowAmount,
     CreativeAdjustment.HalationAmount,
     CreativeAdjustment.FlareAmount,
+    'ortonSpread',
     Effect.GrainAmount,
     Effect.GrainRoughness,
     Effect.GrainSize,
@@ -1335,6 +1359,10 @@ export interface AdjustmentSectionTool {
 }
 
 export const ADJUSTMENT_SECTION_TOOLS: Record<string, Array<AdjustmentSectionTool>> = {
+  basic: [
+    { id: 'lights', label: 'adjustments.basic.lights' },
+    { id: 'supercontrast', label: 'adjustments.basic.supercontrast' },
+  ],
   color: [
     { id: 'whiteBalance', label: 'adjustments.color.whiteBalance' },
     { id: 'colorPresence', label: 'adjustments.color.presence' },
@@ -1346,6 +1374,7 @@ export const ADJUSTMENT_SECTION_TOOLS: Record<string, Array<AdjustmentSectionToo
   details: [
     { id: 'sharpening', label: 'adjustments.details.sharpening' },
     { id: 'presence', label: 'adjustments.details.presence' },
+    { id: 'hlr', label: 'adjustments.details.hlr' },
     { id: 'noiseReduction', label: 'adjustments.details.noiseReduction' },
     { id: 'superResolution', label: 'adjustments.details.superResolution' },
     { id: 'chromaticAberration', label: 'adjustments.details.chromaticAberration' },

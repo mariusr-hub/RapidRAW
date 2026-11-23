@@ -129,6 +129,33 @@ pub struct ExportSettings {
     pub export_original: Option<OriginalExportOptions>,
 }
 
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            jpeg_quality: 95,
+            tiff_bit_depth: TiffBitDepth::Sixteen,
+            color_space: OutputColorSpace::default(),
+            hdr: false,
+            hdr_headroom: default_hdr_headroom(),
+            resize: None,
+            border: None,
+            pad: None,
+            keep_metadata: true,
+            preserve_timestamps: false,
+            strip_gps: false,
+            filename_template: None,
+            watermark: None,
+            export_masks: false,
+            preserve_folders: false,
+            destination_type: None,
+            subfolder: None,
+            dpi: None,
+            on_conflict: None,
+            export_original: None,
+        }
+    }
+}
+
 fn default_hdr_headroom() -> f32 {
     Headroom::DEFAULT_STOPS
 }

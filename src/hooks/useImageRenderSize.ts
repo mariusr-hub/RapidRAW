@@ -76,8 +76,16 @@ export const useImageRenderSize = (
     });
 
     resizeObserver.observe(container);
+    window.addEventListener('resize', updateSize);
 
-    return () => resizeObserver.disconnect();
+    const dprMedia = window.matchMedia?.(`(resolution: ${window.devicePixelRatio}dppx)`);
+    dprMedia?.addEventListener?.('change', updateSize);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updateSize);
+      dprMedia?.removeEventListener?.('change', updateSize);
+    };
   }, [containerRef, imgWidth, imgHeight]);
 
   return renderSize;

@@ -13,12 +13,20 @@ import { withToolCollapsed } from '../../utils/adjustments';
 interface AdjustmentSubSectionProps {
   actions?: ReactNode;
   children: ReactNode;
+  hasActiveAdjustment?: boolean;
   id: string;
   order: number;
   title: string;
 }
 
-export default function AdjustmentSubSection({ actions, children, id, order, title }: AdjustmentSubSectionProps) {
+export default function AdjustmentSubSection({
+  actions,
+  children,
+  hasActiveAdjustment = false,
+  id,
+  order,
+  title,
+}: AdjustmentSubSectionProps) {
   const visibility = useToolVisibility(id);
   const { appSettings, handleSettingsChange } = useSettingsStore(
     useShallow((state) => ({
@@ -41,8 +49,9 @@ export default function AdjustmentSubSection({ actions, children, id, order, tit
   return (
     <div className="p-1 bg-bg-tertiary rounded-md" style={{ order }}>
       <div className="group/visibility flex items-center gap-2 cursor-pointer select-none" onClick={handleToggle}>
-        <Text variant={TextVariants.heading} className={clsx(!visibility && 'grow')}>
-          {title}
+        <Text variant={TextVariants.heading} className={clsx('flex items-center gap-1.5', !visibility && 'grow')}>
+          <span>{title}</span>
+          {hasActiveAdjustment && <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />}
         </Text>
         {visibility && (
           <div className="grow flex items-center">

@@ -4,12 +4,14 @@ import {
   Columns2,
   Eye,
   EyeOff,
+  Grid2X2,
   Loader2,
   LucideIcon,
   Maximize,
   Redo,
   SquareSplitHorizontal,
   SquareSplitVertical,
+  Sun,
   Undo,
 } from 'lucide-react';
 import clsx from 'clsx';
@@ -20,8 +22,11 @@ import { ToolbarMenu, ToolbarMenuItem, useMenuDismiss } from './ToolbarMenu';
 import { IconAperture, IconCalendar, IconClock, IconFocalLength, IconIso, IconShutter } from './ExifIcons';
 import Text from '../../ui/Text';
 import { TextColors, TextVariants, TextWeights } from '../../../types/typography';
+import { useEditorStore } from '../../../store/useEditorStore';
 import { useLibraryStore } from '../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
+import { useUIStore } from '../../../store/useUIStore';
+import { Panel } from '../../../types/ui';
 import { useDisplayStatus } from '../../../hooks/useDisplayStatus';
 import { findGroupVariants, getVariantLabel } from '../../../utils/imageGrouping';
 
@@ -74,6 +79,8 @@ function CompareButton({ compareMode, isComparing, onKeyDown, onSelectMode, onTo
   const { t } = useTranslation();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const enhancedCompareMode = useEditorStore((state) => state.compareMode);
+  const setEditor = useEditorStore((state) => state.setEditor);
   useMenuDismiss(containerRef, isMenuOpen, setIsMenuOpen);
 
   const ModeIcon =
@@ -84,7 +91,7 @@ function CompareButton({ compareMode, isComparing, onKeyDown, onSelectMode, onTo
       <button
         className={clsx(
           'p-2 rounded-full transition-colors',
-          isComparing
+          isComparing || enhancedCompareMode === 'vertical_split' || enhancedCompareMode === 'horizontal_split'
             ? 'bg-accent text-button-text hover:bg-accent/90 hover:text-button-text'
             : 'bg-surface hover:bg-card-active text-text-primary',
         )}
@@ -104,15 +111,46 @@ function CompareButton({ compareMode, isComparing, onKeyDown, onSelectMode, onTo
           <ToolbarMenuItem
             key={mode}
             icon={icon}
-            isSelected={mode === compareMode}
+            isSelected={mode === compareMode && enhancedCompareMode === 'none'}
             label={t(label)}
             onClick={() => {
+              setEditor({ compareMode: 'none' });
               onSelectMode(mode);
               setIsMenuOpen(false);
             }}
             onKeyDown={onKeyDown}
           />
         ))}
+        <ToolbarMenuItem
+          icon={SquareSplitHorizontal}
+          isSelected={enhancedCompareMode === 'vertical_split'}
+          label="Zoom-Synced Split (Vertical)"
+          onClick={() => {
+            const next = enhancedCompareMode === 'vertical_split' ? 'none' : 'vertical_split';
+            setEditor(
+              next === 'none'
+                ? { compareMode: 'none' }
+                : { compareMode: next, compareView: 'off', showOriginal: false, previewOverride: null },
+            );
+            setIsMenuOpen(false);
+          }}
+          onKeyDown={onKeyDown}
+        />
+        <ToolbarMenuItem
+          icon={SquareSplitVertical}
+          isSelected={enhancedCompareMode === 'horizontal_split'}
+          label="Zoom-Synced Split (Horizontal)"
+          onClick={() => {
+            const next = enhancedCompareMode === 'horizontal_split' ? 'none' : 'horizontal_split';
+            setEditor(
+              next === 'none'
+                ? { compareMode: 'none' }
+                : { compareMode: next, compareView: 'off', showOriginal: false, previewOverride: null },
+            );
+            setIsMenuOpen(false);
+          }}
+          onKeyDown={onKeyDown}
+        />
       </ToolbarMenu>
     </div>
   );
@@ -575,6 +613,20 @@ const EditorToolbar = memo(
             </ToolbarMenu>
           </div>
 
+          <button
+            type="button"
+            className="bg-surface hover:bg-card-active text-text-primary px-2.5 py-1.5 rounded-full text-xs font-medium transition-colors flex items-center gap-1.5"
+            onClick={() => {
+              useUIStore.getState().setPanel(Panel.Adjustments);
+              window.dispatchEvent(new CustomEvent('rapidraw-quick-smart-tone'));
+            }}
+            onKeyDown={handleButtonKeyDown}
+            data-tooltip="Smart Tone (Dynamic Exposure & Contrast)"
+          >
+            <Sun size={14} className="text-amber-400" />
+            <span className="hidden xl:inline">Smart Tone</span>
+          </button>
+
           <CompareButton
             compareMode={compareMode}
             isComparing={isComparing}
@@ -582,6 +634,7 @@ const EditorToolbar = memo(
             onSelectMode={onSelectCompareMode}
             onToggle={onToggleCompare}
           />
+          <MatrixCompareToggle onKeyDown={handleButtonKeyDown} />
           {isHdrAvailable && <HdrButton onKeyDown={handleButtonKeyDown} />}
           <button
             className="bg-surface text-text-primary p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed relative"
@@ -598,5 +651,25 @@ const EditorToolbar = memo(
     );
   },
 );
+
+function MatrixCompareToggle({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HTMLButtonElement>): void }) {
+  const compareMode = useEditorStore((state) => state.compareMode);
+  const setEditor = useEditorStore((state) => state.setEditor);
+  const isActive = compareMode === 'matrix_4way';
+
+  return (
+    <button
+      className={clsx(
+        'p-2 rounded-full transition-colors',
+        isActive ? 'bg-accent text-button-text hover:bg-accent/90' : 'bg-surface hover:bg-card-active text-text-primary',
+      )}
+      onClick={() => setEditor({ compareMode: isActive ? 'none' : 'matrix_4way' })}
+      onKeyDown={onKeyDown}
+      data-tooltip="4-Way Variant Matrix (A/B/C/D)"
+    >
+      <Grid2X2 size={20} />
+    </button>
+  );
+}
 
 export default EditorToolbar;

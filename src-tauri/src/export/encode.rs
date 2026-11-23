@@ -335,3 +335,19 @@ fn insert_png_phys_chunk(image_bytes: &mut Vec<u8>, dpi: u16) {
     data.push(1);
     export_metadata::insert_png_chunk(image_bytes, b"pHYs", &data);
 }
+
+pub fn save_tiff_compressed<P: AsRef<std::path::Path>>(
+    path: P,
+    img: &image::Rgb32FImage,
+) -> Result<(), String> {
+    let dyn_img = DynamicImage::ImageRgb32F(img.clone());
+    let bytes = encode_tiff_with_metadata(
+        &dyn_img,
+        TiffSamples::Sixteen,
+        None,
+        Some(OutputColorSpace::Srgb.icc_profile()),
+        Some(300),
+    )?;
+    crate::library::file_ops::write_file_atomic(path.as_ref(), &bytes)
+        .map_err(|e| format!("Failed to write TIFF file: {}", e))
+}

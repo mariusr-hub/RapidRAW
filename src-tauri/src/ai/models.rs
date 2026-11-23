@@ -504,7 +504,7 @@ enum SessionKind {
 }
 
 #[cfg(target_os = "windows")]
-fn high_performance_dml_device_id() -> Option<i32> {
+pub fn high_performance_dml_device_id() -> Option<i32> {
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
         IDXGIAdapter1, IDXGIFactory6,
@@ -679,7 +679,9 @@ pub struct ClipModels {
 }
 
 fn get_models_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf> {
-    let models_dir = app_handle.path().app_data_dir()?.join("models");
+    let models_dir = crate::app::settings::resolved_app_data_dir(app_handle)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .join("models");
     if !models_dir.exists() {
         fs::create_dir_all(&models_dir)?;
     }

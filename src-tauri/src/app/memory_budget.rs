@@ -28,7 +28,15 @@ impl MemoryBudget {
     pub fn from_total_ram(fraction: f64) -> Arc<Self> {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        Self::new((sys.total_memory() as f64 * fraction) as u64)
+        let total_cap = (sys.total_memory() as f64 * fraction) as u64;
+        // Guard for 16 GB unified-memory Intel Iris Xe laptops: cap below available + headroom
+        let avail_cap = sys.available_memory().saturating_mul(85) / 100;
+        let bounded = if avail_cap > 512 * 1024 * 1024 {
+            total_cap.min(avail_cap.max(2 * 1024 * 1024 * 1024))
+        } else {
+            total_cap
+        };
+        Self::new(bounded)
     }
 
     pub fn reserve(

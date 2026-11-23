@@ -10,7 +10,9 @@
         "agx": "AgX",
         "agxDesc": "フィルム調トーンマッピング",
         "basic": "標準",
-        "basicDesc": "標準トーンマッピング"
+        "basicDesc": "標準トーンマッピング",
+        "legacy": "Legacy",
+        "legacyDesc": "Classic v1.x Tonemapping"
       },
       "reset": "リセット",
       "shadows": "シャドウ",
@@ -173,7 +175,8 @@
       "sharpness": "シャープネス",
       "structure": "構造",
       "superResolution": "RapidRes",
-      "threshold": "しきい値"
+      "threshold": "しきい値",
+      "contrastCleaner": "Halo Contrast Cleaner"
     },
     "effects": {
       "amount": "適用量",
@@ -244,6 +247,18 @@
       "size": "サイズ",
       "spatial": "空間",
       "vignette": "周辺光量補正"
+    },
+    "lights": {
+      "brightness": "Highlights Brightness",
+      "contrast": "Highlights Contrast",
+      "desc": "Dedicated highlight recovery & micro-texture",
+      "details": "Highlights Structure",
+      "reset": "Reset Highlights Pipeline",
+      "saturation": "Highlights Saturation",
+      "temperature": "Highlights Warmth",
+      "tint": "Highlights Tint",
+      "title": "Shadow & Highlight Recovery",
+      "vibrance": "Highlights Vibrance"
     }
   },
   "contextMenus": {
@@ -1738,7 +1753,8 @@
       "title": "レンズ補正",
       "vignetting": "周辺光量",
       "zoomInTooltip": "拡大",
-      "zoomOutTooltip": "縮小"
+      "zoomOutTooltip": "縮小",
+      "waitingAutoDetect": "Waiting for auto detection..."
     },
     "merge": {
       "autoCrop": "自動切り抜き",
@@ -1778,7 +1794,15 @@
       "projectionPerspective": "遠近法",
       "projectionSpherical": "球面",
       "savedSuccess": "パノラマを正常に保存しました！",
-      "title": "パノラマ写真を作成"
+      "title": "パノラマ写真を作成",
+      "autoCrop": "自動切り抜き",
+      "excludedImages": "{{count}} 枚の画像は一致しなかったため除外されました",
+      "excludedImages_one": "{{count}} 枚の画像は一致しなかったため除外されました",
+      "excludedImages_other": "{{count}} 枚の画像は一致しなかったため除外されました",
+      "outputInfo": "{{images}} 枚 · {{width}} × {{height}} px",
+      "saving": "保存中…",
+      "projectionPanini": "Panini",
+      "projectionStereographic": "Stereographic"
     },
     "renameAlbum": {
       "placeholder": "新しいアルバム名を入力..."
@@ -1830,6 +1854,49 @@
       "yAxis": "Y軸",
       "zoomInTooltip": "拡大",
       "zoomOutTooltip": "縮小"
+    },
+    "denoise": {
+      "batchProgressText": "Denoising {{current}} of {{total}}...",
+      "btnBatchDenoise": "Batch Denoise",
+      "btnRetry": "Retry",
+      "btnSave": "Save",
+      "btnStart": "Start Denoise",
+      "cancel": "Cancel",
+      "close": "Close",
+      "descBatch": "Batch denoise selected images",
+      "downloadingText": "Downloading AI Model ({{status}})...",
+      "initializing": "Initializing...",
+      "methodAi": "AI Denoise",
+      "methodBm3d": "Classic (BM3D)",
+      "methodLabel": "Method",
+      "methodRaw9": "Apple RAW 9",
+      "openInEditor": "Open in Editor",
+      "processingFailed": "Denoise Failed",
+      "saveSuccess": "Saved successfully",
+      "titleBatch": "Batch RAW Denoise",
+      "waitText": "This may take a moment depending on resolution..."
+    },
+    "negativeConversion": {
+      "blueWeight": "Blue Weight",
+      "cancel": "Cancel",
+      "colorTiming": "Color Timing",
+      "compareTooltip": "Hold to Compare",
+      "contrast": "Contrast",
+      "convertAndSave": "Convert & Save",
+      "convertAndSaveAll": "Convert & Save All ({{count}})",
+      "converting": "Converting...",
+      "convertingProgress": "Converting {{current}} / {{total}}...",
+      "exposure": "Exposure",
+      "greenWeight": "Green Weight",
+      "noticeText": "Inversion logic inspired by <1>NegPy</1> created by marcinz606 (<3>GPL-3.0</3>).",
+      "originalLabel": "Original",
+      "printGrade": "Print Grade",
+      "redWeight": "Red Weight",
+      "resetTooltip": "Reset Parameters",
+      "resetViewTooltip": "Reset View",
+      "title": "Film Negative Conversion",
+      "zoomInTooltip": "Zoom In",
+      "zoomOutTooltip": "Zoom Out"
     }
   },
   "settings": {
@@ -2343,7 +2410,8 @@
       "wgpuDescRecommended": "ブラウザエンコードをバイパスし、即座に反応するライブプレビューを実現します。パフォーマンス向上のため、強く推奨します。",
       "wgpuLabel": "WGPUダイレクトレンダリングを有効化",
       "workerThreads": "サムネイルワーカー数",
-      "workerThreadsDesc": "サムネイル作成に使用する並行スレッドの数。値を大きくするとライブラリのロードが速くなりますが、CPUとメモリを多く使用します。"
+      "workerThreadsDesc": "サムネイル作成に使用する並行スレッドの数。値を大きくするとライブラリのロードが速くなりますが、CPUとメモリを多く使用します。",
+      "wgpuDescWindows": "Intel Iris Xe GPU compute stays active via flicker-free WebView2 compositing (direct swapchain transparency disabled on Windows)."
     },
     "tagging": {
       "addCustomPlaceholder": "カスタムAIタグを入力（カンマ区切り）...",

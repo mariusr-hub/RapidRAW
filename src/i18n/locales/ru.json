@@ -10,7 +10,9 @@
         "agx": "AgX",
         "agxDesc": "Кинематографическое тональное отображение",
         "basic": "Стандартное",
-        "basicDesc": "Стандартное тональное отображение"
+        "basicDesc": "Стандартное тональное отображение",
+        "legacy": "Legacy",
+        "legacyDesc": "Classic v1.x Tonemapping"
       },
       "reset": "Сбросить",
       "shadows": "Тени",
@@ -173,7 +175,8 @@
       "sharpness": "Резкость",
       "structure": "Структура",
       "superResolution": "RapidRes",
-      "threshold": "Порог"
+      "threshold": "Порог",
+      "contrastCleaner": "Halo Contrast Cleaner"
     },
     "effects": {
       "amount": "Величина",
@@ -244,6 +247,18 @@
       "size": "Размер",
       "spatial": "Пространственные",
       "vignette": "Виньетирование"
+    },
+    "lights": {
+      "brightness": "Highlights Brightness",
+      "contrast": "Highlights Contrast",
+      "desc": "Dedicated highlight recovery & micro-texture",
+      "details": "Highlights Structure",
+      "reset": "Reset Highlights Pipeline",
+      "saturation": "Highlights Saturation",
+      "temperature": "Highlights Warmth",
+      "tint": "Highlights Tint",
+      "title": "Shadow & Highlight Recovery",
+      "vibrance": "Highlights Vibrance"
     }
   },
   "contextMenus": {
@@ -1821,7 +1836,8 @@
       "title": "Коррекция объектива",
       "vignetting": "Виньетирование",
       "zoomInTooltip": "Увеличить",
-      "zoomOutTooltip": "Уменьшить"
+      "zoomOutTooltip": "Уменьшить",
+      "waitingAutoDetect": "Waiting for auto detection..."
     },
     "merge": {
       "autoCrop": "Автокадрирование",
@@ -1867,7 +1883,17 @@
       "projectionPerspective": "Перспективная",
       "projectionSpherical": "Сферическая",
       "savedSuccess": "Панорама успешно сохранена!",
-      "title": "Сборка панорамы"
+      "title": "Сборка панорамы",
+      "autoCrop": "Автокадрирование",
+      "excludedImages": "{{count}} изображения не удалось сопоставить, они пропущены",
+      "excludedImages_few": "{{count}} изображения не удалось сопоставить, они пропущены",
+      "excludedImages_many": "{{count}} изображений не удалось сопоставить, они пропущены",
+      "excludedImages_one": "{{count}} изображение не удалось сопоставить, оно пропущено",
+      "excludedImages_other": "{{count}} изображения не удалось сопоставить, они пропущены",
+      "outputInfo": "Изображений: {{images}} · {{width}} × {{height}} пикс.",
+      "saving": "Сохранение…",
+      "projectionPanini": "Panini",
+      "projectionStereographic": "Stereographic"
     },
     "renameAlbum": {
       "placeholder": "Введите новое название альбома..."
@@ -1921,6 +1947,49 @@
       "yAxis": "Ось Y",
       "zoomInTooltip": "Увеличить",
       "zoomOutTooltip": "Уменьшить"
+    },
+    "denoise": {
+      "batchProgressText": "Denoising {{current}} of {{total}}...",
+      "btnBatchDenoise": "Batch Denoise",
+      "btnRetry": "Retry",
+      "btnSave": "Save",
+      "btnStart": "Start Denoise",
+      "cancel": "Cancel",
+      "close": "Close",
+      "descBatch": "Batch denoise selected images",
+      "downloadingText": "Downloading AI Model ({{status}})...",
+      "initializing": "Initializing...",
+      "methodAi": "AI Denoise",
+      "methodBm3d": "Classic (BM3D)",
+      "methodLabel": "Method",
+      "methodRaw9": "Apple RAW 9",
+      "openInEditor": "Open in Editor",
+      "processingFailed": "Denoise Failed",
+      "saveSuccess": "Saved successfully",
+      "titleBatch": "Batch RAW Denoise",
+      "waitText": "This may take a moment depending on resolution..."
+    },
+    "negativeConversion": {
+      "blueWeight": "Blue Weight",
+      "cancel": "Cancel",
+      "colorTiming": "Color Timing",
+      "compareTooltip": "Hold to Compare",
+      "contrast": "Contrast",
+      "convertAndSave": "Convert & Save",
+      "convertAndSaveAll": "Convert & Save All ({{count}})",
+      "converting": "Converting...",
+      "convertingProgress": "Converting {{current}} / {{total}}...",
+      "exposure": "Exposure",
+      "greenWeight": "Green Weight",
+      "noticeText": "Inversion logic inspired by <1>NegPy</1> created by marcinz606 (<3>GPL-3.0</3>).",
+      "originalLabel": "Original",
+      "printGrade": "Print Grade",
+      "redWeight": "Red Weight",
+      "resetTooltip": "Reset Parameters",
+      "resetViewTooltip": "Reset View",
+      "title": "Film Negative Conversion",
+      "zoomInTooltip": "Zoom In",
+      "zoomOutTooltip": "Zoom Out"
     }
   },
   "settings": {
@@ -2440,7 +2509,8 @@
       "wgpuDescRecommended": "Обходит этап кодирования веб-браузера для моментального обновления интерактивного просмотра. Настоятельно рекомендуется для достижения максимальной отзывчивости интерфейса.",
       "wgpuLabel": "Включить прямой рендеринг WGPU",
       "workerThreads": "Потоки генерации миниатюр",
-      "workerThreadsDesc": "Количество параллельно работающих вычислительных потоков для создания миниатюр снимков. Высокие значения ускоряют первоначальный запуск галереи, но нагружают процессор и ОЗУ."
+      "workerThreadsDesc": "Количество параллельно работающих вычислительных потоков для создания миниатюр снимков. Высокие значения ускоряют первоначальный запуск галереи, но нагружают процессор и ОЗУ.",
+      "wgpuDescWindows": "Intel Iris Xe GPU compute stays active via flicker-free WebView2 compositing (direct swapchain transparency disabled on Windows)."
     },
     "tagging": {
       "addCustomPlaceholder": "Добавить пользовательские AI-теги (через запятую)...",

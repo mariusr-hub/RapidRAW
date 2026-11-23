@@ -1,23 +1,29 @@
 import { useState, useEffect, useRef } from 'react';
-import { Star, Copy, ClipboardPaste, Check, Settings, Filter, PanelLeft, PanelRight } from 'lucide-react';
+import { Star, Copy, ClipboardPaste, Check, Settings, Filter, PanelLeft, PanelRight, Cpu } from 'lucide-react';
 import clsx from 'clsx';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'react-toastify';
 
 import Filmstrip from './Filmstrip';
 import { GLOBAL_KEYS } from '../../types/ui';
+import { Invokes } from '../../types/invokes';
 import { ImageFile, ImageFlag } from '../../types/library';
 import { SelectedImage } from '../../types/editor';
 import { ThumbnailAspectRatio } from '../../types/settings';
 import FlagToggles from './library/FlagToggles';
 import Text from '../ui/Text';
 import { getZoomContentSize, getZoomPercent, useEditorStore } from '../../store/useEditorStore';
+import { useSettingsStore } from '../../store/useSettingsStore';
 import { useLibraryActions } from '../../hooks/useLibraryActions';
 import { getReopenedPanelWidth, isFilmstripDocked, useUIStore } from '../../store/useUIStore';
 import { Panel } from '../../types/ui';
 import { PanelTabButton } from './PanelSwitcher';
 import { QuickFilterControls, useQuickFilterToggle } from './QuickFilter';
+import { getDevicePixelRatio } from '../../utils/displayScale';
+import { isDirectWgpuSwapchainActive } from '../../utils/wgpuRenderer';
 
 interface BottomBarProps {
   filmstripHeight?: number;
@@ -559,6 +565,7 @@ export default function BottomBar({
           )}
 
           <div className="flex items-center gap-1 shrink-0">
+            <SystemStatusPill />
             {(showLeftPanelToggle || showRightPanelToggle) && (
               <>
                 {showLeftPanelToggle && (
@@ -601,6 +608,59 @@ export default function BottomBar({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function SystemStatusPill() {
+  const useWgpu = useSettingsStore((s) => isDirectWgpuSwapchainActive(s.appSettings, s.osPlatform));
+  const [isClearing, setIsClearing] = useState(false);
+  const [heapMb, setHeapMb] = useState<number | null>(null);
+
+  useEffect(() => {
+    const updateMem = () => {
+      const mem = (performance as any).memory;
+      if (mem?.usedJSHeapSize) {
+        setHeapMb(Math.round(mem.usedJSHeapSize / (1024 * 1024)));
+      }
+    };
+    updateMem();
+    const id = window.setInterval(updateMem, 10000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const handleFreeCaches = async () => {
+    if (isClearing) return;
+    setIsClearing(true);
+    try {
+      await Promise.all([
+        invoke(Invokes.ReleaseAiSessions),
+        invoke(Invokes.ClearAiMapsCache),
+        invoke(Invokes.ClearAiDenoiseCache),
+        invoke(Invokes.ClearAiUpscaleCache),
+      ]);
+      toast.success('AI memory caches cleared');
+    } catch (err) {
+      toast.error(`Failed to clear AI caches: ${String(err)}`);
+    } finally {
+      setIsClearing(false);
+    }
+  };
+
+  return (
+    <div className="hidden md:flex items-center gap-1.5 mr-1 px-2 py-0.5 rounded-full bg-surface/60 border border-border-color/30 text-[10px] text-text-secondary">
+      <Cpu size={11} className={useWgpu ? 'text-emerald-400' : 'text-sky-400'} />
+      <span className="font-mono">{useWgpu ? 'WGPU' : '2D'}</span>
+      {heapMb !== null && <span className="font-mono opacity-80">{heapMb}MB</span>}
+      <button
+        type="button"
+        disabled={isClearing}
+        onClick={handleFreeCaches}
+        className="ml-0.5 px-1.5 py-0.2 rounded bg-bg-primary/80 hover:bg-accent hover:text-button-text text-text-primary transition-colors cursor-pointer"
+        data-tooltip="Free AI Depth, Denoise & Upscale Caches"
+      >
+        {isClearing ? '...' : 'Free AI'}
+      </button>
     </div>
   );
 }

@@ -60,6 +60,164 @@ use crate::render::preview::cached_patched_image;
 use crate::render::source::{RenderSource, fit_to_gpu, source_id};
 use crate::render::uniforms::get_all_adjustments_from_json;
 
+pub use encode::save_tiff_compressed;
+pub use geometry::resize_in_linear_space;
+
+pub fn build_iso21496_xmp_metadata(max_headroom: f32) -> String {
+    format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" xmlns:Container=\"http://schemas.google.com/photos/1.0/container/\" xmlns:Item=\"http://schemas.google.com/photos/1.0/container/item/\" hdrgm:Version=\"1.0\" hdrgm:GainMapMin=\"0.0\" hdrgm:GainMapMax=\"{:.2}\" hdrgm:Gamma=\"1.0\" hdrgm:OffsetSDR=\"0.0\" hdrgm:OffsetHDR=\"0.0\" hdrgm:HDRCapacityMin=\"0.0\" hdrgm:HDRCapacityMax=\"{:.2}\" hdrgm:BaseRenditionIsHDR=\"False\"><Container:Directory><rdf:Seq><rdf:li rdf:parseType=\"Resource\"><Container:Item Item:Semantic=\"Primary\" Item:Mime=\"image/jpeg\"/></rdf:li><rdf:li rdf:parseType=\"Resource\"><Container:Item Item:Semantic=\"GainMap\" Item:Mime=\"image/jpeg\"/></rdf:li></rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>",
+        max_headroom, max_headroom
+    )
+}
+
+pub fn inject_xmp_into_jpeg(jpeg_bytes: &[u8], xmp_str: &str) -> Vec<u8> {
+    if jpeg_bytes.len() < 2 || jpeg_bytes[0] != 0xFF || jpeg_bytes[1] != 0xD8 {
+        return jpeg_bytes.to_vec();
+    }
+    let namespace = b"http://ns.adobe.com/xap/1.0/\0";
+    let xmp_bytes = xmp_str.as_bytes();
+    let marker_len = namespace.len() + xmp_bytes.len() + 2;
+    if marker_len > 65535 {
+        return jpeg_bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(jpeg_bytes.len() + marker_len + 2);
+    out.extend_from_slice(&jpeg_bytes[..2]);
+    out.push(0xFF);
+    out.push(0xE1);
+    out.push(((marker_len >> 8) & 0xFF) as u8);
+    out.push((marker_len & 0xFF) as u8);
+    out.extend_from_slice(namespace);
+    out.extend_from_slice(xmp_bytes);
+    out.extend_from_slice(&jpeg_bytes[2..]);
+    out
+}
+
+/// Shared batch renderer: reads via SafeFileBuffer, loads `.rrdata` sidecar edits,
+/// and renders through the full GPU pipeline when available (falling back to base decode if headless).
+pub fn render_edited_image_for_batch(
+    path_str: &str,
+    settings: &crate::app::settings::AppSettings,
+    app_handle: &tauri::AppHandle,
+) -> Result<DynamicImage, String> {
+    let (source_path, sidecar_path) = parse_virtual_path(path_str);
+    let file_bytes = crate::library::file_ops::read_file_mapped(&source_path)
+        .map_err(|e| e.to_string())?;
+    let source_path_str = source_path.to_string_lossy().to_string();
+    let base_image = crate::decode::image_loader::load_base_image_from_bytes(
+        &file_bytes,
+        &source_path_str,
+        false,
+        settings,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut metadata = crate::metadata::sidecar::load_sidecar(&sidecar_path);
+    let state = app_handle.state::<AppState>();
+    hydrate_adjustments(&state, &mut metadata.adjustments);
+
+    let has_edits = metadata
+        .adjustments
+        .as_object()
+        .is_some_and(|obj| !obj.is_empty());
+    if !has_edits {
+        return Ok(base_image);
+    }
+
+    let is_raw = is_raw_file(&source_path_str);
+    if let Ok(context) = get_or_init_gpu_context(&state, app_handle) {
+        let render_opts = crate::render::options::resolve_render_options(settings, is_raw);
+        let renders = [(render_opts, RenderOutputPrecision::EightBit)];
+        if let Ok(mut rendered) = process_image_for_export_pipeline(
+            &source_path_str,
+            &base_image,
+            1.0,
+            &metadata.adjustments,
+            &context,
+            &state,
+            is_raw,
+            "batch_render",
+            &renders,
+        ) && let Some(first) = rendered.pop()
+        {
+            return Ok(first);
+        }
+    }
+
+    Ok(base_image)
+}
+
+pub fn save_jpeg_high_quality_with_metadata<P: AsRef<Path>>(
+    path: P,
+    sdr_image: &image::RgbImage,
+    reference_raw_path: Option<&str>,
+) -> Result<(), String> {
+    let mut settings = ExportSettings::default();
+    settings.jpeg_quality = 95;
+    settings.keep_metadata = reference_raw_path.is_some();
+    let dyn_img = DynamicImage::ImageRgb8(sdr_image.clone());
+    let source_str = reference_raw_path.unwrap_or("");
+    let xmp = crate::metadata::export_metadata::ExportXmp::from_metadata(
+        &crate::metadata::sidecar::ImageMetadata::default(),
+    );
+    save_image_with_metadata(&dyn_img, None, path.as_ref(), source_str, &xmp, &settings)
+}
+
+pub fn save_ultrahdr_jpeg<P: AsRef<Path>>(
+    path: P,
+    linear_hdr: &image::Rgb32FImage,
+    sdr_preview: &image::RgbImage,
+) -> Result<(), String> {
+    save_ultrahdr_jpeg_with_metadata(path, linear_hdr, sdr_preview, None)
+}
+
+pub fn quantize_to_rgb8_with_tpdf_dither(img: &DynamicImage) -> image::RgbImage {
+    let rgb32f = img.to_rgb32f();
+    let (w, h) = rgb32f.dimensions();
+    let mut out = image::RgbImage::new(w, h);
+    let mut rng_state = 0x9e3779b97f4a7c15_u64;
+    for (dst, src) in out.as_mut().iter_mut().zip(rgb32f.as_raw().iter()) {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let u1 = ((rng_state >> 33) as f32) / (u32::MAX as f32);
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let u2 = ((rng_state >> 33) as f32) / (u32::MAX as f32);
+        let dither = (u1 - u2) / 255.0;
+        *dst = ((src + dither).clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    out
+}
+
+pub fn save_ultrahdr_jpeg_with_metadata<P: AsRef<Path>>(
+    path: P,
+    linear_hdr: &image::Rgb32FImage,
+    sdr_preview: &image::RgbImage,
+    reference_raw_path: Option<&str>,
+) -> Result<(), String> {
+    save_jpeg_high_quality_with_metadata(&path, sdr_preview, reference_raw_path)?;
+
+    let peak = linear_hdr
+        .as_raw()
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(1.0_f32, f32::max);
+    let max_headroom = peak.max(1.0).log2().clamp(0.5, 6.0);
+    let xmp = build_iso21496_xmp_metadata(max_headroom);
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let jpeg_bytes = std::fs::read(path.as_ref())
+            .map_err(|e| format!("Failed to read JPEG for UltraHDR XMP injection: {}", e))?;
+        let tagged = inject_xmp_into_jpeg(&jpeg_bytes, &xmp);
+        crate::library::file_ops::write_file_atomic(path.as_ref(), &tagged)
+            .map_err(|e| format!("Failed to write UltraHDR JPEG: {}", e))?;
+    }
+    #[cfg(target_os = "android")]
+    let _ = xmp;
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_image_for_export_pipeline(
     path: &str,

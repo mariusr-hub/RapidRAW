@@ -904,7 +904,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               onClick: () => openMergeModal('panorama', finalSelection),
             },
             {
-              disabled: selectionCount < 2 || selectionCount > 9,
+              disabled: selectionCount < 2 || selectionCount > 30,
               icon: Images,
               label: mergeLabel,
               onClick: () => openMergeModal('hdr', finalSelection),

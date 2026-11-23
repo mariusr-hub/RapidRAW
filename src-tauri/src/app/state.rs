@@ -340,6 +340,27 @@ pub struct AppState {
     pub export_task_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub merge_session: Arc<Mutex<Option<Box<dyn MergeSession>>>>,
     pub merge_generation: Arc<AtomicU64>,
+    pub hdr_result: Arc<Mutex<Option<DynamicImage>>>,
+    pub hdr_linear_radiance: Arc<Mutex<Option<Arc<image::Rgb32FImage>>>>,
+    pub hdr_preview_radiance: Arc<Mutex<Option<Arc<image::Rgb32FImage>>>>,
+    pub hdr_last_options: Arc<Mutex<Option<crate::enhanced::hdr_fusion::HdrMergeOptions>>>,
+    pub hdr_tone_generation: Arc<AtomicU64>,
+    pub hdr_cancellation_token: Arc<AtomicBool>,
+    pub hdr_panorama_result: Arc<Mutex<Option<image::DynamicImage>>>,
+    pub panorama_linear_radiance: Arc<Mutex<Option<image::Rgb32FImage>>>,
+    pub panorama_cancellation_token: Arc<AtomicBool>,
+    pub critic_cache: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    u64,
+                    crate::enhanced::photographic_critic::PhotographicQualityReport,
+                ),
+            >,
+        >,
+    >,
+    pub denoise_result: Arc<Mutex<Option<image::DynamicImage>>>,
     pub indexing_task_handle: Mutex<Option<JoinHandle<()>>>,
     pub lut_cache: Mutex<LutCache>,
     pub swatch_lut_cache: Mutex<LutCache>,

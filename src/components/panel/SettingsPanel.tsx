@@ -41,6 +41,7 @@ import Switch from '../ui/Switch';
 import Input from '../ui/Input';
 import Slider from '../ui/Slider';
 import { ThemeProps, THEMES, DEFAULT_THEME_ID } from '../../utils/themes';
+import { getDefaultWgpuRendererSetting } from '../../utils/wgpuRenderer';
 import { useTranslation } from 'react-i18next';
 import { Invokes } from '../../types/invokes';
 import {
@@ -796,7 +797,7 @@ export default function SettingsPanel({
     highResZoomMultiplier: appSettings?.highResZoomMultiplier || 1.0,
     useFullDpiRendering: appSettings?.useFullDpiRendering ?? false,
     useWgpuRenderer:
-      appSettings?.useWgpuRenderer ?? (osPlatform === 'linux' || osPlatform === 'android' ? false : true),
+      appSettings?.useWgpuRenderer ?? getDefaultWgpuRendererSetting(osPlatform),
     thumbnailWorkerThreads: appSettings?.thumbnailWorkerThreads ?? 4,
     imageCacheSize: appSettings?.imageCacheSize ?? 5,
     rawPreprocessingColorNr: appSettings?.rawPreprocessingColorNr ?? 0.5,
@@ -936,7 +937,7 @@ export default function SettingsPanel({
       highResZoomMultiplier: appSettings?.highResZoomMultiplier || 1.0,
       useFullDpiRendering: appSettings?.useFullDpiRendering ?? false,
       useWgpuRenderer:
-        appSettings?.useWgpuRenderer ?? (osPlatform === 'linux' || osPlatform === 'android' ? false : true),
+        appSettings?.useWgpuRenderer ?? getDefaultWgpuRendererSetting(osPlatform),
       thumbnailWorkerThreads: appSettings?.thumbnailWorkerThreads ?? 4,
       imageCacheSize: appSettings?.imageCacheSize ?? 5,
       rawPreprocessingColorNr: appSettings?.rawPreprocessingColorNr ?? 0.5,
@@ -2105,15 +2106,17 @@ export default function SettingsPanel({
                         description={
                           osPlatform === 'android'
                             ? t('settings.processing.wgpuDescAndroid')
-                            : osPlatform === 'linux'
-                              ? isWgpuSupported
-                                ? t('settings.processing.wgpuDescLinuxExperimental')
-                                : t('settings.processing.wgpuDescLinuxX11')
-                              : t('settings.processing.wgpuDescRecommended')
+                            : osPlatform === 'windows' && !isWgpuSupported
+                              ? t('settings.processing.wgpuDescWindows')
+                              : osPlatform === 'linux'
+                                ? isWgpuSupported
+                                  ? t('settings.processing.wgpuDescLinuxExperimental')
+                                  : t('settings.processing.wgpuDescLinuxX11')
+                                : t('settings.processing.wgpuDescRecommended')
                         }
                       >
                         <Switch
-                          checked={processingSettings.useWgpuRenderer}
+                          checked={osPlatform === 'windows' && !isWgpuSupported ? false : processingSettings.useWgpuRenderer}
                           disabled={osPlatform === 'android' || !isWgpuSupported}
                           id="wgpu-renderer-toggle"
                           label={t('settings.processing.wgpuLabel')}

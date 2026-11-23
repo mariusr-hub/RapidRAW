@@ -32,6 +32,8 @@ import {
 import EditorToolbar from './editor/EditorToolbar';
 import ImageCanvas, { ImageRegion, MaskOverlayImage } from './editor/ImageCanvas';
 import SpeedEditOverlay from './editor/overlays/SpeedEditOverlay';
+import SplitCompareOverlay from '../../enhanced/editor/SplitCompareOverlay';
+import VariantMatrix4Way from '../../enhanced/editor/VariantMatrix4Way';
 import { Mask, SubMask } from '../../types/masks';
 import { CompareView } from '../../types/settings';
 import { Panel } from '../../types/ui';
@@ -46,6 +48,7 @@ import { useEditorActions, withRotation } from '../../hooks/useEditorActions';
 import { clickZoomTarget, interpretWheel, movedBeyondClick } from '../../utils/canvasControls';
 import { getVisibleImageRegion } from '../../utils/previewResolution';
 import { getDevicePixelRatio } from '../../utils/displayScale';
+import { isDirectWgpuSwapchainActive } from '../../utils/wgpuRenderer';
 
 const parseRgb = (rgbStr: string): [number, number, number, number] => {
   const match = rgbStr.match(/[\d.]+/g);
@@ -196,6 +199,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const uncroppedAdjustedPreviewUrl = useEditorStore((s) => s.uncroppedAdjustedPreviewUrl);
   const showOriginal = useEditorStore((s) => s.showOriginal);
   const compareView = useEditorStore((s) => s.compareView);
+  const enhancedCompareMode = useEditorStore((s) => s.compareMode);
   const splitPosition = useEditorStore((s) => s.splitPosition);
   const originalPreview = useEditorStore((s) => s.originalPreview);
   const isSliderDragging = useEditorStore((s) => s.isSliderDragging);
@@ -1694,8 +1698,10 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
   useLayoutEffect(syncSplitOverlay, [syncSplitOverlay, activeCompareView, splitPosition, imageRenderSize]);
 
+  const isDirectWgpu = isDirectWgpuSwapchainActive(appSettings, osPlatform);
+
   const wgpuStateRef = useRef<WgpuRenderState>({
-    useWgpuRenderer: appSettings?.useWgpuRenderer,
+    useWgpuRenderer: isDirectWgpu,
     path: selectedImage?.path ?? null,
     isReady: selectedImage?.isReady ?? false,
     wgpuPhase,
@@ -1716,7 +1722,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     const isNeutralGrey = appSettings?.editorNeutralGreyBg ?? false;
 
     wgpuStateRef.current = {
-      useWgpuRenderer: appSettings?.useWgpuRenderer,
+      useWgpuRenderer: isDirectWgpu,
       path: selectedImage?.path ?? null,
       isReady: selectedImage?.isReady ?? false,
       wgpuPhase,
@@ -1729,7 +1735,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       bgSecondary: isNeutralGrey ? NEUTRAL_GREY_RGB : parseRgb(bgSecondaryStr),
     };
   }, [
-    appSettings?.useWgpuRenderer,
+    isDirectWgpu,
     appSettings?.editorNeutralGreyBg,
     selectedImage?.path,
     selectedImage?.isReady,
@@ -1746,7 +1752,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   useEffect(() => {
     syncWgpuRef.current();
   }, [
-    appSettings?.useWgpuRenderer,
+    isDirectWgpu,
     appSettings?.editorNeutralGreyBg,
     selectedImage?.path,
     selectedImage?.isReady,
@@ -2647,8 +2653,11 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     }
   }
 
-  const isWgpuActive = appSettings?.useWgpuRenderer !== false && wgpuPhase === 'live';
-  const isSplitActive = activeCompareView === 'vertical' || activeCompareView === 'horizontal';
+  const isWgpuActive = isDirectWgpu && wgpuPhase === 'live';
+  const isEnhancedSplitActive =
+    (enhancedCompareMode === 'vertical_split' || enhancedCompareMode === 'horizontal_split') && !isCropping;
+  const isSplitActive =
+    !isEnhancedSplitActive && (activeCompareView === 'vertical' || activeCompareView === 'horizontal');
   const contentTransform = `translate(${transformStateRef.current.positionX}px, ${transformStateRef.current.positionY}px) scale(${transformStateRef.current.scale})`;
   const originalLayer = originalPreview?.url && (
     <div
@@ -2692,7 +2701,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         !isInstantTransition && 'transition-all duration-300 ease-in-out',
         isFullScreen
           ? 'rounded-none p-0 gap-0'
-          : clsx('rounded-lg p-2 gap-2', appSettings?.useWgpuRenderer !== false ? 'bg-transparent' : 'bg-bg-secondary'),
+          : clsx('rounded-lg p-2 gap-2', isDirectWgpu ? 'bg-transparent' : 'bg-bg-secondary'),
       )}
     >
       {hasRenderedAnyPreview && <div className="hidden" data-bench-id="editor-first-frame" />}
@@ -2732,7 +2741,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         className={clsx(
           'flex-1 flex relative overflow-hidden isolate',
           isFullScreen ? 'rounded-none' : 'rounded-lg',
-          appSettings?.useWgpuRenderer !== false && !isFullScreen && 'ring-[9999px] ring-bg-secondary',
+          isDirectWgpu && !isFullScreen && 'ring-[9999px] ring-bg-secondary',
           !isWgpuActive && (appSettings?.editorNeutralGreyBg ? 'bg-[#808080]' : 'bg-bg-secondary'),
         )}
       >
@@ -2828,6 +2837,17 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
               overlayRoot={overlayRoot}
               subscribeViewTransform={subscribeViewTransform}
             />
+            {isEnhancedSplitActive && (
+              <SplitCompareOverlay
+                imageWidth={imageRenderSize.width}
+                imageHeight={imageRenderSize.height}
+                offsetX={imageRenderSize.offsetX}
+                offsetY={imageRenderSize.offsetY}
+                originalSrc={originalPreview?.url ?? null}
+                adjustedSrc={finalPreviewUrl}
+                isMaxZoom={isMaxZoom}
+              />
+            )}
           </div>
           <div ref={setOverlayRoot} className="absolute inset-0 overflow-hidden pointer-events-none" />
           {isSplitActive && (
@@ -2846,6 +2866,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
           {straightenOverlay}
         </div>
         <SpeedEditOverlay />
+        {enhancedCompareMode === 'matrix_4way' && <VariantMatrix4Way />}
       </div>
     </div>
   );

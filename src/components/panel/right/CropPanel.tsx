@@ -25,9 +25,12 @@ import {
   Ban,
   Save,
   ScanLine,
+  Compass,
+  Maximize2,
 } from 'lucide-react';
 import { useTranslation, Trans } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'react-toastify';
 import { Adjustments } from '../../../utils/adjustments';
 import { getDefaultAdjustments, getOpenImageDefaults } from '../../../utils/developDefaults';
 import clsx from 'clsx';
@@ -40,7 +43,8 @@ import Switch from '../../ui/Switch';
 import Dropdown from '../../ui/Dropdown';
 import { TEXT_COLOR_KEYS, TextColors, TextVariants, TextWeights } from '../../../types/typography';
 import { useEditorStore } from '../../../store/useEditorStore';
-import { useEditorActions } from '../../../hooks/useEditorActions';
+import { useEditorActions, withRotation } from '../../../hooks/useEditorActions';
+import { Invokes } from '../../../types/invokes';
 import {
   calculateAreaPreservingCrop,
   calculateCenteredCrop,
@@ -128,6 +132,23 @@ export default function CropPanel() {
 
   const [modeBubbleStyle, setModeBubbleStyle] = useState({});
   const isModeInitialAnimation = useRef(true);
+
+  const [isDetectingHorizon, setIsDetectingHorizon] = useState(false);
+
+  const handleAutoHorizon = useCallback(async () => {
+    if (!selectedImage || isDetectingHorizon) return;
+    setIsDetectingHorizon(true);
+    try {
+      const res = await invoke<{ angle_degrees: number; confidence: number }>(Invokes.DetectAutoHorizon);
+      const clampedAngle = Math.max(-MAX_FINE_ROTATION, Math.min(MAX_FINE_ROTATION, Number(res.angle_degrees.toFixed(1))));
+      setAdjustments((prev: Adjustments) => withRotation(prev, selectedImage, clampedAngle));
+      toast.info(`Auto Horizon: ${clampedAngle.toFixed(1)}° (${Math.round((res.confidence ?? 0) * 100)}% conf.)`);
+    } catch (err) {
+      toast.error(`Auto Horizon failed: ${String(err)}`);
+    } finally {
+      setIsDetectingHorizon(false);
+    }
+  }, [selectedImage, isDetectingHorizon, setAdjustments]);
 
   const { cropSectionsState, setUI } = useUIStore(
     useShallow((s) => ({
@@ -933,6 +954,14 @@ export default function CropPanel() {
                         {isAutoStraightening ? <Loader size={14} className="animate-spin" /> : <ScanLine size={14} />}
                       </button>
                       <button
+                        onClick={handleAutoHorizon}
+                        className="p-1.5 rounded-md text-text-secondary transition-colors cursor-pointer hover:bg-card-active hover:text-text-primary disabled:cursor-wait"
+                        data-tooltip={t('editor.crop.tooltips.autoHorizon', 'AI Auto Horizon')}
+                        disabled={isDetectingHorizon || !selectedImage}
+                      >
+                        {isDetectingHorizon ? <Loader size={14} className="animate-spin" /> : <Compass size={14} />}
+                      </button>
+                      <button
                         className="p-1.5 rounded-md text-text-secondary transition-colors cursor-pointer hover:bg-card-active hover:text-text-primary"
                         onClick={resetFineRotation}
                         data-tooltip={t('editor.crop.tooltips.resetFineRotation')}
@@ -1048,6 +1077,14 @@ export default function CropPanel() {
                       className="overflow-hidden"
                     >
                       <div className="px-4 pb-4 pt-3 border-t border-surface/50 flex flex-col gap-6">
+                        <button
+                          type="button"
+                          onClick={() => setUI({ isTransformModalOpen: true })}
+                          className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg bg-card-active hover:bg-accent/20 text-xs font-medium text-text-primary transition-colors cursor-pointer"
+                        >
+                          <Maximize2 size={14} className="text-accent" />
+                          <span>{t('modals.transform.openCalibrationLoupe', 'Open Calibration Loupe...')}</span>
+                        </button>
                         <div>
                           <Text variant={TextVariants.heading} className="mb-2">
                             {t('modals.transform.guided')}
@@ -1334,6 +1371,14 @@ export default function CropPanel() {
                       className="overflow-hidden"
                     >
                       <div className="px-4 pb-4 pt-2 border-t border-surface/50 flex flex-col gap-4">
+                        <button
+                          type="button"
+                          onClick={() => setUI({ isLensCorrectionModalOpen: true })}
+                          className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg bg-card-active hover:bg-accent/20 text-xs font-medium text-text-primary transition-colors cursor-pointer"
+                        >
+                          <Maximize2 size={14} className="text-accent" />
+                          <span>{t('modals.lensCorrection.openCalibrationLoupe', 'Open Calibration Loupe...')}</span>
+                        </button>
                         <div className="w-full p-1 bg-card-active rounded-md">
                           <div className="relative flex w-full">
                             <motion.div

@@ -1,7 +1,10 @@
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Loader2 } from 'lucide-react';
+import { ChevronDown, Loader2, Sparkles } from 'lucide-react';
+import clsx from 'clsx';
 import Slider, { SliderChangeEvent } from '../ui/Slider';
+import Switch from '../ui/Switch';
+import Button from '../ui/Button';
 import Text from '../ui/Text';
 import { TextVariants } from '../../types/typography';
 import { SpatialEffect } from './Effects';
@@ -18,6 +21,7 @@ import { AppSettings } from '../../types/settings';
 import AdjustmentSubSection from './AdjustmentSubSection';
 import { canvasToolState, useEditorStore } from '../../store/useEditorStore';
 import { selectAiModelDownloadStatus, useProcessStore } from '../../store/useProcessStore';
+import { useUIStore } from '../../store/useUIStore';
 
 interface DetailsPanelProps {
   adjustments: Adjustments;
@@ -36,6 +40,10 @@ function DetailsPanel({
 }: DetailsPanelProps) {
   const { t } = useTranslation();
   const setEditor = useEditorStore((state) => state.setEditor);
+  const selectedImage = useEditorStore((state) => state.selectedImage);
+  const setUI = useUIStore((state) => state.setUI);
+  const [isEdgeOpticsOpen, setIsEdgeOpticsOpen] = useState(false);
+  const [isEnhancedPresenceOpen, setIsEnhancedPresenceOpen] = useState(false);
   const aiDenoiseProgress = useEditorStore((state) =>
     state.selectedImage ? state.aiDenoiseProgress[state.selectedImage.path] : undefined,
   );
@@ -62,6 +70,15 @@ function DetailsPanel({
   const hiddenTools = getHiddenAdjustmentTools(appSettings?.adjustmentLayout);
   const toolOrder = getAdjustmentToolOrder('details', appSettings?.adjustmentLayout?.toolOrder);
 
+  const hasEdgeOpticsActive =
+    Math.abs(adjustments.microContrast ?? 0) > 1e-4 ||
+    (adjustments.cornerSharpnessBoost ?? 0) > 0 ||
+    (adjustments.bokehMaskProtection ?? 0) > 0;
+  const hasEnhancedPresenceActive =
+    (adjustments.clearView ?? 0) > 0 ||
+    Math.abs((adjustments.skinShield ?? 0.9) - 0.9) > 1e-4 ||
+    Math.abs((adjustments.contrastCleaner ?? 1.0) - 1.0) > 1e-4;
+
   return (
     <div className="flex flex-col gap-4">
       {!hiddenTools.includes('sharpening') && (
@@ -69,6 +86,9 @@ function DetailsPanel({
           id="sharpening"
           order={toolOrder.indexOf('sharpening')}
           title={t('adjustments.details.sharpening')}
+          hasActiveAdjustment={
+            adjustments.sharpness !== 0 || (adjustments.sharpnessThreshold ?? 15) !== 15 || hasEdgeOpticsActive
+          }
         >
           <Slider
             resetKey="sharpness"
@@ -81,18 +101,78 @@ function DetailsPanel({
             onDragStateChange={onDragStateChange}
           />
           {!isForMask && (
-            <Slider
-              resetKey="sharpnessThreshold"
-              label={t('adjustments.details.threshold')}
-              max={80}
-              min={0}
-              onChange={(e: any) => handleAdjustmentChange(DetailsAdjustment.SharpnessThreshold, e.target.value)}
-              step={1}
-              value={adjustments.sharpnessThreshold ?? 15}
-              onDragStateChange={onDragStateChange}
-              defaultValue={15}
-              fillOrigin="min"
-            />
+            <>
+              <Slider
+                resetKey="sharpnessThreshold"
+                label={t('adjustments.details.threshold')}
+                max={80}
+                min={0}
+                onChange={(e: any) => handleAdjustmentChange(DetailsAdjustment.SharpnessThreshold, e.target.value)}
+                step={1}
+                value={adjustments.sharpnessThreshold ?? 15}
+                onDragStateChange={onDragStateChange}
+                defaultValue={15}
+                fillOrigin="min"
+              />
+              <div className="mt-2 rounded-md border border-border-color/60 bg-bg-secondary/40 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setIsEdgeOpticsOpen((prev) => !prev)}
+                  className="w-full flex items-center justify-between px-2.5 py-1.5 text-xs font-medium text-text-primary hover:bg-card-active/40 transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span>{t('adjustments.details.focusMaskOptics', 'FocusMask & Edge Optics')}</span>
+                    {hasEdgeOpticsActive && <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />}
+                  </span>
+                  <ChevronDown
+                    size={14}
+                    className={clsx(
+                      'text-text-secondary transition-transform duration-200',
+                      isEdgeOpticsOpen && 'rotate-180',
+                    )}
+                  />
+                </button>
+                {isEdgeOpticsOpen && (
+                  <div className="px-2 pb-2 pt-1 space-y-1 border-t border-border-color/40">
+                    <Slider
+                      resetKey="microContrast"
+                      label={t('adjustments.details.microContrast', 'Micro-Contrast')}
+                      max={100}
+                      min={-100}
+                      defaultValue={0}
+                      onChange={(e: any) => handleAdjustmentChange('microContrast', e.target.value)}
+                      step={1}
+                      value={adjustments.microContrast ?? 0}
+                      onDragStateChange={onDragStateChange}
+                    />
+                    <Slider
+                      resetKey="cornerSharpnessBoost"
+                      label={t('adjustments.details.cornerSharpnessBoost', 'Corner Sharpness')}
+                      max={100}
+                      min={0}
+                      defaultValue={0}
+                      onChange={(e: any) => handleAdjustmentChange('cornerSharpnessBoost', e.target.value)}
+                      step={1}
+                      value={adjustments.cornerSharpnessBoost ?? 0}
+                      onDragStateChange={onDragStateChange}
+                      fillOrigin="min"
+                    />
+                    <Slider
+                      resetKey="bokehMaskProtection"
+                      label={t('adjustments.details.bokehMaskProtection', 'Bokeh Mask Protection')}
+                      max={100}
+                      min={0}
+                      defaultValue={0}
+                      onChange={(e: any) => handleAdjustmentChange('bokehMaskProtection', e.target.value)}
+                      step={1}
+                      value={adjustments.bokehMaskProtection ?? 0}
+                      onDragStateChange={onDragStateChange}
+                      fillOrigin="min"
+                    />
+                  </div>
+                )}
+              </div>
+            </>
           )}
         </AdjustmentSubSection>
       )}
@@ -137,22 +217,117 @@ function DetailsPanel({
             onDragStateChange={onDragStateChange}
           />
           {!isForMask && (
-            <div
-              data-center-marker-controls="centre"
-              onPointerDown={() => setEditor(canvasToolState({ activeCenterMarker: 'centre' }))}
-            >
-              <Slider
-                resetKey="centré"
-                label={t('adjustments.details.centre')}
-                max={100}
-                min={-100}
-                onChange={(e: any) => handleAdjustmentChange(DetailsAdjustment.Centré, e.target.value)}
-                step={1}
-                value={adjustments.centré}
-                onDragStateChange={onDragStateChange}
-              />
-            </div>
+            <>
+              <div
+                data-center-marker-controls="centre"
+                onPointerDown={() => setEditor(canvasToolState({ activeCenterMarker: 'centre' }))}
+              >
+                <Slider
+                  resetKey="centré"
+                  label={t('adjustments.details.centre')}
+                  max={100}
+                  min={-100}
+                  onChange={(e: any) => handleAdjustmentChange(DetailsAdjustment.Centré, e.target.value)}
+                  step={1}
+                  value={adjustments.centré}
+                  onDragStateChange={onDragStateChange}
+                />
+              </div>
+              <div className="mt-2 rounded-md border border-border-color/60 bg-bg-secondary/40 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setIsEnhancedPresenceOpen((prev) => !prev)}
+                  className="w-full flex items-center justify-between px-2.5 py-1.5 text-xs font-medium text-text-primary hover:bg-card-active/40 transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span>{t('adjustments.details.enhancedPresence', 'Smart Clarity & Skin Shield')}</span>
+                    {hasEnhancedPresenceActive && <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />}
+                  </span>
+                  <ChevronDown
+                    size={14}
+                    className={clsx(
+                      'text-text-secondary transition-transform duration-200',
+                      isEnhancedPresenceOpen && 'rotate-180',
+                    )}
+                  />
+                </button>
+                {isEnhancedPresenceOpen && (
+                  <div className="px-2 pb-2 pt-1 space-y-1 border-t border-border-color/40">
+                    <Slider
+                      resetKey="skinShield"
+                      label={t('adjustments.details.skinShield', 'Skin Shield')}
+                      max={1.5}
+                      min={0}
+                      defaultValue={0.9}
+                      onChange={(e: any) => handleFloatAdjustmentChange('skinShield', String(e.target.value))}
+                      step={0.05}
+                      value={adjustments.skinShield ?? 0.9}
+                      onDragStateChange={onDragStateChange}
+                      fillOrigin="min"
+                    />
+                    <Slider
+                      resetKey="contrastCleaner"
+                      speedEditId="contrastCleaner"
+                      label={t('adjustments.details.contrastCleaner', 'Halo Contrast Cleaner')}
+                      max={2}
+                      min={0}
+                      defaultValue={1.0}
+                      onChange={(e: any) => handleFloatAdjustmentChange('contrastCleaner', String(e.target.value))}
+                      step={0.05}
+                      value={adjustments.contrastCleaner ?? 1.0}
+                      onDragStateChange={onDragStateChange}
+                      fillOrigin="min"
+                    />
+                    <Slider
+                      resetKey="clearView"
+                      label={t('adjustments.details.clearView', 'ClearView Haze Inversion')}
+                      max={100}
+                      min={0}
+                      defaultValue={0}
+                      onChange={(e: any) => handleAdjustmentChange('clearView', String(e.target.value))}
+                      step={1}
+                      value={adjustments.clearView ?? 0}
+                      onDragStateChange={onDragStateChange}
+                      fillOrigin="min"
+                    />
+                  </div>
+                )}
+              </div>
+            </>
           )}
+        </AdjustmentSubSection>
+      )}
+
+      {!isForMask && !hiddenTools.includes('hlr') && (
+        <AdjustmentSubSection
+          id="hlr"
+          order={toolOrder.indexOf('hlr')}
+          title={t('adjustments.details.hlr', 'Highlight Reconstruction')}
+          hasActiveAdjustment={adjustments.hlrEnabled === false || Math.abs((adjustments.hlrClipCeiling ?? 0.95) - 0.95) > 1e-3}
+        >
+          <div className="space-y-2">
+            <Switch
+              checked={adjustments.hlrEnabled ?? true}
+              label={t('adjustments.details.hlrEnabled', 'Highlight Chroma Recovery')}
+              onChange={(checked) =>
+                setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, hlrEnabled: checked }))
+              }
+            />
+            {(adjustments.hlrEnabled ?? true) && (
+              <Slider
+                resetKey="hlrClipCeiling"
+                label={t('adjustments.details.hlrClipCeiling', 'Clip Ceiling')}
+                max={1.0}
+                min={0.5}
+                defaultValue={0.95}
+                onChange={(e: any) => handleFloatAdjustmentChange('hlrClipCeiling', String(e.target.value))}
+                step={0.01}
+                value={adjustments.hlrClipCeiling ?? 0.95}
+                onDragStateChange={onDragStateChange}
+                fillOrigin="min"
+              />
+            )}
+          </div>
         </AdjustmentSubSection>
       )}
 
@@ -245,6 +420,29 @@ function DetailsPanel({
                   </>
                 )}
               </SpatialEffect>
+              {selectedImage && (
+                <Button
+                  variant="secondary"
+                  className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs py-1.5"
+                  onClick={() =>
+                    setUI({
+                      denoiseModalState: {
+                        isOpen: true,
+                        isProcessing: false,
+                        previewBase64: null,
+                        originalBase64: null,
+                        error: null,
+                        targetPaths: [selectedImage.path],
+                        progressMessage: null,
+                        isRaw: selectedImage.isRaw,
+                      },
+                    })
+                  }
+                >
+                  <Sparkles size={14} className="text-accent" />
+                  {t('adjustments.details.openDenoiseStudio', 'Open AI Denoise Studio...')}
+                </Button>
+              )}
             </div>
           )}
         </AdjustmentSubSection>

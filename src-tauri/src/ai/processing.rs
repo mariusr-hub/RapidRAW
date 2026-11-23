@@ -1059,3 +1059,15 @@ pub struct AiDepthMaskParameters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_source: Option<String>,
 }
+
+#[cfg(target_os = "windows")]
+pub use crate::ai::models::high_performance_dml_device_id;
+
+#[cfg(not(target_os = "windows"))]
+pub fn high_performance_dml_device_id() -> Option<i32> {
+    None
+}
+
+pub fn is_directml_active() -> bool {
+    cfg!(target_os = "windows")
+}

@@ -29,10 +29,7 @@ pub enum AlbumItem {
 }
 
 fn get_albums_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    let data_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
+    let data_dir = crate::app::settings::resolved_app_data_dir(app_handle)?;
     let albums_dir = data_dir.join("albums");
     if !albums_dir.exists() {
         fs::create_dir_all(&albums_dir).map_err(|e| e.to_string())?;

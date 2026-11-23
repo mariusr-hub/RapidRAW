@@ -57,6 +57,8 @@ export function useImageProcessing(
   const originalSize = useEditorStore((state) => state.originalSize);
   const isSliderDragging = useEditorStore((state) => state.isSliderDragging);
   const compareView = useEditorStore((state) => state.compareView);
+  const enhancedCompareMode = useEditorStore((state) => state.compareMode);
+  const showOriginal = useEditorStore((state) => state.showOriginal);
   const setEditor = useEditorStore((state) => state.setEditor);
 
   const activeView = useUIStore((state) => state.activeView);
@@ -104,9 +106,20 @@ export function useImageProcessing(
 
   const renderOriginal = useCallback(
     async (targetRes?: number) => {
-      const { selectedImage: image, adjustments: currentAdjustments, compareView: view } = useEditorStore.getState();
+      const {
+        selectedImage: image,
+        adjustments: currentAdjustments,
+        compareView: view,
+        compareMode,
+        showOriginal: showingOriginal,
+      } = useEditorStore.getState();
       const ui = useUIStore.getState();
-      if (view === 'off' || !image?.isReady || ui.activeView !== 'editor' || ui.activePanel === Panel.Crop) return;
+      const isCompareActive =
+        view !== 'off' ||
+        compareMode === 'vertical_split' ||
+        compareMode === 'horizontal_split' ||
+        showingOriginal;
+      if (!isCompareActive || !image?.isReady || ui.activeView !== 'editor' || ui.activePanel === Panel.Crop) return;
 
       const originalAdjustments = getOriginalAdjustments(currentAdjustments);
       const { useWgpuRenderer, hdrDisplay, gainMapMode, displayColorMode, displayIccProfile, wideGamutPreview } =
@@ -457,16 +470,24 @@ export function useImageProcessing(
     originalSize,
   ]);
 
-  const isComparing = compareView !== 'off';
+  const isComparing =
+    compareView !== 'off' ||
+    enhancedCompareMode === 'vertical_split' ||
+    enhancedCompareMode === 'horizontal_split' ||
+    showOriginal;
 
   useEffect(() => {
-    if (isComparing && currentResRef.current > 0) renderOriginal(currentResRef.current);
+    if (isComparing) {
+      renderOriginal(currentResRef.current > 0 ? currentResRef.current : calculateTargetRes());
+    }
   }, [
     isComparing,
     activeView,
     activePanel,
     selectedImage?.path,
     selectedImage?.isReady,
+    adjustments,
+    calculateTargetRes,
     renderOriginal,
     currentResRef,
   ]);

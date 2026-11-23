@@ -642,7 +642,8 @@ pub fn build_wgpu_display(
         swapchain_caps.alpha_modes[0]
     };
 
-    let present_mode = if (standalone || cfg!(target_os = "linux"))
+    let present_mode = if !cfg!(target_os = "windows")
+        && (standalone || cfg!(target_os = "linux"))
         && swapchain_caps
             .present_modes
             .contains(&wgpu::PresentMode::Mailbox)

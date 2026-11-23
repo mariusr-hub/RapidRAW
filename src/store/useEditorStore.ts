@@ -18,8 +18,18 @@ import { describeHistoryChange, isSameValue } from '../utils/editHistory';
 import { HslMixerProperty } from '../utils/hslMixer';
 import { getCroppedDimensions } from '../utils/cropUtils';
 import { getDevicePixelRatio } from '../utils/displayScale';
+import { IsophoteGuide, ShieldRegion } from '../components/panel/editor/overlays/InpaintGuideOverlay';
 
 export type CenterMarker = 'vignette' | 'centre';
+export type CompareMode = 'none' | 'vertical_split' | 'horizontal_split' | 'side_by_side' | 'matrix_4way';
+
+export interface GradingSnapshot {
+  id: string;
+  name: string;
+  adjustments: Adjustments;
+  previewUrl: string | null;
+  timestamp: number;
+}
 
 interface InteractivePatch {
   url: string;
@@ -55,7 +65,11 @@ interface EditorState {
   interactivePatch: InteractivePatch | null;
   showOriginal: boolean;
   compareView: CompareView;
+  compareMode: CompareMode;
   splitPosition: number;
+  snapshots: GradingSnapshot[];
+  activeSnapshotId: string | null;
+  pendingAutoEdit: { path: string; scene?: string | null; previousAdjustments: Adjustments } | null;
   originalPreview: { path: string; url: string | null } | null;
 
   // Analytics
@@ -97,6 +111,10 @@ interface EditorState {
   activeMaskId: string | null;
   activeAiPatchContainerId: string | null;
   activeAiSubMaskId: string | null;
+  inpaintGuideMode: 'none' | 'linepen' | 'shield';
+  isophoteGuides: IsophoteGuide[];
+  shieldRegions: ShieldRegion[];
+  activeInpaintGuideId: string | null;
   isMaskControlHovered: boolean;
   isGeneratingAiMask: boolean;
   isGeneratingAi: boolean;
@@ -182,7 +200,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   uncroppedAdjustedPreviewUrl: null,
   showOriginal: false,
   compareView: 'off',
+  compareMode: 'none',
   splitPosition: 0.5,
+  snapshots: [],
+  activeSnapshotId: null,
+  pendingAutoEdit: null,
   originalPreview: null,
   histogram: null,
   waveform: null,
@@ -200,6 +222,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   activeMaskId: null,
   activeAiPatchContainerId: null,
   activeAiSubMaskId: null,
+  inpaintGuideMode: 'none',
+  isophoteGuides: [],
+  shieldRegions: [],
+  activeInpaintGuideId: null,
 
   zoom: 1,
   displaySize: { width: 0, height: 0 },

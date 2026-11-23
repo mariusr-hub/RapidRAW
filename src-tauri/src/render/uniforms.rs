@@ -177,8 +177,44 @@ pub struct GlobalAdjustments {
     pub flare_amount: f32,
     pub sharpness_threshold: f32,
 
+    // Enhanced Edition Uniforms (8 x 16 bytes = 128 bytes)
+    pub lights_brightness: f32,
+    pub lights_contrast: f32,
+    pub lights_details: f32,
+    pub contrast_cleaner_strength: f32,
+    pub lights_wb_temp: f32,
+    pub lights_wb_tint: f32,
+    pub lights_saturation: f32,
+    pub lights_vibrance: f32,
+    pub supercontrast_shadows: f32,
+    pub supercontrast_midtones: f32,
+    pub supercontrast_highlights: f32,
+    pub supercontrast_pivots: f32,
+    pub skin_shield_strength: f32,
+    pub orton_spread: f32,
+    pub foliage_enhancer: f32,
+    pub _pad_phase1_end: f32,
+    pub lens_k1: f32,
+    pub lens_k2: f32,
+    pub lens_k3: f32,
+    pub lens_autocrop_scale: f32,
+    pub lens_center_x: f32,
+    pub lens_center_y: f32,
+    pub lens_distortion_enabled: u32,
+    pub _pad_lens: f32,
+    pub corner_sharpness_boost: f32,
+    pub bokeh_mask_protection: f32,
+    pub hlr_enabled: u32,
+    pub hlr_clip_ceiling: f32,
+    pub clearview_strength: f32,
+    pub clearview_t0: f32,
+    pub micro_contrast: f32,
+    pub _pad_reserved: f32,
+
     pub monochrome: MonochromeSettings,
 }
+
+const _: () = assert!(std::mem::size_of::<GlobalAdjustments>() % 16 == 0);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
 #[repr(C)]
@@ -669,6 +705,68 @@ fn get_global_adjustments_from_json(
     let grain_amount = get_val("grain", "grainAmount", SCALES.grain_amount, None);
     let grain_size = 0.243 * get_val("grain", "grainSize", SCALES.grain_size, Some(25.0)).exp2();
 
+    let get_scoped_val = |tool: &str, keys: &[&str], scale: f32, default_val: f64| -> f32 {
+        if !is_visible(tool) {
+            return (default_val as f32) / scale;
+        }
+        if let Some(tool_obj) = js_adjustments.get(tool) {
+            for &k in keys {
+                if let Some(v) = tool_obj.get(k).and_then(|v| v.as_f64()) {
+                    return (v as f32) / scale;
+                }
+            }
+        }
+        for &k in keys {
+            // Never read unprefixed Basic/global keys from top-level JSON as fallback for scoped tools
+            if matches!(
+                k,
+                "brightness"
+                    | "contrast"
+                    | "details"
+                    | "wbTemp"
+                    | "wbTint"
+                    | "saturation"
+                    | "vibrance"
+                    | "shadows"
+                    | "midtones"
+                    | "highlights"
+                    | "pivots"
+            ) {
+                continue;
+            }
+            if let Some(v) = js_adjustments.get(k).and_then(|v| v.as_f64()) {
+                return (v as f32) / scale;
+            }
+        }
+        (default_val as f32) / scale
+    };
+
+    let lens_distortion_enabled = js_adjustments
+        .get("lensDistortionEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && is_visible("lensCorrection");
+    let (lens_k1, lens_k2, lens_k3, gpu_lens_enabled) =
+        if let Some(val) = js_adjustments.get("lensDistortionParams") {
+            let k1 = val.get("k1").and_then(|k| k.as_f64()).unwrap_or(0.0) as f32;
+            let k2 = val.get("k2").and_then(|k| k.as_f64()).unwrap_or(0.0) as f32;
+            let k3 = val.get("k3").and_then(|k| k.as_f64()).unwrap_or(0.0) as f32;
+            let en = if lens_distortion_enabled
+                && (k1.abs() > 1e-6 || k2.abs() > 1e-6 || k3.abs() > 1e-6)
+            {
+                1u32
+            } else {
+                0u32
+            };
+            (k1, k2, k3, en)
+        } else {
+            (0.0, 0.0, 0.0, 0u32)
+        };
+    let lens_autocrop_scale = js_adjustments
+        .get("lensAutocropScale")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0) as f32;
+
     GlobalAdjustments {
         exposure: get_val("basic", "exposure", SCALES.exposure, None) + baseline_exposure,
         brightness: get_val("basic", "brightness", SCALES.brightness, None),
@@ -858,6 +956,48 @@ fn get_global_adjustments_from_json(
             SCALES.sharpness_threshold,
             Some(15.0),
         ),
+
+        lights_brightness: get_scoped_val("lightsSubPipeline", &["lightsBrightness", "lights_brightness", "brightness"], 1.0, 0.0),
+        lights_contrast: get_scoped_val("lightsSubPipeline", &["lightsContrast", "lights_contrast", "contrast"], 1.0, 0.0),
+        lights_details: get_scoped_val("lightsSubPipeline", &["lightsDetails", "lights_details", "details"], 1.0, 0.0),
+        contrast_cleaner_strength: get_scoped_val("presence", &["contrastCleaner", "contrast_cleaner_strength"], 1.0, 1.0),
+        lights_wb_temp: get_scoped_val("lightsSubPipeline", &["lightsTemperature", "lights_wb_temp", "wbTemp"], 1.0, 0.0),
+        lights_wb_tint: get_scoped_val("lightsSubPipeline", &["lightsTint", "lights_wb_tint", "wbTint"], 1.0, 0.0),
+        lights_saturation: get_scoped_val("lightsSubPipeline", &["lightsSaturation", "lights_saturation", "saturation"], 1.0, 0.0),
+        lights_vibrance: get_scoped_val("lightsSubPipeline", &["lightsVibrance", "lights_vibrance", "vibrance"], 1.0, 0.0),
+        supercontrast_shadows: get_scoped_val("supercontrast", &["supercontrastShadows", "supercontrast_shadows", "shadows"], 1.0, 0.0),
+        supercontrast_midtones: get_scoped_val("supercontrast", &["supercontrastMidtones", "supercontrast_midtones", "midtones"], 1.0, 0.0),
+        supercontrast_highlights: get_scoped_val("supercontrast", &["supercontrastHighlights", "supercontrast_highlights", "highlights"], 1.0, 0.0),
+        supercontrast_pivots: get_scoped_val("supercontrast", &["supercontrastPivots", "supercontrast_pivots", "pivots"], 1.0, 0.0),
+        skin_shield_strength: get_scoped_val("creative", &["skinShield", "skin_shield_strength"], 1.0, 0.85),
+        orton_spread: get_scoped_val("creative", &["ortonSpread", "orton_spread"], 1.0, 0.0),
+        foliage_enhancer: get_scoped_val("creative", &["foliageEnhancer", "foliage_enhancer"], 1.0, 0.0),
+        _pad_phase1_end: 0.0,
+        lens_k1,
+        lens_k2,
+        lens_k3,
+        lens_autocrop_scale,
+        lens_center_x: 0.5,
+        lens_center_y: 0.5,
+        lens_distortion_enabled: gpu_lens_enabled,
+        _pad_lens: 0.0,
+        corner_sharpness_boost: get_scoped_val("details", &["cornerSharpnessBoost", "corner_sharpness_boost"], 1.0, 0.0),
+        bokeh_mask_protection: get_scoped_val("details", &["bokehMaskProtection", "bokeh_mask_protection"], 1.0, 0.0),
+        hlr_enabled: if is_visible("hlr")
+            && js_adjustments
+                .get("hlrEnabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        {
+            1
+        } else {
+            0
+        },
+        hlr_clip_ceiling: get_scoped_val("hlr", &["hlrClipCeiling", "hlr_clip_ceiling"], 1.0, 0.96),
+        clearview_strength: get_scoped_val("presence", &["clearView", "clearview_strength"], 1.0, 0.0),
+        clearview_t0: 0.12,
+        micro_contrast: get_scoped_val("presence", &["microContrast", "micro_contrast"], 1.0, 0.0),
+        _pad_reserved: 0.0,
 
         monochrome: if is_monochrome {
             parse_monochrome_settings(

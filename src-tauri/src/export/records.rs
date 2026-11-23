@@ -21,9 +21,7 @@ pub struct ExportRecords {
 
 impl ExportRecords {
     pub fn load(app_handle: &tauri::AppHandle) -> Self {
-        let file = app_handle
-            .path()
-            .app_data_dir()
+        let file = crate::app::settings::resolved_app_data_dir(app_handle)
             .ok()
             .map(|dir| dir.join(RECORDS_FILE));
         Self {

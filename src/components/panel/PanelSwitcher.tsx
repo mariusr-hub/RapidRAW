@@ -14,6 +14,7 @@ import {
   Camera,
   Folder as FolderIcon,
   Film,
+  Sparkles,
   type LucideIcon,
 } from 'lucide-react';
 import { Panel, PanelRegion } from '../../types/ui';
@@ -31,6 +32,7 @@ export const PANEL_ICONS: Record<Panel, LucideIcon> = {
   [Panel.FolderTree]: FolderIcon,
   [Panel.Tethering]: Camera,
   [Panel.Filmstrip]: Film,
+  [Panel.Tones]: Sparkles,
 };
 
 const PANEL_TITLES: Record<Panel, ParseKeys> = {
@@ -44,6 +46,7 @@ const PANEL_TITLES: Record<Panel, ParseKeys> = {
   [Panel.FolderTree]: 'library.folders.sourcesTitle',
   [Panel.Tethering]: 'editor.switcher.tooltips.tethering',
   [Panel.Filmstrip]: 'editor.switcher.tooltips.filmstrip',
+  [Panel.Tones]: 'editor.switcher.tooltips.adjust',
 };
 
 interface PanelTabButtonProps {

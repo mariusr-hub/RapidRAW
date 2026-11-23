@@ -61,6 +61,94 @@ export const CLOSED_MERGE_MODAL_STATE: MergeModalState = {
   sourcePaths: [],
 };
 
+export interface DrizzleModalState {
+  isOpen: boolean;
+  isProcessing: boolean;
+  sourcePaths: string[];
+  scaleFactor: number;
+  pixfrac: number;
+  progressMessage: string | null;
+  error: string | null;
+  finalImageBase64: string | null;
+  originalBase64: string | null;
+  meta: {
+    width: number;
+    height: number;
+    scale: number;
+    frames_stacked: number;
+    snr_boost: string;
+  } | null;
+}
+
+export interface DenoiseModalState {
+  isOpen: boolean;
+  isProcessing: boolean;
+  previewBase64: string | null;
+  originalBase64?: string | null;
+  error: string | null;
+  targetPaths: string[];
+  progressMessage: string | null;
+  isRaw: boolean;
+}
+
+export interface NegativeConversionModalState {
+  isOpen: boolean;
+  targetPaths: Array<string>;
+}
+
+export interface BatchPolishModalState {
+  isOpen: boolean;
+  selectedPaths: Array<string>;
+}
+
+export interface ColorMatcherModalState {
+  isOpen: boolean;
+  heroPath?: string | null;
+  targetPaths?: string[];
+  initialMode?: 'matcher' | 'harmonize';
+}
+
+export interface HeroCuratorModalState {
+  isOpen: boolean;
+  selectedPaths: Array<string>;
+}
+
+export interface ClientDeliveryModalState {
+  isOpen: boolean;
+  selectedPaths: Array<string>;
+}
+
+export interface BokehModalState {
+  isOpen: boolean;
+}
+
+export interface AdvancedExportModalState {
+  isOpen: boolean;
+  selectedPaths: Array<string>;
+}
+
+export interface SpeedCullerModalState {
+  isOpen: boolean;
+  selectedPaths: Array<string>;
+  initialIndex: number;
+}
+
+export interface NightSkyState {
+  isExpanded: boolean;
+  targetPaths: Array<string>;
+  isProcessing: boolean;
+  progressMessage: string | null;
+  freezeGround: boolean;
+  removeLightPollution: boolean;
+  sigmaClip: number;
+  error: string | null;
+  starTrailsMode: boolean;
+  cometDecay: boolean;
+  decayRate: number;
+  fillGaps: boolean;
+  useGpu: boolean;
+}
+
 interface CullingModalState {
   isOpen: boolean;
   suggestions: CullingSuggestions | null;
@@ -72,6 +160,7 @@ interface CullingModalState {
 const ALL_PANELS: Panel[] = [
   Panel.Metadata,
   Panel.FolderTree,
+  Panel.Tones,
   Panel.Export,
   Panel.Tethering,
   Panel.Adjustments,
@@ -93,6 +182,7 @@ const SIBLING_REGION: Record<PanelRegion, PanelRegion> = {
 const DEFAULT_PANEL_DEFAULT_REGIONS: Partial<Record<Panel, PanelRegion>> = {
   [Panel.Metadata]: 'leftTop',
   [Panel.FolderTree]: 'leftTop',
+  [Panel.Tones]: 'leftTop',
   [Panel.Export]: 'leftTop',
   [Panel.Tethering]: 'leftTop',
   [Panel.Adjustments]: 'rightTop',
@@ -102,7 +192,9 @@ const DEFAULT_PANEL_DEFAULT_REGIONS: Partial<Record<Panel, PanelRegion>> = {
   [Panel.Presets]: 'rightTop',
 };
 
-export const DEFAULT_PANEL_WIDTH = 350;
+// Lenovo ThinkPad L13 Gen 2 (13.3" <= 1599px CSS width): compact 285px sidebars leave >790px canvas.
+export const DEFAULT_PANEL_WIDTH =
+  typeof window !== 'undefined' && window.innerWidth < 1600 ? 285 : 350;
 export const DEFAULT_PANEL_SECTION_HEIGHT = 450;
 export const DEFAULT_BOTTOM_PANEL_HEIGHT = 144;
 export const DEFAULT_FILMSTRIP_COLUMNS = 2;
@@ -125,7 +217,7 @@ export function reconcileWorkspace(
     leftTopHeight: DEFAULT_PANEL_SECTION_HEIGHT,
     rightTopHeight: DEFAULT_PANEL_SECTION_HEIGHT,
     panelLayout: {
-      leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Export, ...(isTetheringSupported ? [Panel.Tethering] : [])],
+      leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Tones, Panel.Export, ...(isTetheringSupported ? [Panel.Tethering] : [])],
       leftBottom: [],
       rightTop: [Panel.Adjustments, Panel.Crop, Panel.Masks, Panel.Ai, Panel.Presets],
       rightBottom: [],
@@ -352,8 +444,21 @@ export interface UIState {
 
   confirmModalState: ConfirmModalState;
   mergeModalState: MergeModalState;
+  drizzleModalState: DrizzleModalState;
+  negativeModalState: NegativeConversionModalState;
+  denoiseModalState: DenoiseModalState;
   cullingModalState: CullingModalState;
+  batchPolishModalState: BatchPolishModalState;
+  colorMatcherModalState: ColorMatcherModalState;
+  heroCuratorModalState: HeroCuratorModalState;
+  clientDeliveryModalState: ClientDeliveryModalState;
+  bokehModalState: BokehModalState;
+  advancedExportModalState: AdvancedExportModalState;
+  speedCullerModalState: SpeedCullerModalState;
   collageModalState: CollageModalState;
+  nightSkyState: NightSkyState;
+  isLensCorrectionModalOpen: boolean;
+  isTransformModalOpen: boolean;
 
   setUI: (updater: Partial<UIState> | ((state: UIState) => Partial<UIState>)) => void;
   setPanel: (panel: Panel | null) => void;
@@ -389,7 +494,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   compactEditorPanelHeightOverride: null,
 
   panelLayout: {
-    leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Export],
+    leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Tones, Panel.Export],
     leftBottom: [],
     rightTop: [Panel.Adjustments, Panel.Crop, Panel.Masks, Panel.Ai, Panel.Presets],
     rightBottom: [],
@@ -433,6 +538,52 @@ export const useUIStore = create<UIState>((set, get) => ({
 
   confirmModalState: { isOpen: false },
   mergeModalState: CLOSED_MERGE_MODAL_STATE,
+  drizzleModalState: {
+    isOpen: false,
+    isProcessing: false,
+    sourcePaths: [],
+    scaleFactor: 2,
+    pixfrac: 0.8,
+    progressMessage: null,
+    error: null,
+    finalImageBase64: null,
+    originalBase64: null,
+    meta: null,
+  },
+  negativeModalState: { isOpen: false, targetPaths: [] },
+  denoiseModalState: {
+    isOpen: false,
+    isProcessing: false,
+    previewBase64: null,
+    error: null,
+    targetPaths: [],
+    progressMessage: null,
+    isRaw: false,
+  },
+  batchPolishModalState: { isOpen: false, selectedPaths: [] },
+  colorMatcherModalState: { isOpen: false },
+  heroCuratorModalState: { isOpen: false, selectedPaths: [] },
+  clientDeliveryModalState: { isOpen: false, selectedPaths: [] },
+  bokehModalState: { isOpen: false },
+  advancedExportModalState: { isOpen: false, selectedPaths: [] },
+  speedCullerModalState: { isOpen: false, selectedPaths: [], initialIndex: 0 },
+  nightSkyState: {
+    isExpanded: false,
+    targetPaths: [],
+    isProcessing: false,
+    progressMessage: null,
+    freezeGround: true,
+    removeLightPollution: true,
+    sigmaClip: 2.5,
+    error: null,
+    starTrailsMode: false,
+    cometDecay: true,
+    decayRate: 0.08,
+    fillGaps: true,
+    useGpu: true,
+  },
+  isLensCorrectionModalOpen: false,
+  isTransformModalOpen: false,
   cullingModalState: { isOpen: false, suggestions: null, progress: null, error: null, pathsToCull: [] },
   collageModalState: { isOpen: false, sourceImages: [] },
 

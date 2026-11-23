@@ -2,9 +2,9 @@
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "io.github.CyberTimon.RapidRAW",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm.cmd run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm.cmd run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -17,16 +17,16 @@
         "height": 720,
         "minWidth": 800,
         "minHeight": 600,
-        "transparent": true,
+        "transparent": false,
         "decorations": false
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https://asset.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost blob: data: https://img.clerk.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' 'unsafe-inline' https://clerk.getrapidraw.com; worker-src 'self' blob:; frame-src https://www.openstreetmap.org; connect-src 'self' ipc: http://ipc.localhost https://clerk.getrapidraw.com https://www.getrapidraw.com https://api.github.com",
       "capabilities": ["default", "desktop-cloud", "viewer"],
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPCACHE/thumbnails/*"]
+        "scope": ["$APPCACHE/thumbnails/**"]
       }
     },
     "macOSPrivateApi": true

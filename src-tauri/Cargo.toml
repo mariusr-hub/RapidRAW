@@ -1,17 +1,37 @@
 [package]
 name = "RapidRAW"
+version = "1.7.1"
 description = "A blazingly-fast, non-destructive, and GPU-accelerated RAW image editor built with performance in mind."
 authors = ["Timon Käch"]
 edition = "2024"
 rust-version = "1.98"
+autobins = false
 
 [lib]
 name = "rapidraw_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "RapidRAW"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "render_all"
+path = "src/enhanced/bin/render_all.rs"
+test = false
+required-features = ["cli-tools"]
+
+[[bin]]
+name = "find_clusters"
+path = "src/enhanced/bin/find_clusters.rs"
+test = false
+required-features = ["cli-tools"]
+
 [features]
 default = []
 tethering = ["dep:gphoto2"]
+cli-tools = []
 
 [dependencies]
 tauri = { version = "2.12", features = [ "macos-private-api", "rustls-tls", "protocol-asset" ] }
@@ -59,6 +79,10 @@ mimalloc = { version = "0.1.52", features = ["no_thp"] }
 image_hasher = "3.1.1"
 regex = "1.13.1"
 memmap2 = "0.9.11"
+rand = "0.10"
+image-hdr = { version = "0.6.0", default-features = false }
+fast_image_resize = "5.1"
+rapidraw-dsp = { path = "crates/rapidraw-dsp" }
 flate2 = "1.1.9"
 half = { version = "2.7.1", features = ["bytemuck"] }
 glam = "0.33.5"
@@ -95,6 +119,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_UI_ColorSystem",
@@ -175,9 +200,27 @@ incremental = true
 opt-level = 3
 
 [profile.release]
-codegen-units = 1
-lto = true
+codegen-units = 4
+lto = "off"
+opt-level = 2
 strip = true
+
+[profile.release.package.rapidraw-dsp]
+opt-level = 3
+
+[profile.release.package.fast_image_resize]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.rawler]
+opt-level = 3
+
+[profile.test]
+opt-level = 1
+debug = 0
+incremental = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

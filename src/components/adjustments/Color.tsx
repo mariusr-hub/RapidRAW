@@ -979,6 +979,12 @@ function ColorPanel({
           id="colorPresence"
           order={toolOrder.indexOf('colorPresence')}
           title={isMonochrome ? t('adjustments.color.monochrome.blackWhite') : t('adjustments.color.presence')}
+          hasActiveAdjustment={
+            !isMonochrome &&
+            ((adjustments.vibrance || 0) !== 0 ||
+              (adjustments.saturation || 0) !== 0 ||
+              Math.abs(adjustments.foliageEnhancer ?? 0) > 1e-4)
+          }
         >
           {isMonochrome ? (
             <MonochromePanel
@@ -1011,6 +1017,24 @@ function ColorPanel({
                 value={adjustments.saturation || 0}
                 onDragStateChange={onDragStateChange}
               />
+              {!isForMask && (
+                <Slider
+                  resetKey="foliageEnhancer"
+                  label={t('adjustments.color.foliageEnhancer', 'Foliage Enhancer')}
+                  max={1}
+                  min={-1}
+                  defaultValue={0}
+                  onChange={(e: any) =>
+                    setAdjustments((prev: Partial<Adjustments>) => ({
+                      ...prev,
+                      foliageEnhancer: parseFloat(e.target.value),
+                    }))
+                  }
+                  step={0.05}
+                  value={adjustments.foliageEnhancer ?? 0}
+                  onDragStateChange={onDragStateChange}
+                />
+              )}
             </>
           )}
         </AdjustmentSubSection>

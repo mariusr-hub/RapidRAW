@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { motion } from 'framer-motion';
 import clsx from 'clsx';
 import Slider, { SliderChangeEvent } from '../ui/Slider';
+import Button from '../ui/Button';
 import Switch from '../ui/Switch';
 import {
   Adjustments,
@@ -35,6 +36,7 @@ import { ScenePatch } from './depthScope/scene';
 import { selectAiModelDownloadStatus, useProcessStore } from '../../store/useProcessStore';
 import { useSettingsStore } from '../../store/useSettingsStore';
 import { canvasToolState, useEditorStore } from '../../store/useEditorStore';
+import { useUIStore } from '../../store/useUIStore';
 import { useContextMenu } from '../../context/ContextMenuContext';
 import { useEditorActions } from '../../hooks/useEditorActions';
 
@@ -491,18 +493,37 @@ function EffectsPanel({
           />
 
           {!isForMask && (
-            <Slider
-              resetKey="flareAmount"
-              label={t('adjustments.effects.lightFlares')}
-              max={100}
-              min={0}
-              onChange={(e: SliderChangeEvent) =>
-                handleAdjustmentChange(CreativeAdjustment.FlareAmount, e.target.value)
-              }
-              step={1}
-              value={adjustments.flareAmount}
-              onDragStateChange={onDragStateChange}
-            />
+            <>
+              <Slider
+                resetKey="flareAmount"
+                label={t('adjustments.effects.lightFlares')}
+                max={100}
+                min={0}
+                onChange={(e: SliderChangeEvent) =>
+                  handleAdjustmentChange(CreativeAdjustment.FlareAmount, e.target.value)
+                }
+                step={1}
+                value={adjustments.flareAmount}
+                onDragStateChange={onDragStateChange}
+              />
+              <Slider
+                resetKey="ortonSpread"
+                label={t('adjustments.effects.ortonSpread', 'Orton Dream Glow')}
+                max={1}
+                min={0}
+                defaultValue={0}
+                onChange={(e: SliderChangeEvent) =>
+                  setAdjustments((prev: Partial<Adjustments>) => ({
+                    ...prev,
+                    ortonSpread: parseFloat(String(e.target.value)),
+                  }))
+                }
+                step={0.01}
+                value={adjustments.ortonSpread ?? 0}
+                onDragStateChange={onDragStateChange}
+                fillOrigin="min"
+              />
+            </>
           )}
         </AdjustmentSubSection>
       )}
@@ -736,6 +757,14 @@ function EffectsPanel({
                       />
                     </>
                   )}
+                  <Button
+                    variant="secondary"
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs py-1.5"
+                    onClick={() => useUIStore.getState().setUI({ bokehModalState: { isOpen: true } })}
+                  >
+                    <Aperture size={14} className="text-amber-400" />
+                    {t('adjustments.effects.openBokehStudio', 'Open Creative Optics & Bokeh Studio...')}
+                  </Button>
                 </SpatialEffect>
                 <SpatialEffect
                   enabled={!!adjustments.relightEnabled}
@@ -1154,6 +1183,14 @@ function EffectsPanel({
                       />
                     </>
                   )}
+                  <Button
+                    variant="secondary"
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs py-1.5"
+                    onClick={() => useUIStore.getState().setUI({ bokehModalState: { isOpen: true } })}
+                  >
+                    <Aperture size={14} className="text-amber-400" />
+                    {t('adjustments.effects.openBokehStudio', 'Open Creative Optics & Bokeh Studio...')}
+                  </Button>
                 </SpatialEffect>
               </div>
             </AdjustmentSubSection>

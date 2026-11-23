@@ -1,13 +1,36 @@
-import React, { useCallback, useMemo } from 'react';
-import { RotateCcw, Copy, ClipboardPaste, PencilSparkles, ChartArea, LayoutList } from 'lucide-react';
+import React, { useCallback, useMemo, useState } from 'react';
+import {
+  RotateCcw,
+  Copy,
+  ClipboardPaste,
+  PencilSparkles,
+  ChartArea,
+  LayoutList,
+  ChevronDown,
+  Sparkles,
+  Layers,
+  Moon,
+  DollarSign,
+  Wand2,
+  Palette,
+  Trophy,
+  Package,
+  Download,
+  Zap,
+  Telescope,
+  Camera,
+  Film,
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import AdjustmentSection from '../../adjustments/AdjustmentSection';
 import ConnectedWaveform from '../editor/ConnectedWaveform';
 import Resizer from '../../ui/Resizer';
 import AdjustmentSectionsSubMenu from './AdjustmentSectionsSubMenu';
+import NightSkyDropzone from '../../../enhanced/panels/NightSkyDropzone';
+import FocusStackDropzone from '../../../enhanced/panels/FocusStackDropzone';
+import StockPrepDropzone from '../../../enhanced/panels/StockPrepDropzone';
 import {
   ActiveTools,
   Adjustments,
@@ -19,12 +42,14 @@ import {
   toggleToolActive,
 } from '../../../utils/adjustments';
 import { useContextMenu } from '../../../context/ContextMenuContext';
-import { OPTION_SEPARATOR, Orientation } from '../../../types/ui';
+import { OPTION_SEPARATOR, Orientation, Panel } from '../../../types/ui';
 import Text from '../../ui/Text';
 import { TextVariants, TextColors, TextWeights } from '../../../types/typography';
 import { useShallow } from 'zustand/react/shallow';
 import { canvasToolState, useEditorStore } from '../../../store/useEditorStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
+import { useLibraryStore } from '../../../store/useLibraryStore';
+import clsx from 'clsx';
 import { getOpenImageDefaults } from '../../../utils/developDefaults';
 import { useUIStore } from '../../../store/useUIStore';
 import { buildAutoAdjustModeOptions, useEditorActions } from '../../../hooks/useEditorActions';
@@ -326,7 +351,7 @@ export default function Controls() {
             );
           })
         ) : (
-          <div className="flex items-center justify-center h-full">
+          <div className="flex items-center justify-center py-8">
             <Text
               variant={TextVariants.heading}
               color={TextColors.secondary}
@@ -337,7 +362,185 @@ export default function Controls() {
             </Text>
           </div>
         )}
+
+        <EnhancedStudioDrawer selectedImage={selectedImage} setUI={setUI} />
       </div>
+    </div>
+  );
+}
+
+function EnhancedStudioDrawer({
+  selectedImage,
+  setUI,
+}: {
+  selectedImage: { path: string; isRaw?: boolean } | null;
+  setUI: ReturnType<typeof useUIStore.getState>['setUI'];
+}) {
+  const [isOpen, setIsOpen] = useState(true);
+  const [activeTab, setActiveTab] = useState<'nightSky' | 'focusStack' | 'stockPrep'>('nightSky');
+  const multiSelectedPaths = useLibraryStore((s) => s.multiSelectedPaths);
+  const studioPaths = useMemo(
+    () => (multiSelectedPaths.length > 0 ? multiSelectedPaths : selectedImage ? [selectedImage.path] : []),
+    [multiSelectedPaths, selectedImage],
+  );
+
+  return (
+    <div className="shrink-0 mt-2 rounded-lg border border-border-color/60 bg-bg-secondary/40 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setIsOpen((prev) => !prev)}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-text-primary hover:bg-card-active/40 transition-colors cursor-pointer"
+      >
+        <span className="flex items-center gap-1.5">
+          <Sparkles size={14} className="text-accent" />
+          <span>Enhanced Studio & Dropzones</span>
+        </span>
+        <ChevronDown
+          size={14}
+          className={clsx('text-text-secondary transition-transform duration-200', isOpen && 'rotate-180')}
+        />
+      </button>
+
+      {isOpen && (
+        <div className="p-2.5 space-y-3 border-t border-border-color/40">
+          <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+            <button
+              type="button"
+              onClick={() => setUI({ batchPolishModalState: { isOpen: true, selectedPaths: studioPaths } })}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Wand2 size={12} className="text-accent shrink-0" />
+              <span className="truncate">AI Batch Polish</span>
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setUI({
+                  colorMatcherModalState: {
+                    isOpen: true,
+                    heroPath: selectedImage?.path ?? studioPaths[0] ?? null,
+                    targetPaths: studioPaths,
+                    initialMode: 'matcher',
+                  },
+                })
+              }
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Palette size={12} className="text-purple-400 shrink-0" />
+              <span className="truncate">Color Matcher</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setUI({ heroCuratorModalState: { isOpen: true, selectedPaths: studioPaths } })}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Trophy size={12} className="text-amber-400 shrink-0" />
+              <span className="truncate">Hero Curator</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setUI({ speedCullerModalState: { isOpen: true, selectedPaths: studioPaths, initialIndex: 0 } })}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Zap size={12} className="text-yellow-400 shrink-0" />
+              <span className="truncate">Speed Culler</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setUI({ clientDeliveryModalState: { isOpen: true, selectedPaths: studioPaths } })}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Package size={12} className="text-emerald-400 shrink-0" />
+              <span className="truncate">Client Delivery</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setUI({ advancedExportModalState: { isOpen: true, selectedPaths: studioPaths } })}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Download size={12} className="text-sky-400 shrink-0" />
+              <span className="truncate">Multi-Export</span>
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setUI((s) => ({
+                  drizzleModalState: { ...s.drizzleModalState, isOpen: true, sourcePaths: studioPaths },
+                }))
+              }
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Telescope size={12} className="text-indigo-400 shrink-0" />
+              <span className="truncate">Astro Drizzle</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const ui = useUIStore.getState();
+                const hasTethering = Object.values(ui.panelLayout).some((panels) => panels.includes(Panel.Tethering));
+                if (hasTethering) {
+                  ui.setPanel(Panel.Tethering);
+                } else {
+                  ui.movePanelToIndex(Panel.Tethering, 'leftTop', ui.panelLayout.leftTop.length);
+                  ui.setActivePanel('leftTop', Panel.Tethering);
+                }
+              }}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
+            >
+              <Camera size={12} className="text-rose-400 shrink-0" />
+              <span className="truncate">Tether Studio</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setUI({ negativeModalState: { isOpen: true, targetPaths: studioPaths } })}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer col-span-2"
+            >
+              <Film size={12} className="text-orange-400 shrink-0" />
+              <span className="truncate">Film Negative Converter</span>
+            </button>
+          </div>
+
+          <div className="flex rounded-md bg-surface/60 p-0.5 text-[11px] gap-0.5">
+            <button
+              type="button"
+              onClick={() => setActiveTab('nightSky')}
+              className={clsx(
+                'flex-1 flex items-center justify-center gap-1 py-1 rounded transition-colors cursor-pointer',
+                activeTab === 'nightSky' ? 'bg-accent text-button-text font-medium' : 'text-text-secondary hover:text-text-primary',
+              )}
+            >
+              <Moon size={11} />
+              <span>Astro</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('focusStack')}
+              className={clsx(
+                'flex-1 flex items-center justify-center gap-1 py-1 rounded transition-colors cursor-pointer',
+                activeTab === 'focusStack' ? 'bg-accent text-button-text font-medium' : 'text-text-secondary hover:text-text-primary',
+              )}
+            >
+              <Layers size={11} />
+              <span>Focus</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('stockPrep')}
+              className={clsx(
+                'flex-1 flex items-center justify-center gap-1 py-1 rounded transition-colors cursor-pointer',
+                activeTab === 'stockPrep' ? 'bg-accent text-button-text font-medium' : 'text-text-secondary hover:text-text-primary',
+              )}
+            >
+              <DollarSign size={11} />
+              <span>Stock</span>
+            </button>
+          </div>
+
+          {activeTab === 'nightSky' && <NightSkyDropzone />}
+          {activeTab === 'focusStack' && <FocusStackDropzone />}
+          {activeTab === 'stockPrep' && <StockPrepDropzone />}
+        </div>
+      )}
     </div>
   );
 }

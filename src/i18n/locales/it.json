@@ -10,7 +10,9 @@
         "agx": "AgX",
         "agxDesc": "Tonemapping stile pellicola",
         "basic": "Base",
-        "basicDesc": "Tonemapping Standard"
+        "basicDesc": "Tonemapping Standard",
+        "legacy": "Legacy",
+        "legacyDesc": "Classic v1.x Tonemapping"
       },
       "reset": "Ripristina",
       "shadows": "Ombre",
@@ -173,7 +175,8 @@
       "sharpness": "Nitidezza",
       "structure": "Struttura",
       "superResolution": "RapidRes",
-      "threshold": "Soglia"
+      "threshold": "Soglia",
+      "contrastCleaner": "Halo Contrast Cleaner"
     },
     "effects": {
       "amount": "Quantità",
@@ -244,6 +247,18 @@
       "size": "Dimensione",
       "spatial": "Spaziale",
       "vignette": "Vignettatura"
+    },
+    "lights": {
+      "brightness": "Highlights Brightness",
+      "contrast": "Highlights Contrast",
+      "desc": "Dedicated highlight recovery & micro-texture",
+      "details": "Highlights Structure",
+      "reset": "Reset Highlights Pipeline",
+      "saturation": "Highlights Saturation",
+      "temperature": "Highlights Warmth",
+      "tint": "Highlights Tint",
+      "title": "Shadow & Highlight Recovery",
+      "vibrance": "Highlights Vibrance"
     }
   },
   "contextMenus": {
@@ -1783,7 +1798,8 @@
       "title": "Correzione Obiettivo",
       "vignetting": "Vignettatura",
       "zoomInTooltip": "Ingrandisci",
-      "zoomOutTooltip": "Riduci"
+      "zoomOutTooltip": "Riduci",
+      "waitingAutoDetect": "Waiting for auto detection..."
     },
     "merge": {
       "autoCrop": "Ritaglio automatico",
@@ -1826,7 +1842,16 @@
       "projectionPerspective": "Prospettica",
       "projectionSpherical": "Sferica",
       "savedSuccess": "Panorama Salvato con Successo!",
-      "title": "Unisci Panorama"
+      "title": "Unisci Panorama",
+      "autoCrop": "Ritaglio automatico",
+      "excludedImages": "{{count}} immagini non sono state abbinate e sono state escluse",
+      "excludedImages_many": "{{count}} di immagini non sono state abbinate e sono state escluse",
+      "excludedImages_one": "{{count}} immagine non è stata abbinata ed è stata esclusa",
+      "excludedImages_other": "{{count}} immagini non sono state abbinate e sono state escluse",
+      "outputInfo": "{{images}} immagini · {{width}} × {{height}} px",
+      "saving": "Salvataggio…",
+      "projectionPanini": "Panini",
+      "projectionStereographic": "Stereographic"
     },
     "renameAlbum": {
       "placeholder": "Inserisci nuovo nome album..."
@@ -1879,6 +1904,49 @@
       "yAxis": "Asse Y",
       "zoomInTooltip": "Ingrandisci",
       "zoomOutTooltip": "Riduci"
+    },
+    "denoise": {
+      "batchProgressText": "Denoising {{current}} of {{total}}...",
+      "btnBatchDenoise": "Batch Denoise",
+      "btnRetry": "Retry",
+      "btnSave": "Save",
+      "btnStart": "Start Denoise",
+      "cancel": "Cancel",
+      "close": "Close",
+      "descBatch": "Batch denoise selected images",
+      "downloadingText": "Downloading AI Model ({{status}})...",
+      "initializing": "Initializing...",
+      "methodAi": "AI Denoise",
+      "methodBm3d": "Classic (BM3D)",
+      "methodLabel": "Method",
+      "methodRaw9": "Apple RAW 9",
+      "openInEditor": "Open in Editor",
+      "processingFailed": "Denoise Failed",
+      "saveSuccess": "Saved successfully",
+      "titleBatch": "Batch RAW Denoise",
+      "waitText": "This may take a moment depending on resolution..."
+    },
+    "negativeConversion": {
+      "blueWeight": "Blue Weight",
+      "cancel": "Cancel",
+      "colorTiming": "Color Timing",
+      "compareTooltip": "Hold to Compare",
+      "contrast": "Contrast",
+      "convertAndSave": "Convert & Save",
+      "convertAndSaveAll": "Convert & Save All ({{count}})",
+      "converting": "Converting...",
+      "convertingProgress": "Converting {{current}} / {{total}}...",
+      "exposure": "Exposure",
+      "greenWeight": "Green Weight",
+      "noticeText": "Inversion logic inspired by <1>NegPy</1> created by marcinz606 (<3>GPL-3.0</3>).",
+      "originalLabel": "Original",
+      "printGrade": "Print Grade",
+      "redWeight": "Red Weight",
+      "resetTooltip": "Reset Parameters",
+      "resetViewTooltip": "Reset View",
+      "title": "Film Negative Conversion",
+      "zoomInTooltip": "Zoom In",
+      "zoomOutTooltip": "Zoom Out"
     }
   },
   "settings": {
@@ -2395,7 +2463,8 @@
       "wgpuDescRecommended": "Bypassa la codifica del browser per anteprime dal vivo immediatamente reattive. Altamente raccomandato per le prestazioni.",
       "wgpuLabel": "Abilita Rendering WGPU Diretto",
       "workerThreads": "Thread di Lavoro Miniature",
-      "workerThreadsDesc": "Numero di thread paralleli utilizzati per generare le miniature. Valori più alti velocizzano il caricamento della libreria ma usano più CPU e RAM."
+      "workerThreadsDesc": "Numero di thread paralleli utilizzati per generare le miniature. Valori più alti velocizzano il caricamento della libreria ma usano più CPU e RAM.",
+      "wgpuDescWindows": "Intel Iris Xe GPU compute stays active via flicker-free WebView2 compositing (direct swapchain transparency disabled on Windows)."
     },
     "tagging": {
       "addCustomPlaceholder": "Aggiungi tag AI personalizzati (separati da virgola)...",

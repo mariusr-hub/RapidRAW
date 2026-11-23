@@ -288,6 +288,22 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
     [setTethering],
   );
 
+  const [isTetheringSupported, setIsTetheringSupported] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    invoke<boolean>(Invokes.IsTetheringSupported)
+      .then((supported) => {
+        if (active) setIsTetheringSupported(supported);
+      })
+      .catch(() => {
+        if (active) setIsTetheringSupported(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   useEffect(() => {
     if (cameras.length > 0 && !selectedCamera) {
       setSelectedCamera(cameras[0]);
@@ -428,7 +444,7 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
   };
 
   useEffect(() => {
-    if (isConnected || cameras.length > 0) return;
+    if (isTetheringSupported !== true || isConnected || cameras.length > 0) return;
 
     detectCameras(true);
 
@@ -440,7 +456,7 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [isConnected, cameras.length, detectCameras]);
+  }, [isTetheringSupported, isConnected, cameras.length, detectCameras]);
 
   useEffect(() => {
     if (!isConnected) return;
@@ -640,6 +656,12 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
                 </button>
               )}
             </div>
+
+            {isTetheringSupported === false && (
+              <Text variant={TextVariants.small} color={TextColors.secondary}>
+                USB camera tethering (libgphoto2) is currently available on macOS and Linux builds.
+              </Text>
+            )}
 
             {isConnected && (
               <div className="flex flex-col gap-1.5 relative z-10">

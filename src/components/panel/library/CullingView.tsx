@@ -15,8 +15,10 @@ import {
   Plus,
   SlidersHorizontal,
   Info,
+  Focus,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-toastify';
 import clsx from 'clsx';
 import { Invokes } from '../../../types/invokes';
 import { ImageFile, ImageFlag } from '../../../types/library';
@@ -97,6 +99,9 @@ function CullingPreview({
   const panRef = useRef(pan);
   const [tagInputValue, setTagInputValue] = useState('');
   const [fitScale, setFitScale] = useState<number | null>(null);
+  const [focusPeakingEnabled, setFocusPeakingEnabled] = useState(false);
+  const [focusPeakingUrl, setFocusPeakingUrl] = useState<string | null>(null);
+  const [isLoadingPeaking, setIsLoadingPeaking] = useState(false);
   const { handleRate, handleToggleFlag, handleSetColorLabel, handleTagsChanged } = useLibraryActions();
   const USER_TAG_PREFIX = 'user:';
   const getPathsToUpdate = () =>
@@ -170,6 +175,52 @@ function CullingPreview({
 
   const imageWidth = (image as any).width || imageExif?.ExifImageWidth || imageExif?.PixelXDimension;
   const imageHeight = (image as any).height || imageExif?.ExifImageHeight || imageExif?.PixelYDimension;
+
+  useEffect(() => {
+    setFocusPeakingUrl(null);
+  }, [image.path]);
+
+  useEffect(() => {
+    if (!focusPeakingEnabled || focusPeakingUrl) return;
+    let active = true;
+    setIsLoadingPeaking(true);
+    invoke<{ peaking_mask_data_url: string }>(Invokes.ExtractGreenCfaFocusPeaking, {
+      path: image.path,
+      threshold: 24.0,
+    })
+      .then((res) => {
+        if (active && res?.peaking_mask_data_url) {
+          setFocusPeakingUrl(res.peaking_mask_data_url);
+        }
+      })
+      .catch((err) => {
+        if (active) {
+          toast.error(`Focus peaking failed: ${String(err)}`);
+          setFocusPeakingEnabled(false);
+        }
+      })
+      .finally(() => {
+        if (active) setIsLoadingPeaking(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [focusPeakingEnabled, focusPeakingUrl, image.path]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+      if ((e.key === 'p' || e.key === 'P') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (hoveredPath ? hoveredPath === image.path : isActive) {
+          e.preventDefault();
+          setFocusPeakingEnabled((prev) => !prev);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [hoveredPath, image.path, isActive]);
 
   const handleAddTag = async (tagToAdd: string) => {
     const newTagValue = tagToAdd.trim().toLowerCase();
@@ -536,6 +587,15 @@ function CullingPreview({
               draggable={false}
             />
           )}
+
+          {focusPeakingEnabled && focusPeakingUrl && (
+            <img
+              src={focusPeakingUrl}
+              className="absolute inset-0 w-full h-full object-contain pointer-events-none mix-blend-screen"
+              alt="Green CFA Focus Peaking"
+              draggable={false}
+            />
+          )}
         </div>
       </div>
 
@@ -891,6 +951,21 @@ function CullingPreview({
             data-tooltip={t('library.culling.rateAndLabel')}
           >
             <Tag size={14} />
+          </button>
+
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setFocusPeakingEnabled((prev) => !prev);
+            }}
+            className={clsx(
+              'p-1.5 rounded-full transition-colors shrink-0 flex items-center gap-0.5 text-[10px] font-mono',
+              focusPeakingEnabled ? 'bg-emerald-500 text-black font-bold' : 'text-white/60 hover:bg-white/10 hover:text-white',
+            )}
+            data-tooltip={t('library.culling.focusPeaking', 'Green-CFA Focus Peaking [P]')}
+          >
+            {isLoadingPeaking ? <Loader2 size={13} className="animate-spin" /> : <Focus size={13} />}
+            <span>P</span>
           </button>
 
           <div className="w-px h-5 bg-white/20 mx-1 shrink-0"></div>

@@ -672,6 +672,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub linux_wgpu_renderer_migrated_v1: Option<bool>,
     #[serde(default)]
+    pub windows_wgpu_renderer_migrated_v1: Option<bool>,
+    #[serde(default)]
+    pub curated_presets_seeded_v1: Option<bool>,
+    #[serde(default)]
     pub ai_cache_limits_migrated_v1: Option<bool>,
     #[serde(default)]
     pub library_view_mode: Option<String>,
@@ -805,6 +809,8 @@ pub struct AppSettings {
     pub develop_defaults: crate::adjustments::develop_defaults::DevelopDefaultsSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slider_reset_target: Option<String>,
+    #[serde(default)]
+    pub auto_analyze_on_open: Option<bool>,
 }
 
 const UI_SCALE_MIN: f64 = 0.5;
@@ -846,7 +852,10 @@ impl AppSettings {
             && wgpu_renderer_available()
             && self
                 .use_wgpu_renderer
-                .unwrap_or(cfg!(not(target_os = "linux")))
+                .unwrap_or(cfg!(not(any(
+                    target_os = "linux",
+                    target_os = "windows"
+                ))))
     }
 }
 
@@ -860,7 +869,13 @@ pub fn wgpu_renderer_supported() -> bool {
     *SUPPORTED.get_or_init(crate::platform::linux_graphics::is_wayland_session)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn wgpu_renderer_supported() -> bool {
+    // Tied to tauri.conf.json window "transparent": false on Windows to avoid DWM flicker/white canvas
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn wgpu_renderer_supported() -> bool {
     true
 }
@@ -909,6 +924,8 @@ impl Default for AppSettings {
             linux_gpu_optimization: Some(false),
             linux_gpu_optimization_migrated_v1: Some(true),
             linux_wgpu_renderer_migrated_v1: Some(true),
+            windows_wgpu_renderer_migrated_v1: Some(true),
+            curated_presets_seeded_v1: Some(false),
             ai_cache_limits_migrated_v1: Some(true),
             library_view_mode: Some("flat".to_string()),
             export_presets: default_export_presets(),
@@ -925,9 +942,9 @@ impl Default for AppSettings {
             is_waveform_visible: Some(false),
             waveform_height: Some(220),
             active_waveform_channel: Some("luma".to_string()),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
             use_wgpu_renderer: Some(false),
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
             use_wgpu_renderer: Some(true),
             editor_neutral_grey_bg: Some(false),
             canvas_input_mode: Some("mouse".to_string()),
@@ -988,15 +1005,22 @@ impl Default for AppSettings {
             immich: crate::integrations::immich::ImmichSettings::default(),
             develop_defaults: Default::default(),
             slider_reset_target: None,
+            auto_analyze_on_open: Some(false),
         }
     }
 }
 
+pub fn resolved_app_data_dir<R: tauri::Runtime>(app_handle: &AppHandle<R>) -> Result<PathBuf, String> {
+    if let Some(override_dir) = std::env::var_os("RAPIDRAW_APP_DATA_DIR")
+        && !override_dir.is_empty()
+    {
+        return Ok(PathBuf::from(override_dir));
+    }
+    app_handle.path().app_data_dir().map_err(|e| e.to_string())
+}
+
 pub fn get_settings_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    let settings_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
+    let settings_dir = resolved_app_data_dir(app_handle)?;
 
     if !settings_dir.exists() {
         fs::create_dir_all(&settings_dir).map_err(|e| e.to_string())?;
@@ -1134,6 +1158,13 @@ fn read_settings_from_disk(app_handle: &AppHandle) -> Result<AppSettings, String
     if !settings.linux_wgpu_renderer_migrated_v1.unwrap_or(false) {
         settings.use_wgpu_renderer = Some(false);
         settings.linux_wgpu_renderer_migrated_v1 = Some(true);
+        settings_modified = true;
+    }
+
+    #[cfg(target_os = "windows")]
+    if !settings.windows_wgpu_renderer_migrated_v1.unwrap_or(false) {
+        settings.use_wgpu_renderer = Some(false);
+        settings.windows_wgpu_renderer_migrated_v1 = Some(true);
         settings_modified = true;
     }
 

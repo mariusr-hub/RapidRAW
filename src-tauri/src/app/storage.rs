@@ -224,7 +224,7 @@ fn storage_dirs(app_handle: &AppHandle) -> Result<StorageDirs, String> {
     let path = app_handle.path();
     Ok(StorageDirs {
         cache: path.app_cache_dir().map_err(|e| e.to_string())?,
-        data: path.app_data_dir().map_err(|e| e.to_string())?,
+        data: crate::app::settings::resolved_app_data_dir(app_handle)?,
         logs: path.app_log_dir().map_err(|e| e.to_string())?,
     })
 }
@@ -277,6 +277,13 @@ pub async fn clear_immich_cache(app_handle: AppHandle) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn release_ai_sessions(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.ai_init_lock.lock().await;
+    crate::ai::models::reset_ai_sessions(&state.ai_state);
+    Ok(())
 }
 
 #[tauri::command]

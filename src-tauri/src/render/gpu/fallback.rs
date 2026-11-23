@@ -31,7 +31,12 @@ pub fn gpu_identity(adapter: &str) -> String {
 }
 
 fn data_file(name: &str) -> Option<PathBuf> {
-    Some(app_handle()?.path().app_data_dir().ok()?.join(name))
+    let handle = app_handle()?;
+    Some(
+        crate::app::settings::resolved_app_data_dir(&handle)
+            .ok()?
+            .join(name),
+    )
 }
 
 pub fn load_record<T: DeserializeOwned>(name: &str) -> Option<T> {

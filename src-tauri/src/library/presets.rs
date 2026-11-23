@@ -1,5 +1,6 @@
 use crate::app::settings::load_settings;
 use crate::app::state::AppState;
+pub use crate::enhanced::default_presets::get_default_curated_presets;
 use crate::decode::formats::is_raw_file;
 use crate::library::file_ops::write_file_atomic;
 use crate::library::preset_converter;
@@ -478,11 +479,7 @@ pub struct PresetImportResult {
 }
 
 fn get_presets_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let presets_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("presets");
+    let presets_dir = crate::app::settings::resolved_app_data_dir(app_handle)?.join("presets");
 
     if !presets_dir.exists() {
         fs::create_dir_all(&presets_dir).map_err(|e| e.to_string())?;
@@ -491,14 +488,187 @@ fn get_presets_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String
     Ok(presets_dir.join("presets.json"))
 }
 
+fn is_deprecated_preset_json(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    if ["grain", "sharpening", "luminanceDenoise", "colorDenoise"]
+        .iter()
+        .any(|k| obj.contains_key(*k))
+    {
+        return true;
+    }
+    if let Some(cg) = obj.get("colorGrading").and_then(|v| v.as_object()) {
+        for (_zone, zone_val) in cg {
+            if let Some(z_obj) = zone_val.as_object()
+                && (z_obj.contains_key("sat") || z_obj.contains_key("lum"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Non-destructively merges curated film & reference presets into an existing preset list:
+/// - All user custom presets and custom folders remain intact.
+/// - Deprecated adjustment keys inside matching curated presets are upgraded to canonical keys.
+/// - Migrates legacy `folder-sns-hdr` name to "HDRish styles".
+/// - Missing curated folders or curated child presets are appended cleanly.
+pub fn merge_curated_presets(
+    existing: Vec<PresetItem>,
+    curated: Vec<PresetItem>,
+) -> (Vec<PresetItem>, bool) {
+    use std::collections::HashMap;
+
+    let mut curated_by_id: HashMap<String, Preset> = HashMap::new();
+    for item in &curated {
+        match item {
+            PresetItem::Preset(p) => {
+                curated_by_id.insert(p.id.clone(), p.clone());
+            }
+            PresetItem::Folder(f) => {
+                for p in &f.children {
+                    curated_by_id.insert(p.id.clone(), p.clone());
+                }
+            }
+        }
+    }
+
+    let mut modified = false;
+    let mut merged = existing;
+
+    for item in &mut merged {
+        match item {
+            PresetItem::Preset(p) => {
+                if let Some(fresh) = curated_by_id.get(&p.id)
+                    && is_deprecated_preset_json(&p.adjustments)
+                {
+                    p.adjustments = fresh.adjustments.clone();
+                    modified = true;
+                }
+            }
+            PresetItem::Folder(f) => {
+                if f.id == "folder-sns-hdr" && f.name.contains("SNS-HDR") {
+                    f.name = "HDRish styles".to_string();
+                    modified = true;
+                }
+                for p in &mut f.children {
+                    if let Some(fresh) = curated_by_id.get(&p.id) {
+                        if is_deprecated_preset_json(&p.adjustments) {
+                            p.adjustments = fresh.adjustments.clone();
+                            modified = true;
+                        }
+                        if p.name.starts_with("SNS ") {
+                            p.name = fresh.name.clone();
+                            modified = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut existing_preset_ids: HashSet<String> = HashSet::new();
+    let mut existing_folder_ids: HashMap<String, usize> = HashMap::new();
+    for (idx, item) in merged.iter().enumerate() {
+        match item {
+            PresetItem::Preset(p) => {
+                existing_preset_ids.insert(p.id.clone());
+            }
+            PresetItem::Folder(f) => {
+                existing_folder_ids.insert(f.id.clone(), idx);
+                for p in &f.children {
+                    existing_preset_ids.insert(p.id.clone());
+                }
+            }
+        }
+    }
+
+    for cur_item in curated {
+        match cur_item {
+            PresetItem::Preset(p) => {
+                if !existing_preset_ids.contains(&p.id) {
+                    existing_preset_ids.insert(p.id.clone());
+                    merged.push(PresetItem::Preset(p));
+                    modified = true;
+                }
+            }
+            PresetItem::Folder(cur_folder) => {
+                if let Some(&idx) = existing_folder_ids.get(&cur_folder.id) {
+                    if let Some(PresetItem::Folder(target_folder)) = merged.get_mut(idx) {
+                        for child in cur_folder.children {
+                            if !existing_preset_ids.contains(&child.id) {
+                                existing_preset_ids.insert(child.id.clone());
+                                target_folder.children.push(child);
+                                modified = true;
+                            }
+                        }
+                    }
+                } else {
+                    let missing_children: Vec<Preset> = cur_folder
+                        .children
+                        .into_iter()
+                        .filter(|p| existing_preset_ids.insert(p.id.clone()))
+                        .collect();
+                    if !missing_children.is_empty() {
+                        merged.push(PresetItem::Folder(PresetFolder {
+                            id: cur_folder.id,
+                            name: cur_folder.name,
+                            children: missing_children,
+                        }));
+                        modified = true;
+                    }
+                }
+            }
+        }
+    }
+
+    (merged, modified)
+}
+
 #[tauri::command]
 pub fn load_presets(app_handle: AppHandle) -> Result<Vec<PresetItem>, String> {
     let path = get_presets_path(&app_handle)?;
-    if !path.exists() {
-        return Ok(Vec::new());
+    let mut settings = load_settings(app_handle.clone()).unwrap_or_default();
+
+    let result = if !path.exists() {
+        get_default_curated_presets()
+    } else {
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let parsed: Vec<PresetItem> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        let needs_hdrish_rename = parsed.iter().any(|item| match item {
+            PresetItem::Folder(f) => {
+                f.id == "folder-sns-hdr"
+                    && (f.name.contains("SNS-HDR")
+                        || f.children.iter().any(|c| c.name.starts_with("SNS ")))
+            }
+            _ => false,
+        });
+        if parsed.is_empty() {
+            get_default_curated_presets()
+        } else if !settings.curated_presets_seeded_v1.unwrap_or(false) || needs_hdrish_rename {
+            let (merged, modified) = merge_curated_presets(parsed, get_default_curated_presets());
+            if modified && let Ok(json_string) = serde_json::to_string_pretty(&merged) {
+                let _ = write_file_atomic(&path, json_string.as_bytes());
+            }
+            merged
+        } else {
+            parsed
+        }
+    };
+
+    if !settings.curated_presets_seeded_v1.unwrap_or(false) {
+        if !path.exists()
+            && let Ok(json_string) = serde_json::to_string_pretty(&result)
+        {
+            let _ = write_file_atomic(&path, json_string.as_bytes());
+        }
+        settings.curated_presets_seeded_v1 = Some(true);
+        let _ = crate::app::settings::save_settings(settings, app_handle);
     }
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| e.to_string())
+
+    Ok(result)
 }
 
 #[tauri::command]

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
 import { open } from '@tauri-apps/plugin-shell';
 import {
@@ -159,9 +159,39 @@ function ThumbnailProgressCount() {
 export default function MainLibrary(props: MainLibraryProps) {
   const { t } = useTranslation();
   const setUI = useUIStore((state) => state.setUI);
-  const [appVersion, setAppVersion] = useState('');
+  const [appVersion, setAppVersion] = useState('1.7.1.1');
   const [isUpdateAvailable, setIsUpdateAvailable] = useState(false);
   const [latestVersion, setLatestVersion] = useState('');
+  const [splashSplit, setSplashSplit] = useState(50);
+  const [isDraggingSplashSplit, setIsDraggingSplashSplit] = useState(false);
+  const splashSplitContainerRef = useRef<HTMLDivElement>(null);
+  const splashSplitRafRef = useRef<number | null>(null);
+  const splashPendingSplitRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (splashSplitRafRef.current !== null) {
+        cancelAnimationFrame(splashSplitRafRef.current);
+      }
+    };
+  }, []);
+
+  const updateSplashSplitFromClientX = useCallback((clientX: number) => {
+    const container = splashSplitContainerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const pct = Math.max(8, Math.min(92, ((clientX - rect.left) / rect.width) * 100));
+    splashPendingSplitRef.current = pct;
+    if (splashSplitRafRef.current === null) {
+      splashSplitRafRef.current = requestAnimationFrame(() => {
+        splashSplitRafRef.current = null;
+        if (splashPendingSplitRef.current !== null) {
+          setSplashSplit(splashPendingSplitRef.current);
+        }
+      });
+    }
+  }, []);
   const [isBusyDelayed, setIsBusyDelayed] = useState(false);
   const [isBusyLoaderMounted, setIsBusyLoaderMounted] = useState(false);
   const [isProgressHovered, setIsProgressHovered] = useState(false);
@@ -329,31 +359,53 @@ export default function MainLibrary(props: MainLibraryProps) {
     return (
       <div className="flex-1 flex h-full p-2 bg-transparent">
         <div className="flex w-full h-full bg-bg-secondary rounded-lg border border-border-color/25 overflow-hidden">
-          <div className="w-1/2 hidden md:block relative overflow-hidden bg-black">
-            <AnimatePresence>
-              <motion.img
-                alt="Splash screen background"
-                className="absolute inset-0 w-full h-full object-cover"
-                key={splashImage}
-                src={splashImage}
-              />
-            </AnimatePresence>
+          <div
+            ref={splashSplitContainerRef}
+            className="w-1/2 hidden md:block relative overflow-hidden bg-black select-none touch-none cursor-ew-resize"
+            onPointerDown={(e) => {
+              setIsDraggingSplashSplit(true);
+              (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+              updateSplashSplitFromClientX(e.clientX);
+            }}
+            onPointerMove={(e) => {
+              if (!isDraggingSplashSplit) return;
+              updateSplashSplitFromClientX(e.clientX);
+            }}
+            onPointerUp={() => setIsDraggingSplashSplit(false)}
+            onPointerCancel={() => setIsDraggingSplashSplit(false)}
+          >
+            <img
+              alt="Before RAW"
+              className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+              src="/splash-before.jpg"
+            />
+            <img
+              alt="After Auto-Enhanced"
+              className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+              style={{ clipPath: `inset(0 0 0 ${splashSplit}%)` }}
+              src="/splash-enhanced.jpg"
+            />
+            <div
+              className="absolute top-0 bottom-0 w-0.5 bg-white/90 shadow-[0_0_8px_rgba(0,0,0,0.85)] pointer-events-none"
+              style={{ left: `${splashSplit}%`, transform: 'translateX(-50%)' }}
+            >
+              <div className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-7 h-7 rounded-full bg-black/80 border border-white/50 flex items-center justify-center text-[10px] font-mono text-white shadow-lg">
+                ⇆
+              </div>
+            </div>
+            <div className="absolute bottom-3 left-3 px-2 py-0.5 rounded bg-black/70 border border-white/20 text-[10px] font-mono text-white/90 pointer-events-none">
+              BEFORE · RAW
+            </div>
+            <div className="absolute bottom-3 right-3 px-2 py-0.5 rounded bg-accent/90 border border-accent text-[10px] font-mono font-semibold text-button-text pointer-events-none">
+              AFTER · AUTO-ENHANCED
+            </div>
           </div>
 
           <div className="w-full md:w-1/2 relative overflow-hidden isolate rounded-lg md:rounded-l-none md:rounded-r-lg">
-            <div className="absolute inset-0 -z-10 pointer-events-none overflow-hidden rounded-lg md:rounded-l-none md:rounded-r-lg">
-              <AnimatePresence>
-                {splashImage && (
-                  <motion.img
-                    key={splashImage + '-ambient'}
-                    src={splashImage}
-                    className="absolute inset-0 w-full h-full object-cover blur-2xl opacity-50 pointer-events-none scale-110"
-                    aria-hidden="true"
-                  />
-                )}
-              </AnimatePresence>
-              <div className="absolute inset-0 bg-bg-secondary/90"></div>
-            </div>
+            <div
+              className="absolute inset-0 -z-10 pointer-events-none overflow-hidden rounded-lg md:rounded-l-none md:rounded-r-lg bg-gradient-to-br from-bg-secondary via-bg-secondary to-bg-primary"
+              aria-hidden="true"
+            />
 
             <div className="w-full h-full flex flex-col p-8 lg:p-16 overflow-y-auto custom-scrollbar relative z-10">
               {isSettingsOpen && props.appSettings ? (
@@ -367,7 +419,15 @@ export default function MainLibrary(props: MainLibraryProps) {
               ) : (
                 <>
                   <div className="my-auto text-left relative z-10">
-                    <Text variant={TextVariants.displayLarge}>{t('library.splash.brand')}</Text>
+                    <div className="flex flex-wrap items-baseline gap-3">
+                      <Text variant={TextVariants.displayLarge}>{t('library.splash.brand')}</Text>
+                      <span
+                        data-testid="splash-version-badge"
+                        className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold bg-accent text-button-text shadow-sm"
+                      >
+                        {`v${appVersion || '1.7.1.1'}`}
+                      </span>
+                    </div>
                     <Text
                       variant={TextVariants.heading}
                       color={TextColors.secondary}
@@ -427,18 +487,17 @@ export default function MainLibrary(props: MainLibraryProps) {
                   <Text
                     variant={TextVariants.small}
                     as="div"
-                    className="absolute bottom-8 left-8 lg:left-16 space-y-1 z-10 drop-shadow-sm"
+                    className="mt-6 space-y-1 z-10"
                   >
-                    <p>
-                      {t('library.splash.imagesBy')}{' '}
-                      <a
-                        href="https://instagram.com/timonkaech.photography"
-                        className="hover:underline"
-                        target="_blank"
-                        rel="noopener noreferrer"
+                    <p className="text-text-secondary">
+                      {'Spiders protect their nest. Photo by '}
+                      <button
+                        type="button"
+                        onClick={() => open('https://500px.com/p/mariusphoto')}
+                        className="hover:underline text-text-primary font-medium cursor-pointer"
                       >
-                        {'Timon Käch'}
-                      </a>
+                        Marius R.
+                      </button>
                     </p>
                     {appVersion && (
                       <div className="flex items-center space-x-2">
@@ -451,7 +510,7 @@ export default function MainLibrary(props: MainLibraryProps) {
                             }`}
                             onClick={() => {
                               if (isUpdateAvailable) {
-                                open('https://github.com/CyberTimon/RapidRAW/releases/latest');
+                                open('https://github.com/mariusr-hub/RapidRAW/releases/latest');
                               }
                             }}
                             data-tooltip={
@@ -473,16 +532,7 @@ export default function MainLibrary(props: MainLibraryProps) {
                         <span>-</span>
                         <p>
                           <a
-                            href="https://ko-fi.com/cybertimon"
-                            className="hover:underline"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                          >
-                            {t('library.splash.donate')}
-                          </a>
-                          <span className="mx-1">{t('library.splash.or')}</span>
-                          <a
-                            href="https://github.com/CyberTimon/RapidRAW"
+                            href="https://github.com/mariusr-hub/RapidRAW"
                             className="hover:underline"
                             target="_blank"
                             rel="noopener noreferrer"

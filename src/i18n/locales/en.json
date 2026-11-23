@@ -10,7 +10,9 @@
         "agx": "AgX",
         "agxDesc": "Film-like Tonemapping",
         "basic": "Basic",
-        "basicDesc": "Standard Tonemapping"
+        "basicDesc": "Standard Tonemapping",
+        "legacy": "Legacy",
+        "legacyDesc": "Classic v1.x Tonemapping"
       },
       "reset": "Reset",
       "shadows": "Shadows",
@@ -173,7 +175,8 @@
       "sharpness": "Sharpness",
       "structure": "Structure",
       "superResolution": "RapidRes",
-      "threshold": "Threshold"
+      "threshold": "Threshold",
+      "contrastCleaner": "Halo Contrast Cleaner"
     },
     "effects": {
       "amount": "Amount",
@@ -244,6 +247,18 @@
       "size": "Size",
       "spatial": "Spatial",
       "vignette": "Vignette"
+    },
+    "lights": {
+      "brightness": "Highlights Brightness",
+      "contrast": "Highlights Contrast",
+      "desc": "Dedicated highlight recovery & micro-texture",
+      "details": "Highlights Structure",
+      "reset": "Reset Highlights Pipeline",
+      "saturation": "Highlights Saturation",
+      "temperature": "Highlights Warmth",
+      "tint": "Highlights Tint",
+      "title": "Shadow & Highlight Recovery",
+      "vibrance": "Highlights Vibrance"
     }
   },
   "contextMenus": {
@@ -1745,7 +1760,8 @@
       "title": "Lens Correction",
       "vignetting": "Vignetting",
       "zoomInTooltip": "Zoom In",
-      "zoomOutTooltip": "Zoom Out"
+      "zoomOutTooltip": "Zoom Out",
+      "waitingAutoDetect": "Waiting for auto detection..."
     },
     "merge": {
       "autoCrop": "Auto Crop",
@@ -1785,7 +1801,15 @@
       "projectionPerspective": "Perspective",
       "projectionSpherical": "Spherical",
       "savedSuccess": "Panorama Saved Successfully!",
-      "title": "Stitch Panorama"
+      "title": "Stitch Panorama",
+      "autoCrop": "Auto Crop",
+      "excludedImages": "{{count}} images couldn't be matched and were left out",
+      "excludedImages_one": "{{count}} image couldn't be matched and was left out",
+      "excludedImages_other": "{{count}} images couldn't be matched and were left out",
+      "outputInfo": "{{images}} images · {{width}} × {{height}} px",
+      "projectionPanini": "Panini",
+      "projectionStereographic": "Stereographic",
+      "saving": "Saving…"
     },
     "renameAlbum": {
       "placeholder": "Enter new album name..."
@@ -1835,6 +1859,49 @@
       "vertical": "Vertical",
       "xAxis": "X Axis",
       "yAxis": "Y Axis",
+      "zoomInTooltip": "Zoom In",
+      "zoomOutTooltip": "Zoom Out"
+    },
+    "denoise": {
+      "batchProgressText": "Denoising {{current}} of {{total}}...",
+      "btnBatchDenoise": "Batch Denoise",
+      "btnRetry": "Retry",
+      "btnSave": "Save",
+      "btnStart": "Start Denoise",
+      "cancel": "Cancel",
+      "close": "Close",
+      "descBatch": "Batch denoise selected images",
+      "downloadingText": "Downloading AI Model ({{status}})...",
+      "initializing": "Initializing...",
+      "methodAi": "AI Denoise",
+      "methodBm3d": "Classic (BM3D)",
+      "methodLabel": "Method",
+      "methodRaw9": "Apple RAW 9",
+      "openInEditor": "Open in Editor",
+      "processingFailed": "Denoise Failed",
+      "saveSuccess": "Saved successfully",
+      "titleBatch": "Batch RAW Denoise",
+      "waitText": "This may take a moment depending on resolution..."
+    },
+    "negativeConversion": {
+      "blueWeight": "Blue Weight",
+      "cancel": "Cancel",
+      "colorTiming": "Color Timing",
+      "compareTooltip": "Hold to Compare",
+      "contrast": "Contrast",
+      "convertAndSave": "Convert & Save",
+      "convertAndSaveAll": "Convert & Save All ({{count}})",
+      "converting": "Converting...",
+      "convertingProgress": "Converting {{current}} / {{total}}...",
+      "exposure": "Exposure",
+      "greenWeight": "Green Weight",
+      "noticeText": "Inversion logic inspired by <1>NegPy</1> created by marcinz606 (<3>GPL-3.0</3>).",
+      "originalLabel": "Original",
+      "printGrade": "Print Grade",
+      "redWeight": "Red Weight",
+      "resetTooltip": "Reset Parameters",
+      "resetViewTooltip": "Reset View",
+      "title": "Film Negative Conversion",
       "zoomInTooltip": "Zoom In",
       "zoomOutTooltip": "Zoom Out"
     }
@@ -2350,7 +2417,8 @@
       "wgpuDescRecommended": "Bypasses browser encoding for instantly responsive live previews. Highly recommended for performance.",
       "wgpuLabel": "Enable Direct WGPU Render",
       "workerThreads": "Thumbnail Worker Threads",
-      "workerThreadsDesc": "Number of parallel threads used to generate thumbnails. Higher values speed up library loading but use more CPU & RAM."
+      "workerThreadsDesc": "Number of parallel threads used to generate thumbnails. Higher values speed up library loading but use more CPU & RAM.",
+      "wgpuDescWindows": "Intel Iris Xe GPU compute stays active via flicker-free WebView2 compositing (direct swapchain transparency disabled on Windows)."
     },
     "tagging": {
       "addCustomPlaceholder": "Add custom AI tags (comma separated)...",

@@ -21,6 +21,7 @@ import { notifyEmbeddedPreview } from './useImageLoader';
 import { clearLibrarySelection } from './useLibraryActions';
 import { computeSortedLibrary } from './useSortedLibrary';
 import { getImmichAlbumImages, isImmichAlbumId } from '../utils/immichApi';
+import { isDirectWgpuSwapchainActive } from '../utils/wgpuRenderer';
 
 export interface AppNavigationProps {
   clearThumbnailQueue: () => void;
@@ -197,8 +198,9 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       const cached = globalImageCache.get(path);
       const isFrontendCached = Boolean(cached && cached.selectedImage?.isReady);
+      const { appSettings, osPlatform } = useSettingsStore.getState();
       const canKeepWgpuLive =
-        useSettingsStore.getState().appSettings?.useWgpuRenderer !== false &&
+        isDirectWgpuSwapchainActive(appSettings, osPlatform) &&
         wasEditorVisible &&
         useEditorStore.getState().wgpuPhase === 'live';
       const isCachedInBackend = canKeepWgpuLive

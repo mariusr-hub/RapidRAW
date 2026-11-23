@@ -230,8 +230,33 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dest_dir.display());
     }
 
+    if target_os == "windows" {
+        println!("cargo:rustc-link-arg-bins=/STACK:33554432");
+        println!("cargo:rustc-link-arg-tests=/STACK:33554432");
+        let manifest_path = manifest_dir.join("RapidRAW.manifest");
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
+            manifest_path.display()
+        );
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=RapidRAW.manifest");
     println!("cargo:rerun-if-env-changed=RAPIDRAW_RUNTIME_DIR");
 
-    tauri_build::build()
+    tauri_build::try_build(
+        tauri_build::Attributes::new().windows_attributes(
+            tauri_build::WindowsAttributes::new()
+                .app_manifest(include_str!("RapidRAW.manifest")),
+        ),
+    )
+    .expect("failed to run tauri build script");
+
+    if target_os == "windows" {
+        // Override the /MANIFEST:EMBED flag above on [[bin]] targets, where tauri_build
+        // already embeds RapidRAW.manifest into resource.lib (avoiding CVT1100), while
+        // keeping /MANIFEST:EMBED active for both `--lib` unit tests and `tests/*.rs`.
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
+    }
 }

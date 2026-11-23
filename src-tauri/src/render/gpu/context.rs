@@ -80,17 +80,23 @@ fn decode_gpu_for(context: &GpuContext) -> DecodeGpu {
     {
         return existing.gpu.clone();
     }
-    let opened = open_device(
-        &context.adapter,
-        "Decode Device",
-        wgpu::Features::empty(),
-        &context.limits,
-        &DECODE_DEVICE_LOST,
-    );
-    let (device, queue) = opened.unwrap_or_else(|e| {
-        log::warn!("Decoding on the display queue: {}", e);
+    // On unified-memory integrated GPUs (e.g., Intel Iris Xe), share the main device/queue
+    // to avoid duplicate driver allocations and enable zero-copy resource sharing.
+    let (device, queue) = if context.adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
         (Arc::clone(&context.device), Arc::clone(&context.queue))
-    });
+    } else {
+        let opened = open_device(
+            &context.adapter,
+            "Decode Device",
+            wgpu::Features::empty(),
+            &context.limits,
+            &DECODE_DEVICE_LOST,
+        );
+        opened.unwrap_or_else(|e| {
+            log::warn!("Decoding on the display queue: {}", e);
+            (Arc::clone(&context.device), Arc::clone(&context.queue))
+        })
+    };
     let gpu = DecodeGpu {
         device,
         queue,
@@ -111,12 +117,17 @@ fn open_device(
     limits: &wgpu::Limits,
     lost: &'static AtomicBool,
 ) -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
+    let memory_hints = if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
+        wgpu::MemoryHints::MemoryUsage
+    } else {
+        wgpu::MemoryHints::Performance
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some(label),
         required_features,
         required_limits: limits.clone(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
-        memory_hints: wgpu::MemoryHints::Performance,
+        memory_hints,
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| e.to_string())?;

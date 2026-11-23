@@ -352,6 +352,7 @@ export function SearchInput({ indexingProgress, isIndexing }: any) {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    e.stopPropagation();
     if ((e.key === ',' || e.key === 'Enter') && text.trim()) {
       e.preventDefault();
       setSearchCriteria((prev) => ({
@@ -653,7 +654,7 @@ export function ViewOptionsDropdown({
         </>
       }
       buttonTitle={t('library.header.viewOptions.title')}
-      contentClassName="library-view-options-menu w-[760px]"
+      contentClassName="library-view-options-menu w-[760px] max-w-[calc(100vw-2rem)]"
     >
       <div className="library-view-options-content flex">
         <div className="library-view-options-section w-1/2 py-4 px-2 border-r border-border-color space-y-5">

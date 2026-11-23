@@ -864,3 +864,343 @@ pub fn get_lensfun_lenses_for_maker(maker: String) -> Result<Vec<String>, String
 pub fn get_lens_correction_info(path: String, selection: Value) -> Option<LensCorrectionInfo> {
     resolve(&path, &selection).map(|r| r.info.clone())
 }
+
+pub fn apply_radial_vignette_equalization(
+    img: &mut image::Rgb32FImage,
+    k1: f32,
+    k2: f32,
+) {
+    if k1.abs() < 1e-5 && k2.abs() < 1e-5 {
+        return;
+    }
+    use rayon::prelude::*;
+    let (width, height) = img.dimensions();
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let max_radius = (cx * cx + cy * cy).sqrt().max(1.0);
+
+    img.enumerate_rows_mut().par_bridge().for_each(|(_, row)| {
+        for (x, y, pixel) in row {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let r = (dx * dx + dy * dy).sqrt() / max_radius;
+            let r2 = r * r;
+            let r4 = r2 * r2;
+            let gain = (1.0 + k1 * r2 + k2 * r4).max(0.0);
+
+            pixel[0] *= gain;
+            pixel[1] *= gain;
+            pixel[2] *= gain;
+        }
+    });
+}
+
+pub fn auto_detect_transverse_chromatic_aberration(img: &image::Rgb32FImage) -> (f32, f32) {
+    let (width, height) = img.dimensions();
+    if width < 200 || height < 200 {
+        return (1.0, 1.0);
+    }
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let max_radius = (cx * cx + cy * cy).sqrt().max(1.0);
+
+    let step = ((width * height) / 10000).max(1);
+    let mut edge_samples = Vec::with_capacity(1200);
+
+    for idx in (0..(width * height)).step_by(step as usize) {
+        let x = idx % width;
+        let y = idx / width;
+
+        if x < 4 || y < 4 || x >= width - 4 || y >= height - 4 {
+            continue;
+        }
+
+        let dx = x as f32 - cx;
+        let dy = y as f32 - cy;
+        let dist = (dx * dx + dy * dy).sqrt();
+        let r = dist / max_radius;
+
+        if r < 0.35 || r > 0.90 {
+            continue;
+        }
+
+        let dir_x = dx / dist.max(1e-4);
+        let dir_y = dy / dist.max(1e-4);
+
+        let x_step = (dir_x * 2.0).round() as i32;
+        let y_step = (dir_y * 2.0).round() as i32;
+
+        let g_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[1];
+        let g_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[1];
+
+        let grad = (g_next - g_prev).abs();
+        if grad > 0.08 {
+            edge_samples.push((x, y, r * r, dir_x, dir_y));
+            if edge_samples.len() >= 1000 {
+                break;
+            }
+        }
+    }
+
+    if edge_samples.len() < 50 {
+        return (1.0, 1.0);
+    }
+
+    let deltas = [
+        -0.0012f32, -0.0009, -0.0006, -0.0003, 0.0, 0.0003, 0.0006, 0.0009, 0.0012,
+    ];
+
+    let mut best_delta_r = 0.0f32;
+    let mut min_err_r = f32::INFINITY;
+    let mut best_delta_b = 0.0f32;
+    let mut min_err_b = f32::INFINITY;
+
+    for &delta in &deltas {
+        let mut err_r = 0.0f32;
+        let mut err_b = 0.0f32;
+
+        for &(x, y, r_sq, dir_x, dir_y) in &edge_samples {
+            let x_step = (dir_x * 2.0).round() as i32;
+            let y_step = (dir_y * 2.0).round() as i32;
+
+            let g_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[1];
+            let g_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[1];
+            let g_span = g_next - g_prev;
+            if g_span.abs() < 0.04 {
+                continue;
+            }
+            let g_target = img.get_pixel(x, y)[1];
+            let t_g = (g_target - g_prev) / g_span;
+
+            let r_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[0];
+            let r_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[0];
+            let r_span = r_next - r_prev;
+
+            let b_next = img.get_pixel((x as i32 + x_step) as u32, (y as i32 + y_step) as u32)[2];
+            let b_prev = img.get_pixel((x as i32 - x_step) as u32, (y as i32 - y_step) as u32)[2];
+            let b_span = b_next - b_prev;
+
+            let offset = delta * r_sq * max_radius;
+            let sx = (x as f32 + dir_x * offset).clamp(0.0, width as f32 - 1.001);
+            let sy = (y as f32 + dir_y * offset).clamp(0.0, height as f32 - 1.001);
+
+            let sx0 = sx.floor() as u32;
+            let sy0 = sy.floor() as u32;
+            let sx1 = (sx0 + 1).min(width - 1);
+            let sy1 = (sy0 + 1).min(height - 1);
+            let fx = sx - sx0 as f32;
+            let fy = sy - sy0 as f32;
+
+            let p00 = img.get_pixel(sx0, sy0);
+            let p10 = img.get_pixel(sx1, sy0);
+            let p01 = img.get_pixel(sx0, sy1);
+            let p11 = img.get_pixel(sx1, sy1);
+
+            let r_interp = (p00[0] * (1.0 - fx) + p10[0] * fx) * (1.0 - fy)
+                + (p01[0] * (1.0 - fx) + p11[0] * fx) * fy;
+            let b_interp = (p00[2] * (1.0 - fx) + p10[2] * fx) * (1.0 - fy)
+                + (p01[2] * (1.0 - fx) + p11[2] * fx) * fy;
+
+            if r_span.abs() >= 0.04 {
+                let t_r = (r_interp - r_prev) / r_span;
+                err_r += (t_r - t_g).abs();
+            } else {
+                err_r += (r_interp - g_target).abs() * 0.2;
+            }
+
+            if b_span.abs() >= 0.04 {
+                let t_b = (b_interp - b_prev) / b_span;
+                err_b += (t_b - t_g).abs();
+            } else {
+                err_b += (b_interp - g_target).abs() * 0.2;
+            }
+        }
+
+        if err_r < min_err_r {
+            min_err_r = err_r;
+            best_delta_r = delta;
+        }
+        if err_b < min_err_b {
+            min_err_b = err_b;
+            best_delta_b = delta;
+        }
+    }
+
+    (1.0 + best_delta_r, 1.0 + best_delta_b)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LensDistortionParams {
+    pub k1: f64,
+    pub k2: f64,
+    pub k3: f64,
+    pub model: u32,
+    pub tca_vr: f64,
+    pub tca_vb: f64,
+    pub vig_k1: f64,
+    pub vig_k2: f64,
+    pub vig_k3: f64,
+}
+
+#[tauri::command]
+pub fn autodetect_lens(maker: String, model: String) -> Result<Option<(String, String)>, String> {
+    let db = database().ok_or("Lens database not loaded")?;
+    if let Some(lens) = db.lens_by_fuzzy_model(&maker, &model, None) {
+        return Ok(Some((lens.get_maker(), lens.get_full_model_name())));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub fn get_lens_distortion_params(
+    maker: String,
+    model: String,
+    focal_length: f32,
+    aperture: Option<f32>,
+    distance: Option<f32>,
+) -> Result<Option<LensDistortionParams>, String> {
+    let db = database().ok_or("Lens database not loaded")?;
+    let Some(lens) = db
+        .lens_by_name(&maker, &model)
+        .or_else(|| db.lens_by_fuzzy_model(&maker, &model, None))
+    else {
+        return Ok(None);
+    };
+    let d = lens.distortion_at(focal_length).unwrap_or([0.0; 5]);
+    let tca = lens
+        .tca_at(focal_length)
+        .unwrap_or([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+    let vig = lens
+        .vignetting_at(
+            focal_length,
+            aperture.unwrap_or(4.0),
+            distance.unwrap_or(DEFAULT_DISTANCE),
+        )
+        .unwrap_or([0.0; 3]);
+    Ok(Some(LensDistortionParams {
+        k1: d[0],
+        k2: d[1],
+        k3: d[2],
+        model: if d[0].abs() > 1e-8 || d[1].abs() > 1e-8 {
+            1
+        } else {
+            0
+        },
+        tca_vr: tca[0],
+        tca_vb: tca[1],
+        vig_k1: vig[0],
+        vig_k2: vig[1],
+        vig_k3: vig[2],
+    }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidedLine {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+    pub orientation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidedUprightResult {
+    pub vertical: f64,
+    pub horizontal: f64,
+    pub rotate: f64,
+    pub aspect: f64,
+    pub scale: f64,
+}
+
+#[tauri::command]
+pub fn solve_guided_upright(
+    lines: Vec<GuidedLine>,
+    width: f64,
+    height: f64,
+) -> Result<GuidedUprightResult, String> {
+    if lines.is_empty() {
+        return Err("No guide lines provided".to_string());
+    }
+
+    let aspect_ratio = if height > 0.0 { width / height } else { 1.5 };
+    let mut vertical_lines: Vec<&GuidedLine> = Vec::new();
+    let mut horizontal_lines: Vec<&GuidedLine> = Vec::new();
+
+    for line in &lines {
+        let dx = (line.x2 - line.x1).abs();
+        let dy = (line.y2 - line.y1).abs();
+        if line.orientation == "vertical" || (line.orientation.is_empty() && dy >= dx) {
+            vertical_lines.push(line);
+        } else {
+            horizontal_lines.push(line);
+        }
+    }
+
+    let mut rotation_deg = 0.0;
+    let mut vertical_tilt = 0.0;
+    let mut horizontal_tilt = 0.0;
+
+    if !vertical_lines.is_empty() {
+        let mut angles = Vec::new();
+        for v in &vertical_lines {
+            let dx = (v.x2 - v.x1) * aspect_ratio;
+            let dy = v.y2 - v.y1;
+            let angle = dx.atan2(dy).to_degrees();
+            angles.push((angle, (v.x1 + v.x2) / 2.0));
+        }
+
+        let avg_angle: f64 = angles.iter().map(|(a, _)| *a).sum::<f64>() / angles.len() as f64;
+        rotation_deg = -avg_angle;
+
+        if angles.len() >= 2 {
+            angles.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let left = angles.first().unwrap();
+            let right = angles.last().unwrap();
+            let dx_span = right.1 - left.1;
+            if dx_span > 0.1 {
+                let convergence = (left.0 - right.0) / dx_span;
+                vertical_tilt = (convergence * 2.2).clamp(-100.0, 100.0);
+            }
+        }
+    }
+
+    if !horizontal_lines.is_empty() {
+        let mut angles = Vec::new();
+        for h in &horizontal_lines {
+            let dx = h.x2 - h.x1;
+            let dy = (h.y2 - h.y1) / aspect_ratio;
+            let angle = dy.atan2(dx).to_degrees();
+            angles.push((angle, (h.y1 + h.y2) / 2.0));
+        }
+
+        if vertical_lines.is_empty() {
+            let avg_angle: f64 = angles.iter().map(|(a, _)| *a).sum::<f64>() / angles.len() as f64;
+            rotation_deg = -avg_angle;
+        }
+
+        if angles.len() >= 2 {
+            angles.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = angles.first().unwrap();
+            let bottom = angles.last().unwrap();
+            let dy_span = bottom.1 - top.1;
+            if dy_span > 0.1 {
+                let convergence = (top.0 - bottom.0) / dy_span;
+                horizontal_tilt = (convergence * 2.2).clamp(-100.0, 100.0);
+            }
+        }
+    }
+
+    let total_distortion_mag =
+        (vertical_tilt.abs().powi(2) + horizontal_tilt.abs().powi(2) + rotation_deg.abs().powi(2))
+            .sqrt();
+    let auto_scale = (100.0 + total_distortion_mag * 0.45).clamp(100.0, 160.0);
+
+    Ok(GuidedUprightResult {
+        vertical: vertical_tilt.round(),
+        horizontal: horizontal_tilt.round(),
+        rotate: (rotation_deg * 10.0).round() / 10.0,
+        aspect: 0.0,
+        scale: auto_scale.round(),
+    })
+}

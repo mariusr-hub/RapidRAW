@@ -654,3 +654,189 @@ pub fn get_fast_demosaic_scale_factor(
     }
     1.0
 }
+
+/// Ratio-Corrected Demosaicing (RCD) for Bayer CFA sensels.
+pub fn demosaic_rcd_bayer(
+    cfa: &[f32],
+    width: usize,
+    height: usize,
+    cfa_pattern: [u8; 4],
+) -> Vec<[f32; 3]> {
+    demosaic_rcd_bayer_with_ca(cfa, width, height, cfa_pattern, None, None)
+}
+
+/// Ratio-Corrected Demosaicing with pre-demosaic sub-lattice lateral CA warping.
+pub fn demosaic_rcd_bayer_with_ca(
+    cfa: &[f32],
+    width: usize,
+    height: usize,
+    cfa_pattern: [u8; 4],
+    ca_red_coeffs: Option<[f32; 3]>,
+    ca_blue_coeffs: Option<[f32; 3]>,
+) -> Vec<[f32; 3]> {
+    let mut rgb = vec![[0.0f32; 3]; width * height];
+    if width < 5 || height < 5 {
+        return rgb;
+    }
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+    let r_max = (cx * cx + cy * cy).sqrt().max(1.0);
+
+    let warp_offset = |x: usize, y: usize, coeffs: [f32; 3]| -> (f32, f32) {
+        let dx = x as f32 - cx;
+        let dy = y as f32 - cy;
+        let r = (dx * dx + dy * dy).sqrt() / r_max;
+        let r2 = r * r;
+        let r4 = r2 * r2;
+        let r6 = r4 * r2;
+        let scale = 1.0 + coeffs[0] * r2 + coeffs[1] * r4 + coeffs[2] * r6;
+        ((scale - 1.0) * dx, (scale - 1.0) * dy)
+    };
+
+    let sample_sensel = |x: i32, y: i32| -> f32 {
+        let scx = x.clamp(0, width as i32 - 1) as usize;
+        let scy = y.clamp(0, height as i32 - 1) as usize;
+        cfa[scy * width + scx]
+    };
+
+    let sample_sublattice_bilinear = |base_x: i32, base_y: i32, ox: f32, oy: f32| -> f32 {
+        let u = ox * 0.5;
+        let v = oy * 0.5;
+        let u0 = u.floor() as i32;
+        let v0 = v.floor() as i32;
+        let fu = u - u.floor();
+        let fv = v - v.floor();
+
+        let s00 = sample_sensel(base_x + 2 * u0, base_y + 2 * v0);
+        let s10 = sample_sensel(base_x + 2 * (u0 + 1), base_y + 2 * v0);
+        let s01 = sample_sensel(base_x + 2 * u0, base_y + 2 * (v0 + 1));
+        let s11 = sample_sensel(base_x + 2 * (u0 + 1), base_y + 2 * (v0 + 1));
+
+        let top = s00 * (1.0 - fu) + s10 * fu;
+        let bottom = s01 * (1.0 - fu) + s11 * fu;
+        top * (1.0 - fv) + bottom * fv
+    };
+
+    for y in 2..(height - 2) {
+        for x in 2..(width - 2) {
+            let idx = y * width + x;
+            let c = cfa[idx];
+            let p_type = cfa_pattern[(y % 2) * 2 + (x % 2)];
+
+            if p_type == 1 || p_type == 2 {
+                rgb[idx][1] = c;
+            } else {
+                let h_diff = (cfa[y * width + (x - 1)] - cfa[y * width + (x + 1)]).abs()
+                    + (cfa[y * width + (x - 2)] - cfa[y * width + (x + 2)]).abs() * 0.5;
+                let v_diff = (cfa[(y - 1) * width + x] - cfa[(y + 1) * width + x]).abs()
+                    + (cfa[(y - 2) * width + x] - cfa[(y + 2) * width + x]).abs() * 0.5;
+
+                if h_diff < v_diff * 0.8 {
+                    rgb[idx][1] = 0.5 * (cfa[y * width + (x - 1)] + cfa[y * width + (x + 1)]);
+                } else if v_diff < h_diff * 0.8 {
+                    rgb[idx][1] = 0.5 * (cfa[(y - 1) * width + x] + cfa[(y + 1) * width + x]);
+                } else {
+                    rgb[idx][1] = 0.25
+                        * (cfa[y * width + (x - 1)]
+                            + cfa[y * width + (x + 1)]
+                            + cfa[(y - 1) * width + x]
+                            + cfa[(y + 1) * width + x]);
+                }
+            }
+        }
+    }
+
+    for y in 2..(height - 2) {
+        for x in 2..(width - 2) {
+            let idx = y * width + x;
+            let g = rgb[idx][1].max(1e-5);
+            let p_type = cfa_pattern[(y % 2) * 2 + (x % 2)];
+
+            let (r_ox, r_oy) = ca_red_coeffs.map(|c| warp_offset(x, y, c)).unwrap_or((0.0, 0.0));
+            let (b_ox, b_oy) = ca_blue_coeffs.map(|c| warp_offset(x, y, c)).unwrap_or((0.0, 0.0));
+
+            if p_type == 0 {
+                rgb[idx][0] = cfa[idx];
+                let b_ratio = 0.25
+                    * (sample_sublattice_bilinear(x as i32 - 1, y as i32 - 1, b_ox, b_oy)
+                        / rgb[(y - 1) * width + (x - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32 - 1, b_ox, b_oy)
+                            / rgb[(y - 1) * width + (x + 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 - 1, y as i32 + 1, b_ox, b_oy)
+                            / rgb[(y + 1) * width + (x - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32 + 1, b_ox, b_oy)
+                            / rgb[(y + 1) * width + (x + 1)][1].max(1e-5));
+                rgb[idx][2] = (b_ratio * g).max(0.0);
+            } else if p_type == 3 {
+                rgb[idx][2] = cfa[idx];
+                let r_ratio = 0.25
+                    * (sample_sublattice_bilinear(x as i32 - 1, y as i32 - 1, r_ox, r_oy)
+                        / rgb[(y - 1) * width + (x - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32 - 1, r_ox, r_oy)
+                            / rgb[(y - 1) * width + (x + 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 - 1, y as i32 + 1, r_ox, r_oy)
+                            / rgb[(y + 1) * width + (x - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32 + 1, r_ox, r_oy)
+                            / rgb[(y + 1) * width + (x + 1)][1].max(1e-5));
+                rgb[idx][0] = (r_ratio * g).max(0.0);
+            } else if y % 2 == 0 && x % 2 == 1 {
+                let r_ratio = 0.5
+                    * (sample_sublattice_bilinear(x as i32 - 1, y as i32, r_ox, r_oy)
+                        / rgb[y * width + (x - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32, r_ox, r_oy)
+                            / rgb[y * width + (x + 1)][1].max(1e-5));
+                let b_ratio = 0.5
+                    * (sample_sublattice_bilinear(x as i32, y as i32 - 1, b_ox, b_oy)
+                        / rgb[(y - 1) * width + x][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32, y as i32 + 1, b_ox, b_oy)
+                            / rgb[(y + 1) * width + x][1].max(1e-5));
+                rgb[idx][0] = (r_ratio * g).max(0.0);
+                rgb[idx][2] = (b_ratio * g).max(0.0);
+            } else {
+                let b_ratio = 0.5
+                    * (sample_sublattice_bilinear(x as i32 - 1, y as i32, b_ox, b_oy)
+                        / rgb[y * width + (x - 1)][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32 + 1, y as i32, b_ox, b_oy)
+                            / rgb[y * width + (x + 1)][1].max(1e-5));
+                let r_ratio = 0.5
+                    * (sample_sublattice_bilinear(x as i32, y as i32 - 1, r_ox, r_oy)
+                        / rgb[(y - 1) * width + x][1].max(1e-5)
+                        + sample_sublattice_bilinear(x as i32, y as i32 + 1, r_ox, r_oy)
+                            / rgb[(y + 1) * width + x][1].max(1e-5));
+                rgb[idx][0] = (r_ratio * g).max(0.0);
+                rgb[idx][2] = (b_ratio * g).max(0.0);
+            }
+        }
+    }
+
+    rgb
+}
+
+pub trait CfaExt {
+    fn is_bayer(&self) -> bool;
+}
+
+impl CfaExt for rawler::cfa::CFA {
+    fn is_bayer(&self) -> bool {
+        self.width == 2 && self.height == 2
+    }
+}
+
+pub fn interpolate_dual_illuminant_matrix(
+    matrix_a: &[f32],
+    matrix_d65: &[f32],
+    cct: f32,
+) -> Vec<f32> {
+    if matrix_a.len() != matrix_d65.len() || matrix_a.is_empty() {
+        return matrix_d65.to_vec();
+    }
+    let mired_a = 1.0 / 2856.0f32;
+    let mired_d65 = 1.0 / 6504.0f32;
+    let mired_shot = 1.0 / cct.clamp(2000.0, 12000.0);
+    let weight_a = ((mired_shot - mired_d65) / (mired_a - mired_d65)).clamp(0.0, 1.0);
+    matrix_a
+        .iter()
+        .zip(matrix_d65.iter())
+        .map(|(&a, &d65)| weight_a * a + (1.0 - weight_a) * d65)
+        .collect()
+}

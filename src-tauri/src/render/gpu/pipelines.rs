@@ -90,7 +90,8 @@ pub fn shader_features(adjustments: &AllAdjustments) -> u32 {
         F_GLOW_HALATION_FLARE,
         any(g.glow_amount, |m| m.glow_amount)
             || any(g.halation_amount, |m| m.halation_amount)
-            || any(g.flare_amount, |m| m.flare_amount),
+            || any(g.flare_amount, |m| m.flare_amount)
+            || g.orton_spread > 0.0,
     );
     set(F_GRAIN, g.grain_amount > 0.0);
     set(F_VIGNETTE, g.vignette_amount != 0.0);

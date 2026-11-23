@@ -105,7 +105,7 @@ export interface Progress {
   total: number;
 }
 
-export type PanoramaProjection = 'perspective' | 'cylindrical' | 'spherical';
+export type PanoramaProjection = 'perspective' | 'cylindrical' | 'spherical' | 'panini' | 'stereographic';
 
 export type PanoramaProjectionMode = 'auto' | PanoramaProjection;
 
@@ -116,6 +116,8 @@ export interface PanoramaSettings {
   boundaryWarp: number;
   exposureCompensation: boolean;
   projection: PanoramaProjectionMode;
+  fastDraft?: boolean;
+  halfSize?: boolean;
 }
 
 export interface HdrSettings {
@@ -143,6 +145,8 @@ export const DEFAULT_MERGE_SETTINGS: MergeSettingsByKind = {
     boundaryWarp: 0,
     exposureCompensation: true,
     projection: 'auto',
+    fastDraft: false,
+    halfSize: false,
   },
   hdr: {
     autoCrop: true,
