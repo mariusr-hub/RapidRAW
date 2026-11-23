@@ -626,6 +626,17 @@ pub fn set_rating_for_paths(
         }
     });
 
+    if rating >= 4 {
+        for p in &paths {
+            let (source_path, sidecar_path) = parse_virtual_path(p);
+            let meta = crate::metadata::sidecar::load_sidecar(&sidecar_path);
+            crate::enhanced::local_priors::record_confirmed_photo_edits(
+                &source_path,
+                &meta.adjustments,
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -638,6 +649,31 @@ pub fn set_flag_for_paths(
     update_metadata_for_paths(&paths, &app_handle, |metadata| {
         metadata.flag = flag;
     });
+
+    if let Some(f) = flag
+        && (f == ImageFlag::Pick || f == ImageFlag::Reject)
+    {
+        let settings = load_settings(app_handle).unwrap_or_default();
+        let is_pick = f == ImageFlag::Pick;
+        for p in &paths {
+            let (source_path, _) = parse_virtual_path(p);
+            let s = source_path.to_string_lossy().to_string();
+            if let Ok(bytes) = fs::read(&source_path)
+                && !bytes.is_empty()
+            {
+                let (make, model) = crate::metadata::exif_processing::read_camera_make_model(&s, &bytes)
+                    .unwrap_or_default();
+                let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+                let exif_map = crate::metadata::exif_processing::read_exif_data_from_bytes(&s, &bytes);
+                let lens = exif_map.get("LensModel").cloned().unwrap_or_default();
+                let lens_key = crate::enhanced::local_priors::normalize_lens_key(&lens);
+                if let Ok(img) = crate::decode::image_loader::load_base_image_from_bytes(&bytes, &s, false, &settings, None) {
+                    let sharp = crate::enhanced::speed_culler::compute_sharpness_variance(&img);
+                    crate::enhanced::local_priors::record_culler_flag(&cam_key, &lens_key, is_pick, sharp);
+                }
+            }
+        }
+    }
 
     Ok(())
 }

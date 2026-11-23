@@ -854,13 +854,23 @@ pub fn auto_remove_dust_and_blemishes(
     let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
     if let Some(loaded_image) = &*orig_guard {
         let (width, height) = loaded_image.image.dimensions();
+        let path_str = loaded_image.path.clone();
+        let (src_path, _) = crate::library::sidecars::parse_virtual_path(&path_str);
+        let cam_key = if let Ok(bytes) = std::fs::read(&src_path)
+            && let Some((make, model)) =
+                crate::metadata::exif_processing::read_camera_make_model(&path_str, &bytes)
+        {
+            crate::enhanced::local_priors::normalize_camera_key(&make, &model)
+        } else {
+            "universal".to_string()
+        };
+
         let dust_spots = detect_dust_candidate_spots(&loaded_image.image);
         let scratches = detect_linear_scratch_candidates(&loaded_image.image);
-        let dust_count = dust_spots.len();
-        let scratch_count = scratches.len();
 
         let mut spots: Vec<DetectedSpot> = dust_spots
             .into_iter()
+            .filter(|s| !crate::enhanced::local_priors::is_dust_spot_suppressed(&cam_key, s.norm_x, s.norm_y))
             .map(|s| DetectedSpot {
                 x: s.norm_x * width as f32,
                 y: s.norm_y * height as f32,
@@ -874,6 +884,30 @@ pub fn auto_remove_dust_and_blemishes(
                 norm_end_y: None,
             })
             .collect();
+
+        for persistent in crate::enhanced::local_priors::persistent_dust_candidates(&cam_key) {
+            let already = spots.iter().any(|s| {
+                s.kind == "dust"
+                    && (s.norm_x - persistent.norm_x).hypot(s.norm_y - persistent.norm_y)
+                        <= crate::enhanced::local_priors::DUST_CONFIRM_RADIUS
+            });
+            if !already {
+                spots.push(DetectedSpot {
+                    x: persistent.norm_x * width as f32,
+                    y: persistent.norm_y * height as f32,
+                    radius: persistent.radius,
+                    norm_x: persistent.norm_x,
+                    norm_y: persistent.norm_y,
+                    kind: "dust".to_string(),
+                    end_x: None,
+                    end_y: None,
+                    norm_end_x: None,
+                    norm_end_y: None,
+                });
+            }
+        }
+        let dust_count = spots.iter().filter(|s| s.kind == "dust").count();
+        let scratch_count = scratches.len();
 
         for sc in scratches {
             spots.push(DetectedSpot {

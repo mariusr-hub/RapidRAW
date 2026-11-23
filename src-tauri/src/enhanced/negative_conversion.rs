@@ -791,6 +791,13 @@ pub async fn convert_negatives(
             results.push(out_path.to_string_lossy().to_string());
         }
 
+        crate::enhanced::local_priors::record_negative_mask_confirmation(
+            params.base_mask_r.unwrap_or(params.red_weight),
+            params.base_mask_g.unwrap_or(params.green_weight),
+            params.base_mask_b.unwrap_or(params.blue_weight),
+            params.film_profile.as_deref().unwrap_or("default"),
+        );
+
         Ok(results)
     })
     .await

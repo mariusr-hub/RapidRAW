@@ -261,10 +261,19 @@ pub async fn analyze_image_noise_profile(
     // 2. Heteroscedastic noise curve (alpha, beta)
     let (alpha_shot, beta_read) = estimate_heteroscedastic_noise_curve(&rgb);
 
-    // 3. Sensor Profile (including Canon 77D / Dual Pixel APS-C / Sony / Nikon / Fuji)
+    // 3. Sensor Profile (including Canon 77D / Dual Pixel APS-C / Sony / Nikon / Fuji + empirical fallback)
     let (make, model) = crate::metadata::exif_processing::read_camera_make_model(&path_str, &file_bytes)
         .unwrap_or_default();
-    let profile = get_sensor_noise_profile(&make, &model);
+    let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+    let mut profile = get_sensor_noise_profile(&make, &model);
+    if profile.sensor_type == "Universal CMOS Noise Model"
+        && let Some((fit_read, fit_shot)) =
+            crate::enhanced::local_priors::get_empirical_sensor_fit(&cam_key)
+    {
+        profile.base_read_noise = fit_read;
+        profile.shot_noise_coeff = fit_shot;
+        profile.sensor_type = "Universal CMOS (Empirical Local Fit)".into();
+    }
 
     // 4. EXIF Parameters: ISO and Shutter Speed
     let iso = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes);
@@ -301,8 +310,14 @@ pub async fn analyze_image_noise_profile(
 
     let smart_tier = select_smart_denoise_tier(effective_iso, push, None);
 
-    // Dynamic pro slider coordinates aligned with Smart Auto-Tier rules
-    let (rec_engine, rec_luma, rec_chroma, rec_detail, rec_shadow_boost, rec_deband) = match smart_tier {
+    let iso_val_for_fit = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes).unwrap_or(effective_iso);
+    crate::enhanced::local_priors::record_empirical_sensor_noise(
+        &cam_key,
+        iso_val_for_fit,
+        empirical_sigma,
+    );
+
+    let (rec_engine, mut rec_luma, rec_chroma, mut rec_detail, rec_shadow_boost, rec_deband) = match smart_tier {
         SmartDenoiseTier::FastGpu => (
             "fast_gpu",
             combined_intensity.clamp(10, 35),
@@ -328,6 +343,17 @@ pub async fn analyze_image_noise_profile(
             effective_iso > 3200,
         ),
     };
+
+    if let Some(learned_dn) =
+        crate::enhanced::local_priors::get_denoise_prior(&cam_key, effective_iso)
+    {
+        rec_luma = ((rec_luma as f32 * 0.65) + (learned_dn.ai_denoise_amount * 0.35))
+            .round()
+            .clamp(5.0, 95.0) as u32;
+        rec_detail = ((rec_detail as f32 * 0.65) + (learned_dn.ai_denoise_detail * 0.35))
+            .round()
+            .clamp(5.0, 85.0) as u32;
+    }
 
     let estimated_time_hint = match smart_tier {
         SmartDenoiseTier::FastGpu => "~0.5-2s",
@@ -789,8 +815,17 @@ pub async fn save_denoised_image(
     };
 
     let (real_path, _) = crate::library::sidecars::parse_virtual_path(&original_path_str);
-    let _ =
-        crate::metadata::exif_processing::write_rrexif_sidecar(&real_path.to_string_lossy(), &output_path);
+    let real_path_str = real_path.to_string_lossy().to_string();
+    let _ = crate::metadata::exif_processing::write_rrexif_sidecar(&real_path_str, &output_path);
+    if let Ok(bytes) = fs::read(&real_path)
+        && !bytes.is_empty()
+    {
+        let (make, model) = crate::metadata::exif_processing::read_camera_make_model(&real_path_str, &bytes)
+            .unwrap_or_default();
+        let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+        let iso = crate::metadata::exif_processing::read_iso(&real_path_str, &bytes).unwrap_or(400);
+        crate::enhanced::local_priors::record_denoise_confirmation(&cam_key, iso, 100.0, 15.0, 0.0, 0.0);
+    }
 
     if source_sidecar_path.exists()
         && let Some(output_path_str) = output_path.to_str()

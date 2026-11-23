@@ -1011,6 +1011,10 @@ pub(crate) async fn export_images_impl(
                 })();
 
                 if result.is_ok() {
+                    crate::enhanced::local_priors::record_confirmed_photo_edits(
+                        &source_path,
+                        &js_adjustments,
+                    );
                     match fingerprint {
                         Some(fingerprint) => export_records.record(&output_path, fingerprint),
                         None => export_records.forget(&output_path),

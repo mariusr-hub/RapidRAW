@@ -45,7 +45,7 @@ pub struct TriageCullResult {
     pub flagged_paths: Vec<String>,
 }
 
-fn compute_sharpness_variance(img: &DynamicImage) -> f32 {
+pub fn compute_sharpness_variance(img: &DynamicImage) -> f32 {
     rapidraw_dsp::calculate_laplacian_variance(&img.to_rgb8()).sqrt().clamp(0.0, 100.0)
 }
 
@@ -270,7 +270,14 @@ pub fn batch_auto_triage_cull(
     state: State<crate::app::state::AppState>,
 ) -> Result<TriageCullResult, String> {
     let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("batch_auto_triage_cull");
-    let min_sharpness = blur_threshold.unwrap_or(14.0);
+    let learned_cutoff = paths.first().and_then(|first_path| {
+        let (src, _) = parse_virtual_path(first_path);
+        let bytes = std::fs::read(&src).ok()?;
+        let (make, model) = crate::metadata::exif_processing::read_camera_make_model(first_path, &bytes)?;
+        let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+        crate::enhanced::local_priors::get_culler_sharpness_cutoff(&cam_key, "unknown_lens")
+    });
+    let min_sharpness = blur_threshold.or(learned_cutoff).unwrap_or(14.0);
     let check_blinks = reject_blinks.unwrap_or(true);
     let total_scanned = paths.len();
 

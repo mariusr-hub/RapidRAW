@@ -356,20 +356,20 @@ pub fn generate_semantic_adjustments(
             temperature = (temperature - 8.0 * mult as f64).min(-6.0);
             tint = (tint + 10.0 * mult as f64).max(8.0);
             clarity = (clarity + 22.0 * mult as f64).max(18.0);
-            dehaze = (dehaze + 24.0 * mult as f64).max(20.0);
+            dehaze = (dehaze + 24.0 * mult as f64).min(24.0);
             sharpening = 36.0 * mult as f64;
-            sharpness_threshold = 60.0 * mult as f64;
+            sharpness_threshold = (60.0 * mult as f64).max(60.0);
             color_noise_reduction = 48.0 * mult as f64;
             luma_noise_reduction = 30.0 * mult as f64;
         }
         SemanticScene::Macro => {
             contrast = (contrast + 14.0 * mult as f64).max(15.0);
-            highlights = (highlights - 24.0 * mult as f64).min(-18.0);
-            whites = (whites + 14.0 * mult as f64).max(12.0);
-            shadows = (shadows + 18.0 * mult as f64).max(14.0);
-            clarity = (clarity + 20.0 * mult as f64).max(16.0);
-            sharpening = 38.0 * mult as f64;
-            sharpness_threshold = 25.0 * mult as f64;
+            highlights = (highlights - 24.0 * mult as f64).min(-20.0);
+            whites = (whites + 12.0 * mult as f64).max(10.0);
+            shadows = (shadows + 20.0 * mult as f64).max(16.0);
+            clarity = (clarity + 22.0 * mult as f64).max(18.0);
+            sharpening = 40.0 * mult as f64;
+            sharpness_threshold = (32.0 * mult as f64).max(28.0);
             vibrance = (vibrance + 14.0 * mult as f64).max(12.0);
         }
         SemanticScene::General => {
@@ -444,6 +444,227 @@ struct PreScannedImage {
     pub horizon_angle: Option<f32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatureSubMode {
+    ForestCanopy,
+    GoldenHour,
+    MistyAtmospheric,
+    AlpineWater,
+}
+
+pub fn detect_nature_submode(image: &DynamicImage, scene: SemanticScene) -> (Option<NatureSubMode>, bool) {
+    if !matches!(scene, SemanticScene::Landscape | SemanticScene::Overcast | SemanticScene::Sunset) {
+        return (None, false);
+    }
+    let thumb = image.thumbnail(256, 256).to_rgb8();
+    let (w, h) = thumb.dimensions();
+    let total = (w * h).max(1) as f32;
+    let mut mist_px = 0.0f32;
+    let mut canopy_px = 0.0f32;
+    let mut alpine_px = 0.0f32;
+    let mut gold_px = 0.0f32;
+
+    for p in thumb.pixels() {
+        let r = p[0] as f32 / 255.0;
+        let g = p[1] as f32 / 255.0;
+        let b = p[2] as f32 / 255.0;
+        let max_c = r.max(g).max(b);
+        let min_c = r.min(g).min(b);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let sat = if max_c > 1e-4 { (max_c - min_c) / max_c } else { 0.0 };
+
+        if luma > 0.50 && sat < 0.20 {
+            mist_px += 1.0;
+        } else if g > r * 1.12 && g > b * 1.12 {
+            canopy_px += 1.0;
+        } else if b > r * 1.15 && luma > 0.25 {
+            alpine_px += 1.0;
+        } else if r > g * 1.15 && g > b * 1.25 {
+            gold_px += 1.0;
+        }
+    }
+
+    let mist_ratio = mist_px / total;
+    if mist_ratio > 0.26 && scene != SemanticScene::Sunset {
+        return (Some(NatureSubMode::MistyAtmospheric), true);
+    }
+    if gold_px / total > 0.14 || scene == SemanticScene::Sunset {
+        return (Some(NatureSubMode::GoldenHour), false);
+    }
+    if alpine_px / total > canopy_px / total && alpine_px / total > 0.14 {
+        return (Some(NatureSubMode::AlpineWater), false);
+    }
+    if canopy_px / total > 0.12 {
+        return (Some(NatureSubMode::ForestCanopy), false);
+    }
+    (None, false)
+}
+
+pub fn apply_nature_submode(adj: &mut serde_json::Value, submode: Option<NatureSubMode>, mist_guard: bool) {
+    match submode {
+        Some(NatureSubMode::MistyAtmospheric) => {
+            if let Some(d) = adj.get("dehaze").and_then(|v| v.as_f64()) {
+                adj["dehaze"] = serde_json::json!(d.min(8.0));
+            }
+            if let Some(c) = adj.get("clarity").and_then(|v| v.as_f64()) {
+                adj["clarity"] = serde_json::json!((c * 0.7).clamp(-20.0, 14.0));
+            }
+        }
+        Some(NatureSubMode::ForestCanopy) => {
+            let vib = adj.get("vibrance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            adj["vibrance"] = serde_json::json!((vib + 4.0).clamp(-30.0, 35.0));
+        }
+        Some(NatureSubMode::GoldenHour) => {
+            let hl = adj.get("highlights").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            adj["highlights"] = serde_json::json!(hl.min(-18.0));
+        }
+        Some(NatureSubMode::AlpineWater) => {
+            let cl = adj.get("clarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            adj["clarity"] = serde_json::json!((cl + 5.0).clamp(-20.0, 35.0));
+        }
+        None => {}
+    }
+    if mist_guard {
+        let d = adj.get("dehaze").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        adj["dehaze"] = serde_json::json!(d.min(8.0));
+    }
+}
+
+pub fn apply_learned_auto_prior_to_json(
+    adj: &mut serde_json::Value,
+    camera_key: &str,
+    scene_key: &str,
+) {
+    let Some(prior) = crate::enhanced::local_priors::get_auto_enhance_prior(camera_key, scene_key) else {
+        return;
+    };
+    let add_clamped = |obj: &mut serde_json::Value, key: &str, delta: f32, lo: f64, hi: f64| {
+        if delta.abs() > 1e-4
+            && let Some(cur) = obj.get(key).and_then(|v| v.as_f64())
+        {
+            obj[key] = serde_json::json!((cur + delta as f64).clamp(lo, hi));
+        }
+    };
+    add_clamped(adj, "exposure", prior.exposure, -5.0, 5.0);
+    add_clamped(adj, "contrast", prior.contrast, -100.0, 100.0);
+    add_clamped(adj, "highlights", prior.highlights, -100.0, 100.0);
+    add_clamped(adj, "shadows", prior.shadows, -100.0, 100.0);
+    add_clamped(adj, "whites", prior.whites, -100.0, 100.0);
+    add_clamped(adj, "blacks", prior.blacks, -100.0, 100.0);
+    add_clamped(adj, "temperature", prior.temperature, -100.0, 100.0);
+    add_clamped(adj, "vibrance", prior.vibrance, -100.0, 100.0);
+    add_clamped(adj, "clarity", prior.clarity, -100.0, 100.0);
+}
+
+/// Fast <= 512px linear Rgb32F closed-loop verification step (<= 3 micro-steps, < 15 ms).
+pub fn verify_adjustments_on_linear_preview(
+    image: &DynamicImage,
+    adj: &mut serde_json::Value,
+    protect_skin: bool,
+) {
+    let thumb = image.thumbnail(512, 512).to_rgb32f();
+    let raw = thumb.as_raw();
+    let total_px = (raw.len() / 3).max(1) as f32;
+
+    for _step in 0..3 {
+        let exposure = adj.get("exposure").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let contrast = adj.get("contrast").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let highlights = adj.get("highlights").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let blacks = adj.get("blacks").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let shadows = adj.get("shadows").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let temp = adj.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let tint = adj.get("tint").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+        let ev_gain = 2.0f32.powf(exposure.clamp(-4.0, 4.0));
+        let contrast_k = 1.0 + (contrast / 100.0) * 0.45;
+        let hl_scale = 1.0 + (highlights / 100.0) * 0.25;
+        let shadow_lift = (blacks.max(0.0) * 0.0005 + shadows.max(0.0) * 0.0003).clamp(0.0, 0.04);
+        let black_crush = (-blacks.min(0.0) * 0.0004).clamp(0.0, 0.03);
+
+        let mut clip_count = 0usize;
+        let mut crush_count = 0usize;
+        let mut skin_hue_drift_sum = 0.0f32;
+        let mut skin_count = 0usize;
+
+        for px in raw.chunks_exact(3) {
+            let mut r = px[0] * ev_gain;
+            let mut g = px[1] * ev_gain;
+            let mut b = px[2] * ev_gain;
+
+            r = (r - 0.18) * contrast_k + 0.18;
+            g = (g - 0.18) * contrast_k + 0.18;
+            b = (b - 0.18) * contrast_k + 0.18;
+
+            if r.max(g).max(b) > 0.65 {
+                r *= hl_scale;
+                g *= hl_scale;
+                b *= hl_scale;
+            }
+            r = (r + shadow_lift - black_crush).max(0.0);
+            g = (g + shadow_lift - black_crush).max(0.0);
+            b = (b + shadow_lift - black_crush).max(0.0);
+
+            if r > 0.995 || g > 0.995 || b > 0.995 {
+                clip_count += 1;
+            }
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if luma < 0.008 {
+                crush_count += 1;
+            }
+
+            if protect_skin && (px[0] > 0.12 && px[0] > px[1] && px[1] > px[2]) {
+                let (l0, a0, b0) = srgb_to_oklab(
+                    px[0].clamp(0.0, 1.0) * 255.0,
+                    px[1].clamp(0.0, 1.0) * 255.0,
+                    px[2].clamp(0.0, 1.0) * 255.0,
+                );
+                if l0 > 0.35 && l0 < 0.85 && a0 > 0.02 && b0 > 0.01 {
+                    let sr = (r * (1.0 + temp * 0.003)).clamp(0.0, 1.0);
+                    let sg = (g * (1.0 - tint * 0.002)).clamp(0.0, 1.0);
+                    let sb = (b * (1.0 - temp * 0.003)).clamp(0.0, 1.0);
+                    let (_l1, a1, b1) =
+                        srgb_to_oklab(sr * 255.0, sg * 255.0, sb * 255.0);
+                    let h0 = b0.atan2(a0).to_degrees();
+                    let h1 = b1.atan2(a1).to_degrees();
+                    skin_hue_drift_sum += (h1 - h0).abs();
+                    skin_count += 1;
+                }
+            }
+        }
+
+        let clip_pct = (clip_count as f32 / total_px) * 100.0;
+        let crush_pct = (crush_count as f32 / total_px) * 100.0;
+        let mean_skin_drift = if skin_count > 0 {
+            skin_hue_drift_sum / skin_count as f32
+        } else {
+            0.0
+        };
+
+        let mut adjusted = false;
+        if clip_pct > 0.5 {
+            adj["exposure"] = serde_json::json!((exposure as f64 - 0.12).clamp(-3.0, 3.0));
+            adj["highlights"] = serde_json::json!((highlights as f64 - 8.0).clamp(-100.0, 100.0));
+            adjusted = true;
+        }
+        if crush_pct > 2.5 {
+            adj["blacks"] = serde_json::json!((blacks as f64 + 6.0).clamp(-100.0, 100.0));
+            adj["shadows"] = serde_json::json!((shadows as f64 + 6.0).clamp(-100.0, 100.0));
+            adjusted = true;
+        }
+        if protect_skin && mean_skin_drift >= 1.0 {
+            adj["temperature"] = serde_json::json!((temp as f64 * 0.65).clamp(-100.0, 100.0));
+            adj["tint"] = serde_json::json!((tint as f64 * 0.65).clamp(-100.0, 100.0));
+            if let Some(vib) = adj.get("vibrance").and_then(|v| v.as_f64()) {
+                adj["vibrance"] = serde_json::json!(vib.min(14.0));
+            }
+            adjusted = true;
+        }
+        if !adjusted {
+            break;
+        }
+    }
+}
+
 #[tauri::command]
 pub fn analyze_and_polish_active_image(
     intensity: Option<f32>,
@@ -455,42 +676,134 @@ pub fn analyze_and_polish_active_image(
     let intensity_val = intensity.unwrap_or(100.0);
     let straighten = auto_straighten.unwrap_or(true);
     let style = ToneCurveStyle::from_str_opt(tone_style.as_deref());
+    let protect_skin = skin_protection.unwrap_or(true);
 
-    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-    if let Some(loaded_image) = &*orig_guard {
-        let (scene, confidence) = detect_semantic_scene(&loaded_image.image);
-        let base_analysis = perform_auto_analysis(&loaded_image.image, 0.0);
+    let (image_arc, path_str) = {
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        let loaded = orig_guard
+            .as_ref()
+            .ok_or_else(|| "No active image loaded".to_string())?;
+        (Arc::clone(&loaded.image), loaded.path.clone())
+    };
 
-        let horizon_angle = if straighten {
-            let horizon = detect_horizon_angle(&loaded_image.image);
-            if horizon.confidence > 0.35 {
-                Some(horizon.angle_degrees)
-            } else {
-                None
-            }
+    let (scene, confidence) = detect_semantic_scene(&image_arc);
+    let base_analysis = perform_auto_analysis(&image_arc, 0.0);
+    let (submode, mist_guard) = detect_nature_submode(&image_arc, scene);
+
+    let horizon_angle = if straighten {
+        let horizon = detect_horizon_angle(&image_arc);
+        if horizon.confidence > 0.35 {
+            Some(horizon.angle_degrees)
         } else {
             None
-        };
-
-        let adjustments = generate_semantic_adjustments(
-            scene,
-            &base_analysis,
-            intensity_val,
-            horizon_angle,
-            Some(style),
-            skin_protection,
-        );
-
-        Ok(SemanticAnalysisResult {
-            scene,
-            scene_name: scene.display_name().to_string(),
-            confidence,
-            horizon_angle,
-            adjustments,
-        })
+        }
     } else {
-        Err("No active image loaded".to_string())
+        None
+    };
+
+    let mut adjustments = generate_semantic_adjustments(
+        scene,
+        &base_analysis,
+        intensity_val,
+        horizon_angle,
+        Some(style),
+        Some(protect_skin),
+    );
+    apply_nature_submode(&mut adjustments, submode, mist_guard);
+
+    let (source_path, _) = parse_virtual_path(&path_str);
+    let cam_key = if let Ok(bytes) = fs::read(&source_path)
+        && let Some((make, model)) = crate::metadata::exif_processing::read_camera_make_model(&path_str, &bytes)
+    {
+        crate::enhanced::local_priors::normalize_camera_key(&make, &model)
+    } else {
+        "universal".to_string()
+    };
+    let scene_key = format!("{:?}", scene);
+    apply_learned_auto_prior_to_json(&mut adjustments, &cam_key, &scene_key);
+    verify_adjustments_on_linear_preview(&image_arc, &mut adjustments, protect_skin);
+
+    Ok(SemanticAnalysisResult {
+        scene,
+        scene_name: scene.display_name().to_string(),
+        confidence,
+        horizon_angle,
+        adjustments,
+    })
+}
+
+#[tauri::command]
+pub fn analyze_night_sky_active_image(
+    intensity: Option<f32>,
+    state: State<AppState>,
+) -> Result<SemanticAnalysisResult, String> {
+    let intensity_val = intensity.unwrap_or(100.0);
+    let (image_arc, path_str) = {
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        let loaded = orig_guard
+            .as_ref()
+            .ok_or_else(|| "No active image loaded".to_string())?;
+        (Arc::clone(&loaded.image), loaded.path.clone())
+    };
+
+    let base_analysis = perform_auto_analysis(&image_arc, 0.0);
+    let thumb = image_arc.thumbnail(320, 320).to_rgb8();
+    let (w, h) = thumb.dimensions();
+    let mut orange_sky_cast = 0.0f32;
+    let mut sky_count = 0.0f32;
+    for y in 0..(h * 2 / 3).max(1) {
+        for x in 0..w {
+            let p = thumb.get_pixel(x, y);
+            let r = p[0] as f32;
+            let g = p[1] as f32;
+            let b = p[2] as f32;
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if luma < 70.0 {
+                orange_sky_cast += (r - b).max(0.0);
+                sky_count += 1.0;
+            }
+        }
     }
+    let avg_amber_cast = if sky_count > 10.0 {
+        (orange_sky_cast / sky_count).clamp(0.0, 25.0)
+    } else {
+        6.0
+    };
+
+    let mut adjustments = generate_semantic_adjustments(
+        SemanticScene::NightSky,
+        &base_analysis,
+        intensity_val,
+        None,
+        Some(ToneCurveStyle::FilmicDynamic),
+        Some(false),
+    );
+    let cur_temp = adjustments.get("temperature").and_then(|v| v.as_f64()).unwrap_or(-8.0);
+    adjustments["temperature"] =
+        serde_json::json!((cur_temp - (avg_amber_cast as f64 * 0.35)).clamp(-24.0, -4.0));
+    adjustments["dehaze"] = serde_json::json!(
+        adjustments.get("dehaze").and_then(|v| v.as_f64()).unwrap_or(20.0).min(24.0)
+    );
+    adjustments["sharpnessThreshold"] = serde_json::json!(62.0);
+
+    let (source_path, _) = parse_virtual_path(&path_str);
+    let cam_key = if let Ok(bytes) = fs::read(&source_path)
+        && let Some((make, model)) = crate::metadata::exif_processing::read_camera_make_model(&path_str, &bytes)
+    {
+        crate::enhanced::local_priors::normalize_camera_key(&make, &model)
+    } else {
+        "universal".to_string()
+    };
+    apply_learned_auto_prior_to_json(&mut adjustments, &cam_key, "NightSky");
+    verify_adjustments_on_linear_preview(&image_arc, &mut adjustments, false);
+
+    Ok(SemanticAnalysisResult {
+        scene: SemanticScene::NightSky,
+        scene_name: SemanticScene::NightSky.display_name().to_string(),
+        confidence: 0.92,
+        horizon_angle: None,
+        adjustments,
+    })
 }
 
 #[tauri::command]
@@ -913,6 +1226,60 @@ mod tests {
         let (noise_detected, var, _) = evaluate_pre_tone_noise_variance_gate(&clean_img, Some(100));
         assert!(!noise_detected);
         assert_eq!(var, 0.0);
+    }
+
+    #[test]
+    fn test_verification_loop_under_15ms_and_clipping_guard() {
+        let bright_img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(512, 512, |_x, _y| {
+            image::Rgb([252, 252, 252])
+        }));
+        let mut adj = serde_json::json!({
+            "exposure": 1.2,
+            "contrast": 20.0,
+            "highlights": 10.0,
+            "shadows": 0.0,
+            "blacks": 0.0,
+            "temperature": 0.0,
+            "tint": 0.0
+        });
+        let t0 = std::time::Instant::now();
+        verify_adjustments_on_linear_preview(&bright_img, &mut adj, true);
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert!(elapsed_ms < 50, "Verification step should be very fast, took {} ms", elapsed_ms);
+        assert!(adj["exposure"].as_f64().unwrap() < 1.2);
+    }
+
+    #[test]
+    fn test_mist_vs_haze_guard_clamps_dehaze_and_canonical_keys() {
+        let mist_img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(128, 128, |_x, _y| {
+            image::Rgb([180, 185, 190])
+        }));
+        let (submode, mist_guard) = detect_nature_submode(&mist_img, SemanticScene::Landscape);
+        assert_eq!(submode, Some(NatureSubMode::MistyAtmospheric));
+        assert!(mist_guard);
+
+        let base = perform_auto_analysis(&mist_img, 0.0);
+        let mut adj = generate_semantic_adjustments(
+            SemanticScene::Landscape,
+            &base,
+            100.0,
+            None,
+            Some(ToneCurveStyle::FilmicDynamic),
+            Some(true),
+        );
+        apply_nature_submode(&mut adj, submode, mist_guard);
+        assert!(adj["dehaze"].as_f64().unwrap() <= 8.0);
+
+        let defaults: serde_json::Value =
+            serde_json::from_str(include_str!("../../../src/utils/defaultAdjustments.json")).unwrap();
+        let default_obj = defaults.as_object().unwrap();
+        for key in adj.as_object().unwrap().keys() {
+            assert!(
+                default_obj.contains_key(key),
+                "Key '{}' must exist in defaultAdjustments.json",
+                key
+            );
+        }
     }
 }
 

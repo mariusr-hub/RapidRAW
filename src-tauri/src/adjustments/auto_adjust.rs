@@ -304,6 +304,27 @@ pub fn calculate_auto_adjustments(
     let exposure =
         effective_baseline_exposure(&js_adjustments, loaded_image.as_shot, render.baseline);
     let results = perform_auto_analysis(&loaded_image.image, exposure);
+    let mut json = auto_results_to_json(&results, mode.unwrap_or_default());
 
-    Ok(auto_results_to_json(&results, mode.unwrap_or_default()))
+    let (source_path, _) = crate::library::sidecars::parse_virtual_path(&loaded_image.path);
+    let cam_key = if let Ok(bytes) = std::fs::read(&source_path)
+        && let Some((make, model)) =
+            crate::metadata::exif_processing::read_camera_make_model(&loaded_image.path, &bytes)
+    {
+        crate::enhanced::local_priors::normalize_camera_key(&make, &model)
+    } else {
+        "universal".to_string()
+    };
+    crate::enhanced::semantic_auto_polish::apply_learned_auto_prior_to_json(
+        &mut json,
+        &cam_key,
+        "general",
+    );
+    crate::enhanced::semantic_auto_polish::verify_adjustments_on_linear_preview(
+        &loaded_image.image,
+        &mut json,
+        true,
+    );
+
+    Ok(json)
 }

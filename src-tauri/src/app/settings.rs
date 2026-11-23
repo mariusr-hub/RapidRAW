@@ -815,6 +815,12 @@ pub struct AppSettings {
     pub slider_reset_target: Option<String>,
     #[serde(default)]
     pub auto_analyze_on_open: Option<bool>,
+    #[serde(default = "default_enable_local_adaptive_learning")]
+    pub enable_local_adaptive_learning: Option<bool>,
+}
+
+fn default_enable_local_adaptive_learning() -> Option<bool> {
+    Some(true)
 }
 
 const UI_SCALE_MIN: f64 = 0.5;
@@ -1010,6 +1016,7 @@ impl Default for AppSettings {
             develop_defaults: Default::default(),
             slider_reset_target: None,
             auto_analyze_on_open: Some(false),
+            enable_local_adaptive_learning: default_enable_local_adaptive_learning(),
         }
     }
 }

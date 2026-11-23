@@ -1099,6 +1099,36 @@ function BasicAdjustments({
                   <div className="border-t border-border-color/50 my-1" />
                   <button
                     type="button"
+                    onClick={async () => {
+                      setIsAstroMenuOpen(false);
+                      try {
+                        const current = useEditorStore.getState().adjustments;
+                        const res: any = await invoke(Invokes.AnalyzeNightSkyActiveImage, { intensity: 100 });
+                        if (res?.adjustments) {
+                          setDetectedSceneBadge(res.sceneName || 'Night Sky');
+                          const next = { ...current, ...res.adjustments };
+                          setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, ...res.adjustments }));
+                          useEditorStore.getState().setEditor({
+                            pendingAutoEdit: {
+                              path: selectedImage?.path ?? '',
+                              scene: res.sceneName || 'Night Sky',
+                              previousAdjustments: current,
+                            },
+                          });
+                          useEditorStore.getState().pushHistory(next, 'Night Sky Auto');
+                        }
+                      } catch (err) {
+                        console.error('Night Sky Auto error:', err);
+                        handleNightSkyMagic(selectedAstroScene);
+                      }
+                    }}
+                    className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-left hover:bg-surface/80 text-accent font-medium transition-colors"
+                    title="Analyzes star density & light pollution cast on the active photo (100% local)"
+                  >
+                    <span className="truncate">Night Sky Auto (AI Polish)</span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={handleRemoveLightPollution}
                     className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-left hover:bg-surface/80 text-amber-400 font-medium transition-colors"
                     title="Extracts and subtracts 2D polynomial background light pollution gradient"

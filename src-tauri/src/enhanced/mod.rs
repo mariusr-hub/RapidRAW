@@ -27,6 +27,7 @@ pub mod hdr_panorama;
 pub mod hdr_presets;
 pub mod hero_curator;
 pub mod hugin_engine;
+pub mod local_priors;
 pub mod negative_conversion;
 pub mod panorama_utils;
 pub mod photographic_critic;

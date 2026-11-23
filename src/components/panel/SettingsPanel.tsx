@@ -44,6 +44,7 @@ import { ThemeProps, THEMES, DEFAULT_THEME_ID } from '../../utils/themes';
 import { getDefaultWgpuRendererSetting } from '../../utils/wgpuRenderer';
 import { useTranslation } from 'react-i18next';
 import { Invokes } from '../../types/invokes';
+import type { AppSettings } from '../../types/settings';
 import {
   formatKeyCode,
   getDefaultCombo,
@@ -240,6 +241,127 @@ const KeybindRow = ({
             </Text>
           )}
         </button>
+      </div>
+    </div>
+  );
+};
+
+const LocalSmartCalibrationCard = ({
+  appSettings,
+  onSettingsChange,
+}: {
+  appSettings: AppSettings;
+  onSettingsChange: (s: AppSettings) => void;
+}) => {
+  const [summary, setSummary] = useState<{
+    enabled: boolean;
+    totalSamples: number;
+    autoEnhanceProfiles: number;
+    autoEnhanceSamples: number;
+    denoiseSamples: number;
+    dustSpotsTracked: number;
+    cullerProfiles: number;
+    negativeConfirmed: number;
+    cameraKeys: string[];
+  } | null>(null);
+  const [confirmingReset, setConfirmingReset] = useState(false);
+
+  const refreshSummary = useCallback(() => {
+    invoke<typeof summary>(Invokes.GetLocalPriorsSummary)
+      .then((res) => setSummary(res))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshSummary();
+  }, [refreshSummary, appSettings?.enableLocalAdaptiveLearning]);
+
+  const enabled = appSettings?.enableLocalAdaptiveLearning ?? true;
+
+  return (
+    <div className="p-6 bg-surface rounded-xl shadow-md space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <Text variant={TextVariants.title} color={TextColors.accent}>
+            Local Smart Calibration
+          </Text>
+          <Text variant={TextVariants.small} className="mt-1">
+            100% offline / on-device priors learned only from confirmed Exports, 4★+ ratings, Pick/Reject flags, and retained dust fixes.
+          </Text>
+        </div>
+        <span className="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px] font-mono">
+          100% Offline
+        </span>
+      </div>
+
+      <Switch
+        checked={enabled}
+        id="local-adaptive-learning-toggle"
+        label="Enable Local Adaptive Learning"
+        onChange={(checked) =>
+          onSettingsChange({ ...appSettings, enableLocalAdaptiveLearning: checked })
+        }
+      />
+
+      {summary && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs bg-bg-primary/60 p-3 rounded-lg border border-border-color/40">
+          <div>
+            <span className="text-text-secondary">Confirmed Samples:</span>{' '}
+            <span className="font-mono font-semibold text-text-primary">{summary.totalSamples}</span>
+          </div>
+          <div>
+            <span className="text-text-secondary">Auto-Enhance:</span>{' '}
+            <span className="font-mono font-semibold text-text-primary">{summary.autoEnhanceSamples}</span>
+          </div>
+          <div>
+            <span className="text-text-secondary">Denoise Priors:</span>{' '}
+            <span className="font-mono font-semibold text-text-primary">{summary.denoiseSamples}</span>
+          </div>
+          <div>
+            <span className="text-text-secondary">Dust Coords:</span>{' '}
+            <span className="font-mono font-semibold text-text-primary">{summary.dustSpotsTracked}</span>
+          </div>
+          <div>
+            <span className="text-text-secondary">Culler Profiles:</span>{' '}
+            <span className="font-mono font-semibold text-text-primary">{summary.cullerProfiles}</span>
+          </div>
+          <div>
+            <span className="text-text-secondary">Cameras:</span>{' '}
+            <span className="font-mono font-semibold text-text-primary">{summary.cameraKeys.length}</span>
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-2">
+        {confirmingReset ? (
+          <>
+            <button
+              type="button"
+              onClick={() => setConfirmingReset(false)}
+              className="px-3 py-1.5 rounded-md text-xs text-text-secondary hover:bg-card-active transition-colors"
+            >
+              Cancel
+            </button>
+            <Button
+              variant="secondary"
+              onClick={async () => {
+                try {
+                  const res = await invoke<typeof summary>(Invokes.ResetLocalPriors, {});
+                  setSummary(res);
+                } finally {
+                  setConfirmingReset(false);
+                }
+              }}
+            >
+              Confirm Reset Learned Data
+            </Button>
+          </>
+        ) : (
+          <Button variant="secondary" onClick={() => setConfirmingReset(true)}>
+            <Trash2 size={14} className="mr-1.5" />
+            Reset Learned Data
+          </Button>
+        )}
       </div>
     </div>
   );
@@ -1888,6 +2010,13 @@ export default function SettingsPanel({
                       </SettingItem>
                     </div>
                   </div>
+
+                  {appSettings && (
+                    <LocalSmartCalibrationCard
+                      appSettings={appSettings}
+                      onSettingsChange={onSettingsChange}
+                    />
+                  )}
 
                   <div className="p-6 bg-surface rounded-xl shadow-md">
                     <Text variant={TextVariants.title} color={TextColors.accent} className="mb-4">

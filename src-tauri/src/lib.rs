@@ -262,11 +262,19 @@ pub fn run() {
             }
 
             if let Ok(cache_dir) = app_handle.path().app_cache_dir() {
+                crate::enhanced::auto_tune_loop::init_calibration_vault_path(cache_dir.clone());
                 crate::ai::denoise::initialize_cache_dir(&cache_dir);
                 crate::ai::upscale::initialize_cache_dir(&cache_dir);
                 crate::effects::maps::initialize_cache_dir(cache_dir.clone());
                 crate::metadata::exif_cache::initialize_cache_dir(cache_dir.clone());
                 crate::app::storage::initialize_thumbnail_cache(cache_dir);
+            }
+            if let Ok(app_data) = crate::app::settings::resolved_app_data_dir(&app_handle) {
+                let learning_enabled = crate::app::settings::load_settings(app_handle.clone())
+                    .ok()
+                    .and_then(|s| s.enable_local_adaptive_learning)
+                    .unwrap_or(true);
+                crate::enhanced::local_priors::init_local_priors_path(app_data, learning_enabled);
             }
 
             {
@@ -851,7 +859,12 @@ pub fn run() {
             enhanced::negative_conversion::convert_negatives,
             enhanced::photographic_critic::get_photographic_critic_report,
             enhanced::semantic_auto_polish::analyze_and_polish_active_image,
+            enhanced::semantic_auto_polish::analyze_night_sky_active_image,
             enhanced::semantic_auto_polish::batch_polish_photoshoot,
+            enhanced::local_priors::get_local_priors_summary,
+            enhanced::local_priors::reset_local_priors,
+            enhanced::local_priors::record_dust_spot_rejection,
+            enhanced::local_priors::record_auto_edit_rejection,
             enhanced::sky_sculptor::apply_ai_sky_sculpt,
             enhanced::speed_culler::analyze_culling_frame,
             enhanced::speed_culler::batch_auto_triage_cull,
