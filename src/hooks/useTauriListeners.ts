@@ -405,19 +405,40 @@ export function useTauriListeners({
             errorMessage: typeof event.payload === 'string' ? event.payload : 'Unknown error',
           });
       }),
-      listen<{ path: string; progress: number }>('ai-denoise-progress', (event) => {
+      listen<{
+        path: string;
+        progress: number;
+        stage?: string;
+        provider?: string;
+        tileIndex?: number;
+        totalTiles?: number;
+        etaSec?: number;
+      }>('ai-denoise-progress', (event) => {
         if (!isEffectActive) return;
-        const { path, progress } = event.payload;
-        useEditorStore
-          .getState()
-          .setEditor((state) => ({ aiDenoiseProgress: { ...state.aiDenoiseProgress, [path]: progress } }));
+        const { path, progress, stage, provider, tileIndex, totalTiles, etaSec } = event.payload;
+        useEditorStore.getState().setEditor((state) => ({
+          aiDenoiseProgress: { ...state.aiDenoiseProgress, [path]: progress },
+          aiDenoiseMeta: {
+            ...state.aiDenoiseMeta,
+            [path]: {
+              ...state.aiDenoiseMeta[path],
+              ...(stage !== undefined ? { stage } : {}),
+              ...(provider !== undefined ? { provider } : {}),
+              ...(tileIndex !== undefined ? { tileIndex } : {}),
+              ...(totalTiles !== undefined ? { totalTiles } : {}),
+              ...(etaSec !== undefined ? { etaSec } : {}),
+            },
+          },
+        }));
       }),
       listen<string>('ai-denoise-ready', (event) => {
         if (!isEffectActive) return;
         useEditorStore.getState().setEditor((state) => {
           const { [event.payload]: _, ...aiDenoiseProgress } = state.aiDenoiseProgress;
+          const { [event.payload]: _meta, ...aiDenoiseMeta } = state.aiDenoiseMeta;
           return {
             aiDenoiseProgress,
+            aiDenoiseMeta,
             ...(state.selectedImage?.path === event.payload ? { adjustments: { ...state.adjustments } } : {}),
           };
         });
@@ -425,11 +446,15 @@ export function useTauriListeners({
       listen<{ path: string; error: string }>('ai-denoise-error', (event) => {
         if (!isEffectActive) return;
         const { path, error } = event.payload;
-        toast.error(`AI denoise failed: ${error}`);
+        if (!error.toLowerCase().includes('cancelled')) {
+          toast.error(`AI denoise failed: ${error}`);
+        }
         useEditorStore.getState().setEditor((state) => {
           const { [path]: _, ...aiDenoiseProgress } = state.aiDenoiseProgress;
+          const { [path]: _meta, ...aiDenoiseMeta } = state.aiDenoiseMeta;
           return {
             aiDenoiseProgress,
+            aiDenoiseMeta,
             ...(state.selectedImage?.path === path
               ? { adjustments: { ...state.adjustments, aiDenoiseEnabled: false } }
               : {}),

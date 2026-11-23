@@ -336,6 +336,7 @@ pub struct AppState {
     pub gpu_processor: Mutex<Option<GpuProcessorState>>,
     pub ai_state: Mutex<Option<AiState>>,
     pub ai_init_lock: TokioMutex<()>,
+    pub ai_denoise_cancel: Arc<AtomicBool>,
     pub active_ai_tasks: Mutex<HashMap<String, Arc<AiTaskToken>>>,
     pub export_task_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub merge_session: Arc<Mutex<Option<Box<dyn MergeSession>>>>,

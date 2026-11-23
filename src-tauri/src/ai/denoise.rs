@@ -8,8 +8,9 @@ use image::{DynamicImage, GenericImageView, Rgb32FImage, imageops};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const MODEL_TAG: &str = "nind-v7";
 const BM3D_TAG: &str = "bm3d-v4";
@@ -389,21 +390,117 @@ fn restore_low_frequencies(denoised: &mut Rgb32FImage, source: &Rgb32FImage) {
         });
 }
 
-fn run_denoiser(
+fn emit_denoise_progress(
+    app_handle: &tauri::AppHandle,
+    path: &str,
+    tp: &crate::ai::tiling::TileProgress,
+) {
+    let _ = app_handle.emit(
+        "ai-denoise-progress",
+        serde_json::json!({
+            "path": path,
+            "progress": tp.progress,
+            "stage": tp.stage,
+            "provider": tp.provider,
+            "tileIndex": tp.tile_index,
+            "totalTiles": tp.total_tiles,
+            "etaSec": tp.eta_sec,
+        }),
+    );
+}
+
+fn run_denoiser_with_control(
+    app_handle: &tauri::AppHandle,
+    path: &str,
     base: &DynamicImage,
     session: Option<&Session>,
-    on_progress: &(dyn Fn(f32) + Sync),
+    _on_progress: &(dyn Fn(f32) + Sync),
 ) -> Result<Rgb32FImage, String> {
+    let state = app_handle.state::<AppState>();
+    let cancel = Arc::clone(&state.ai_denoise_cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return Err("AI denoise cancelled".to_string());
+    }
+
     let source = base.to_rgb32f();
     let mut output = match session {
         Some(session) => {
-            let mut output = crate::ai::tiling::run_ai_denoise(&source, session, on_progress)
-                .map_err(|e| e.to_string())?
-                .into_rgb32f();
+            let is_gpu = crate::ai::models::is_gpu_active();
+            let first_attempt = crate::ai::tiling::run_ai_denoise_with_control(
+                &source,
+                session,
+                Some(&cancel),
+                is_gpu,
+                &|tp| emit_denoise_progress(app_handle, path, &tp),
+            );
+
+            let dyn_out = match first_attempt {
+                Ok(img) => img,
+                Err(err)
+                    if is_gpu
+                        && !cancel.load(Ordering::Relaxed)
+                        && (err.to_string().contains("DIRECTML_FIRST_TILE_SLOW")
+                            || !crate::ai::models::is_gpu_active()) =>
+                {
+                    log::warn!(
+                        "DirectML AI denoise stalled/failed ({}); retrying on CPU ONNX.",
+                        err
+                    );
+                    let _ = app_handle.emit(
+                        "ai-denoise-progress",
+                        serde_json::json!({
+                            "path": path,
+                            "progress": 0.0f32,
+                            "stage": "DirectML stalled — switching to CPU...",
+                            "provider": "CPU (Fallback)",
+                        }),
+                    );
+                    let cpu_session = tauri::async_runtime::block_on(
+                        crate::ai::models::force_cpu_denoise_model(
+                            app_handle,
+                            &state.ai_state,
+                            &state.ai_init_lock,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    crate::ai::tiling::run_ai_denoise_with_control(
+                        &source,
+                        &cpu_session,
+                        Some(&cancel),
+                        false,
+                        &|tp| emit_denoise_progress(app_handle, path, &tp),
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+                Err(err) => return Err(err.to_string()),
+            };
+
+            let mut output = dyn_out.into_rgb32f();
             remove_tile_grid(&mut output);
             output
         }
-        None => crate::ai::bm3d::denoise(&source, BM3D_INTENSITY, on_progress),
+        None => {
+            let _ = app_handle.emit(
+                "ai-denoise-progress",
+                serde_json::json!({
+                    "path": path,
+                    "progress": 0.05f32,
+                    "stage": "Running BM3D wavelet denoise...",
+                    "provider": "CPU (BM3D)",
+                }),
+            );
+            crate::ai::bm3d::denoise(&source, BM3D_INTENSITY, &|p| {
+                let _ = app_handle.emit(
+                    "ai-denoise-progress",
+                    serde_json::json!({
+                        "path": path,
+                        "progress": p,
+                        "stage": "Running BM3D wavelet denoise...",
+                        "provider": "CPU (BM3D)",
+                    }),
+                );
+            })
+        }
     };
 
     output
@@ -417,12 +514,27 @@ fn run_denoiser(
 
 async fn load_session(
     app_handle: tauri::AppHandle,
+    path: String,
     method: DenoiseMethod,
 ) -> Result<Option<Session>, String> {
     if method != DenoiseMethod::Nind {
         return Ok(None);
     }
     let state = app_handle.state::<AppState>();
+    let provider = if crate::ai::models::gpu_acceleration_enabled(&app_handle) {
+        "DirectML GPU"
+    } else {
+        "CPU"
+    };
+    let _ = app_handle.emit(
+        "ai-denoise-progress",
+        serde_json::json!({
+            "path": path,
+            "progress": 0.0f32,
+            "stage": "Loading NIND neural model...",
+            "provider": provider,
+        }),
+    );
     crate::ai::models::get_or_init_denoise_model(&app_handle, &state.ai_state, &state.ai_init_lock)
         .await
         .map(Some)
@@ -438,6 +550,9 @@ pub fn ensure_generated(
         return;
     }
 
+    let state = app_handle.state::<AppState>();
+    state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+
     let source = source_string(&loaded_image.path);
     let method = DenoiseMethod::from_adjustments(adjustments);
     let Some(job) = CACHE.job(
@@ -447,14 +562,18 @@ pub fn ensure_generated(
     ) else {
         return;
     };
-    let session = load_session(app_handle.clone(), method);
+    let session = load_session(app_handle.clone(), loaded_image.path.clone(), method);
+    let run_handle = app_handle.clone();
+    let run_path = loaded_image.path.clone();
     CACHE.spawn(
         app_handle,
         loaded_image,
         job,
         true,
         session,
-        |session, base, progress| run_denoiser(base, session.as_ref(), progress),
+        move |session, base, progress| {
+            run_denoiser_with_control(&run_handle, &run_path, base, session.as_ref(), progress)
+        },
     );
 }
 
@@ -476,15 +595,26 @@ pub fn generate_for_base(
     base: &DynamicImage,
     method: DenoiseMethod,
 ) -> Result<bool, String> {
+    let state = app_handle.state::<AppState>();
+    state.ai_denoise_cancel.store(false, Ordering::SeqCst);
     let key = entry_key(&source_string(path), method.tag());
+    let run_handle = app_handle.clone();
+    let run_path = path.to_string();
     CACHE.generate_blocking(
         app_handle,
         path,
         base,
         key,
-        load_session(app_handle.clone(), method),
-        |session, base, progress| run_denoiser(base, session.as_ref(), progress),
+        load_session(app_handle.clone(), path.to_string(), method),
+        move |session, base, progress| {
+            run_denoiser_with_control(&run_handle, &run_path, base, session.as_ref(), progress)
+        },
     )
+}
+
+#[tauri::command]
+pub fn cancel_ai_denoise(state: tauri::State<'_, AppState>) {
+    state.ai_denoise_cancel.store(true, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -588,4 +718,146 @@ fn box_filter(buf: &mut [f32], w: usize, h: usize, ch: usize, before: usize, aft
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "Benchmarks NIND ONNX DirectML vs CPU single-tile throughput using local model"]
+    fn bench_nind_single_tile_dml_vs_cpu() {
+        use ndarray::Array4;
+        use ort::execution_providers::CPUExecutionProvider;
+        use ort::session::{builder::GraphOptimizationLevel, Session};
+        use ort::value::Tensor;
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let appdata = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .expect("APPDATA env var missing");
+        let model_path = appdata
+            .join("io.github.CyberTimon.RapidRAW")
+            .join("models")
+            .join("nind_denoise_utnet_684.onnx");
+        assert!(
+            model_path.exists(),
+            "NIND model not found at {}",
+            model_path.display()
+        );
+
+        let _ = ort::init().with_name("AI-Denoise-Bench").commit();
+        let device_id = crate::ai::models::high_performance_dml_device_id().unwrap_or(0);
+        println!(
+            "=== NIND Benchmark ===\nModel: {}\nDirectML device_id: {}",
+            model_path.display(),
+            device_id
+        );
+
+        // 1. DirectML benchmark with 25s watchdog
+        let dml_model_path = model_path.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res: Result<(u128, u128, u128), String> = (|| {
+                #[cfg(target_os = "windows")]
+                let ep = ort::execution_providers::DirectMLExecutionProvider::default()
+                    .with_device_id(device_id)
+                    .build();
+                #[cfg(not(target_os = "windows"))]
+                let ep = CPUExecutionProvider::default().build();
+                let cpu_ep = CPUExecutionProvider::default()
+                    .with_arena_allocator(false)
+                    .build();
+
+                let t0 = Instant::now();
+                let mut sess = Session::builder()
+                    .map_err(|e| e.to_string())?
+                    .with_memory_pattern(false)
+                    .map_err(|e| e.to_string())?
+                    .with_parallel_execution(false)
+                    .map_err(|e| e.to_string())?
+                    .with_config_entry("ep.dml.disable_memory_arena", "1")
+                    .map_err(|e| e.to_string())?
+                    .with_execution_providers([ep, cpu_ep])
+                    .map_err(|e| e.to_string())?
+                    .commit_from_file(&dml_model_path)
+                    .map_err(|e| e.to_string())?;
+                let init_ms = t0.elapsed().as_millis();
+
+                let t1_in = Array4::<f32>::from_elem((1, 3, 504, 504), 0.25);
+                let t1_start = Instant::now();
+                let out1 = sess
+                    .run(ort::inputs![Tensor::from_array(t1_in).map_err(|e| e.to_string())?])
+                    .map_err(|e| e.to_string())?;
+                drop(out1);
+                let tile1_ms = t1_start.elapsed().as_millis();
+
+                let t2_in = Array4::<f32>::from_elem((1, 3, 504, 504), 0.35);
+                let t2_start = Instant::now();
+                let out2 = sess
+                    .run(ort::inputs![Tensor::from_array(t2_in).map_err(|e| e.to_string())?])
+                    .map_err(|e| e.to_string())?;
+                drop(out2);
+                let tile2_ms = t2_start.elapsed().as_millis();
+
+                Ok((init_ms, tile1_ms, tile2_ms))
+            })();
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(25)) {
+            Ok(Ok((init_ms, tile1_ms, tile2_ms))) => {
+                println!(
+                    "[DirectML + parallel_execution(false)] init={} ms, tile1={} ms, tile2={} ms",
+                    init_ms, tile1_ms, tile2_ms
+                );
+            }
+            Ok(Err(err)) => {
+                println!("[DirectML] error: {}", err);
+            }
+            Err(_) => {
+                println!("[DirectML] TIMED OUT after 25000 ms (watchdog triggered)");
+            }
+        }
+
+        // 2. CPU benchmark (intra=4, inter=1, Level3)
+        let t0 = Instant::now();
+        let cpu_ep = CPUExecutionProvider::default()
+            .with_arena_allocator(true)
+            .build();
+        let mut cpu_sess = Session::builder()
+            .unwrap()
+            .with_intra_threads(4)
+            .unwrap()
+            .with_inter_threads(1)
+            .unwrap()
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .unwrap()
+            .with_execution_providers([cpu_ep])
+            .unwrap()
+            .commit_from_file(&model_path)
+            .unwrap();
+        let cpu_init_ms = t0.elapsed().as_millis();
+
+        let t1_in = Array4::<f32>::from_elem((1, 3, 504, 504), 0.25);
+        let t1_start = Instant::now();
+        let out1 = cpu_sess
+            .run(ort::inputs![Tensor::from_array(t1_in).unwrap()])
+            .unwrap();
+        drop(out1);
+        let cpu_tile1_ms = t1_start.elapsed().as_millis();
+
+        let t2_in = Array4::<f32>::from_elem((1, 3, 504, 504), 0.35);
+        let t2_start = Instant::now();
+        let out2 = cpu_sess
+            .run(ort::inputs![Tensor::from_array(t2_in).unwrap()])
+            .unwrap();
+        drop(out2);
+        let cpu_tile2_ms = t2_start.elapsed().as_millis();
+
+        println!(
+            "[CPU intra=4 inter=1 Level3] init={} ms, tile1={} ms, tile2={} ms",
+            cpu_init_ms, cpu_tile1_ms, cpu_tile2_ms
+        );
+    }
 }

@@ -119,6 +119,16 @@ interface EditorState {
   isGeneratingAiMask: boolean;
   isGeneratingAi: boolean;
   aiDenoiseProgress: Record<string, number>;
+  aiDenoiseMeta: Record<
+    string,
+    {
+      stage?: string;
+      provider?: string;
+      tileIndex?: number;
+      totalTiles?: number;
+      etaSec?: number;
+    }
+  >;
   aiUpscaleProgress: Record<string, number>;
   isAIConnectorConnected: boolean;
   wgpuPhase: WgpuPhase;
@@ -257,6 +267,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   isAIConnectorConnected: false,
   isGeneratingAi: false,
   aiDenoiseProgress: {},
+  aiDenoiseMeta: {},
   aiUpscaleProgress: {},
   isMaskControlHovered: false,
   wgpuPhase: 'hidden',

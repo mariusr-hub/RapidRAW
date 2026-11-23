@@ -584,6 +584,14 @@ fn create_session(
     if use_gpu || kind == SessionKind::OneShot {
         builder = builder.with_memory_pattern(false)?;
     }
+    if use_gpu {
+        builder = builder.with_parallel_execution(false)?;
+    } else {
+        builder = builder
+            .with_intra_threads(4)?
+            .with_inter_threads(1)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+    }
     if use_gpu && kind == SessionKind::OneShot {
         builder = builder.with_config_entry("ep.dml.disable_memory_arena", "1")?;
     }
@@ -602,6 +610,17 @@ fn create_session(
         }
         None => Ok(builder.commit_from_file(model_path)?),
     }
+}
+
+pub fn mark_gpu_failed() {
+    let prev = GPU_STATUS.swap(GPU_FAILED, Ordering::AcqRel);
+    if prev != GPU_FAILED && prev != GPU_DISABLED {
+        log::warn!("Marking GPU AI execution as failed; switching to CPU ONNX backend.");
+    }
+}
+
+pub fn is_gpu_active() -> bool {
+    GPU_STATUS.load(Ordering::Acquire) < GPU_FAILED
 }
 
 fn build_session(
@@ -624,8 +643,23 @@ fn build_session_with_dims(
         && GPU_STATUS.load(Ordering::Acquire) < GPU_FAILED
         && let Some(gpu_provider) = gpu_execution_provider()
     {
-        match create_session(model_path, kind, Some(gpu_provider), gpu_patch, fixed_dims) {
-            Ok(session) => {
+        let owned_path = model_path.to_path_buf();
+        let owned_dims: Vec<(String, i64)> = fixed_dims
+            .iter()
+            .map(|&(name, size)| (name.to_string(), size))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dim_refs: Vec<(&str, i64)> = owned_dims
+                .iter()
+                .map(|(name, size)| (name.as_str(), *size))
+                .collect();
+            let res = create_session(&owned_path, kind, Some(gpu_provider), gpu_patch, &dim_refs);
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(25)) {
+            Ok(Ok(session)) => {
                 let _ = GPU_STATUS.compare_exchange(
                     GPU_IDLE,
                     GPU_ACTIVE,
@@ -634,11 +668,18 @@ fn build_session_with_dims(
                 );
                 return Ok(session);
             }
-            Err(e) => log::warn!(
+            Ok(Err(e)) => log::warn!(
                 "GPU acceleration unavailable for {}, falling back to CPU: {}",
                 model_path.display(),
                 e
             ),
+            Err(_) => {
+                log::warn!(
+                    "DirectML session initialization timed out after 25s for {}, falling back to CPU",
+                    model_path.display()
+                );
+                mark_gpu_failed();
+            }
         }
     }
     create_session(model_path, kind, None, None, fixed_dims)
@@ -910,6 +951,20 @@ pub async fn get_or_init_denoise_model(
         .denoise_model = Some(denoise_model.clone());
 
     Ok(denoise_model)
+}
+
+pub async fn force_cpu_denoise_model(
+    app_handle: &tauri::AppHandle,
+    ai_state_mutex: &Mutex<Option<AiState>>,
+    ai_init_lock: &TokioMutex<()>,
+) -> Result<Arc<Mutex<Session>>> {
+    mark_gpu_failed();
+    if let Ok(mut guard) = ai_state_mutex.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        state.denoise_model = None;
+    }
+    get_or_init_denoise_model(app_handle, ai_state_mutex, ai_init_lock).await
 }
 
 pub async fn get_or_init_upscale_model(

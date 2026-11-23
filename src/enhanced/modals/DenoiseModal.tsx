@@ -37,10 +37,14 @@ import { useEditorStore } from '../../store/useEditorStore';
 import { Invokes } from '../../components/ui/AppProperties';
 import { useSettingsStore } from '../../store/useSettingsStore';
 
-export type DenoiseMethod = 'ai' | 'bm3d' | 'raw9';
+export type DenoiseMethod = 'auto' | 'fast_gpu' | 'ai' | 'bm3d' | 'raw9';
 
 const defaultIntensityFor = (m: DenoiseMethod): number => {
   switch (m) {
+    case 'auto':
+      return 35;
+    case 'fast_gpu':
+      return 28;
     case 'raw9':
       return 40;
     case 'ai':
@@ -416,7 +420,7 @@ export default function DenoiseModal({
   const [shadowBoost, setShadowBoost] = useState<number>(0);
   const [filmGrain, setFilmGrain] = useState<number>(0);
   const [deband, setDeband] = useState<boolean>(false);
-  const [method, setMethod] = useState<DenoiseMethod>('ai');
+  const [method, setMethod] = useState<DenoiseMethod>('auto');
   const [raw9Available, setRaw9Available] = useState<boolean>(false);
   const targetPathsKey = targetPaths.join(',');
   const [healDust, setHealDust] = useState(true);
@@ -433,7 +437,10 @@ export default function DenoiseModal({
     model?: string;
     sensor_type?: string;
     dual_gain_active?: boolean;
-    recommended_engine: 'ai' | 'bm3d';
+    recommended_engine: 'fast_gpu' | 'ai' | 'bm3d';
+    recommended_tier?: string;
+    recommended_tier_label?: string;
+    estimated_time_hint?: string;
     recommended_intensity: number;
     recommended_chroma: number;
     recommended_details: number;
@@ -462,35 +469,60 @@ export default function DenoiseModal({
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; path: string } | null>(null);
 
-  // Real-Time Sub-Tile Loupe ROI Preview State (<25ms)
+  // Real-Time Sub-Tile Loupe ROI Preview State with monotonic ID & coalescing
   const [roiPreview, setRoiPreview] = useState<{ original: string; denoised: string } | null>(null);
   const [isRoiLoading, setIsRoiLoading] = useState(false);
+  const roiRequestIdRef = useRef(0);
+  const roiInFlightRef = useRef(false);
+  const roiPendingRef = useRef<{
+    targetPath: string;
+    intensity: number;
+    chromaIntensity: number;
+    preserveDetails: number;
+    shadowBoost: number;
+    deband: boolean;
+    protectStars: boolean;
+    filmGrain: number;
+    method: DenoiseMethod;
+  } | null>(null);
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
   const isBatch = targetPaths.length > 1;
   const mouseDownTarget = useRef<EventTarget | null>(null);
-  const recommendedEngine: 'ai' | 'bm3d' = useMemo(() => {
-    if (isRaw) return 'ai';
-    if (activeIso && activeIso >= 800) return 'ai';
+  const recommendedEngine: 'fast_gpu' | 'ai' | 'bm3d' = useMemo(() => {
+    if (autoProfile?.recommended_engine) return autoProfile.recommended_engine;
+    if (activeIso && activeIso > 1600) return 'ai';
+    if (activeIso && activeIso > 800) return 'bm3d';
     if (empiricalSigma && empiricalSigma > 0.05) return 'ai';
-    return 'bm3d';
-  }, [isRaw, activeIso, empiricalSigma]);
+    return 'fast_gpu';
+  }, [autoProfile, activeIso, empiricalSigma]);
 
   const recommendationReason = useMemo(() => {
-    if (isRaw) return 'RAW sensor data detected · Neural Deep Denoise reconstructs authentic sensor Bayer patterns';
-    if (activeIso && activeIso >= 800) return `High ISO (${activeIso}) · AI Neural model eliminates heavy color noise & grain`;
-    return 'Low noise floor / daylight · Guided Wavelet preserves razor-sharp edges with zero hallucination';
-  }, [isRaw, activeIso]);
+    if (autoProfile?.recommended_tier_label) {
+      return `${autoProfile.recommended_tier_label} (${autoProfile.estimated_time_hint || 'Auto-calibrated'})`;
+    }
+    if (activeIso && activeIso > 1600) return `High ISO (${activeIso}) · Tier 3 NIND Neural AI eliminates heavy blotches`;
+    if (activeIso && activeIso > 800) return `Mid ISO (${activeIso}) · Tier 2 Star-Safe BM3D preserves fine edges & stars`;
+    return 'ISO <= 800 · Tier 1 Fast Edge-Safe denoise cleans shadow noise in seconds';
+  }, [autoProfile, activeIso]);
 
   const methodOptions = useMemo<Array<{ label: string; value: DenoiseMethod; disabled?: boolean }>>(
     () => [
       {
-        label: `${t('modals.denoise.methodAi')}${recommendedEngine === 'ai' && !isAiFree ? ' ✨ (Recommended)' : ''}`,
-        value: 'ai',
-        disabled: isAiFree,
+        label: 'Auto (Smart Tier) ✨',
+        value: 'auto',
       },
       {
-        label: `${t('modals.denoise.methodBm3d')}${recommendedEngine === 'bm3d' ? ' ✨ (Recommended)' : ''}`,
+        label: `Fast Edge-Safe${recommendedEngine === 'fast_gpu' ? ' (Tier 1)' : ''}`,
+        value: 'fast_gpu',
+      },
+      {
+        label: `${t('modals.denoise.methodBm3d')}${recommendedEngine === 'bm3d' ? ' (Tier 2)' : ''}`,
         value: 'bm3d',
+      },
+      {
+        label: `${t('modals.denoise.methodAi')}${recommendedEngine === 'ai' && !isAiFree ? ' (Tier 3)' : ''}`,
+        value: 'ai',
+        disabled: isAiFree,
       },
       ...(raw9Available ? [{ label: t('modals.denoise.methodRaw9'), value: 'raw9' as const }] : []),
     ],
@@ -655,8 +687,7 @@ export default function DenoiseModal({
   useEffect(() => {
     if (isOpen) {
       const useAi = isRaw && !isAiFree;
-      const initialEngine = useAi || (activeIso && activeIso >= 800 && !isAiFree) ? 'ai' : 'bm3d';
-      setMethod(initialEngine);
+      setMethod('auto');
       const targetPath = targetPaths[0] || selectedImage?.path;
 
       if (targetPath) {
@@ -669,13 +700,19 @@ export default function DenoiseModal({
           model?: string;
           sensor_type?: string;
           dual_gain_active?: boolean;
-          recommended_engine: 'ai' | 'bm3d';
+          recommended_engine: 'fast_gpu' | 'ai' | 'bm3d';
+          recommended_tier?: string;
+          recommended_tier_label?: string;
+          estimated_time_hint?: string;
           recommended_intensity: number;
           recommended_chroma: number;
           recommended_details: number;
           recommended_shadow_boost: number;
           recommended_deband: boolean;
           flat_patch_used?: boolean;
+          gpu_accelerator?: string;
+          pipeline_mode?: string;
+          est_speed_sec?: number;
         }>(Invokes.AnalyzeImageNoiseProfile, { path: targetPath, exposure_push: 0.0 })
           .then((profile) => {
             if (profile?.sigma !== undefined) {
@@ -696,10 +733,6 @@ export default function DenoiseModal({
               if (profile.recommended_deband !== undefined) {
                 setDeband(profile.recommended_deband);
               }
-              if (profile.recommended_engine) {
-                const engine = profile.recommended_engine === 'ai' && isAiFree ? 'bm3d' : profile.recommended_engine;
-                setMethod(engine);
-              }
               if (profile.make || profile.model) {
                 setCameraProfile({
                   make: profile.make || 'Universal',
@@ -715,14 +748,14 @@ export default function DenoiseModal({
               const autoIntensity = Math.min(85, Math.max(15, Math.round(Math.log2(activeIso / 100) * 12 + 20)));
               setIntensity(autoIntensity);
             } else {
-              setIntensity(useAi ? 50 : 15);
+              setIntensity(useAi ? 35 : 15);
             }
           });
       } else if (activeIso) {
         const autoIntensity = Math.min(85, Math.max(15, Math.round(Math.log2(activeIso / 100) * 12 + 20)));
         setIntensity(autoIntensity);
       } else {
-        setIntensity(useAi ? 50 : 15);
+        setIntensity(useAi ? 35 : 15);
       }
       setIsMounted(true);
       const timer = setTimeout(() => setShow(true), 10);
@@ -738,43 +771,70 @@ export default function DenoiseModal({
         setCameraProfile(null);
         setAutoProfile(null);
         setRoiPreview(null);
+        roiPendingRef.current = null;
+        roiInFlightRef.current = false;
       }, 300);
       return () => clearTimeout(timer);
     }
   }, [isOpen, isRaw, isAiFree, activeIso, targetPaths, selectedImage]);
 
-  // Real-time Sub-Tile Loupe ROI Preview Debounce (<25ms)
+  const flushRoiQueue = useCallback(async () => {
+    if (roiInFlightRef.current || !roiPendingRef.current) return;
+    roiInFlightRef.current = true;
+    setIsRoiLoading(true);
+    try {
+      while (roiPendingRef.current) {
+        const params = roiPendingRef.current;
+        roiPendingRef.current = null;
+        const reqId = ++roiRequestIdRef.current;
+        try {
+          const res = await invoke<{ original_roi: string; denoised_roi: string }>(Invokes.PreviewDenoisedRoi, {
+            path: params.targetPath,
+            centerX: 0.5,
+            centerY: 0.5,
+            cropSize: 512,
+            intensity: params.intensity / 100,
+            chromaIntensity: params.chromaIntensity / 100,
+            preserveDetails: params.preserveDetails / 100,
+            shadowBoost: params.shadowBoost / 100,
+            deband: params.deband,
+            protectStars: params.protectStars,
+            filmGrain: params.filmGrain / 100,
+            method: params.method,
+          });
+          if (reqId === roiRequestIdRef.current && res?.original_roi && res?.denoised_roi) {
+            setRoiPreview({ original: res.original_roi, denoised: res.denoised_roi });
+          }
+        } catch (e) {
+          console.warn('Real-time Loupe ROI preview failed:', e);
+        }
+      }
+    } finally {
+      roiInFlightRef.current = false;
+      setIsRoiLoading(false);
+    }
+  }, []);
+
+  // Real-time Sub-Tile Loupe ROI Preview Debounce with coalescing lock
   useEffect(() => {
     if (!isOpen || isBatch || isProcessing) return;
     const targetPath = targetPaths[0] || selectedImage?.path;
     if (!targetPath) return;
 
-    const timer = setTimeout(async () => {
-      setIsRoiLoading(true);
-      try {
-        const res = await invoke<{ original_roi: string; denoised_roi: string }>(Invokes.PreviewDenoisedRoi, {
-          path: targetPath,
-          centerX: 0.5,
-          centerY: 0.5,
-          cropSize: 512,
-          intensity: intensity / 100,
-          chromaIntensity: chromaIntensity / 100,
-          preserveDetails: preserveDetails / 100,
-          shadowBoost: shadowBoost / 100,
-          deband,
-          protectStars,
-          filmGrain: filmGrain / 100,
-          method,
-        });
-        if (res?.original_roi && res?.denoised_roi) {
-          setRoiPreview({ original: res.original_roi, denoised: res.denoised_roi });
-        }
-      } catch (e) {
-        console.warn('Real-time Loupe ROI preview failed:', e);
-      } finally {
-        setIsRoiLoading(false);
-      }
-    }, 120);
+    const timer = setTimeout(() => {
+      roiPendingRef.current = {
+        targetPath,
+        intensity,
+        chromaIntensity,
+        preserveDetails,
+        shadowBoost,
+        deband,
+        protectStars,
+        filmGrain,
+        method,
+      };
+      void flushRoiQueue();
+    }, 150);
 
     return () => clearTimeout(timer);
   }, [
@@ -791,6 +851,7 @@ export default function DenoiseModal({
     protectStars,
     filmGrain,
     method,
+    flushRoiQueue,
   ]);
 
   const handleClose = useCallback(() => {
@@ -926,10 +987,21 @@ export default function DenoiseModal({
       return (
         <div className="flex flex-col items-center justify-center py-6 h-[260px] md:h-[340px]">
           <Loader2 className="w-12 h-12 animate-spin text-accent mb-4" />
-          <Text variant={TextVariants.title} className="mb-2">
+          <Text variant={TextVariants.title} className="mb-2 text-center">
             {currentStatusText}
           </Text>
-          <Text color={TextColors.secondary}>{t('modals.denoise.waitText', 'This may take a moment depending on resolution...')}</Text>
+          <Text color={TextColors.secondary} className="mb-4 text-center">
+            {t('modals.denoise.waitText', 'This may take a moment depending on resolution...')}
+          </Text>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              invoke(Invokes.CancelAiDenoise).catch(() => {});
+            }}
+          >
+            <XCircle className="mr-1.5" size={16} />
+            {t('modals.denoise.cancel', 'Cancel')}
+          </Button>
         </div>
       );
     }
@@ -1116,15 +1188,16 @@ export default function DenoiseModal({
                   {t('modals.denoise.methodLabel')}
                 </Text>
                 <span className="px-1.5 py-0.2 rounded bg-accent/20 text-accent font-bold text-[9px] uppercase tracking-wide">
-                  {method === recommendedEngine ? '✨ Recommended Mode' : '⚡ Custom Mode'}
+                  {method === 'auto' || method === recommendedEngine ? '✨ Smart Tier' : '⚡ Custom Mode'}
                 </span>
               </div>
               <Dropdown
                 options={methodOptions}
                 value={method}
                 onChange={(val) => {
-                  setMethod(val);
-                  setIntensity(val === 'ai' ? 50 : 15);
+                  const next = val as DenoiseMethod;
+                  setMethod(next);
+                  setIntensity(defaultIntensityFor(next));
                 }}
               />
               <span className="text-[10px] text-text-secondary leading-tight mt-0.5" title={recommendationReason}>

@@ -12,10 +12,88 @@ use std::cmp::Ordering;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartDenoiseTier {
+    FastGpu,
+    StarSafeBm3d,
+    MaxHighIsoNind,
+}
+
+impl SmartDenoiseTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FastGpu => "fast_gpu",
+            Self::StarSafeBm3d => "star_safe_bm3d",
+            Self::MaxHighIsoNind => "max_high_iso_nind",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FastGpu => "Tier 1 · Fast Edge-Safe (~1s)",
+            Self::StarSafeBm3d => "Tier 2 · Star-Safe BM3D + Deband (~4-8s)",
+            Self::MaxHighIsoNind => "Tier 3 · Max High-ISO NIND AI",
+        }
+    }
+
+    pub fn engine_method(&self) -> &'static str {
+        match self {
+            Self::MaxHighIsoNind => "ai",
+            Self::FastGpu | Self::StarSafeBm3d => "bm3d",
+        }
+    }
+}
+
+pub fn select_smart_denoise_tier(
+    iso: u32,
+    exposure_ev: f32,
+    scene: Option<&str>,
+) -> SmartDenoiseTier {
+    if iso > 1600 || exposure_ev >= 1.5 {
+        SmartDenoiseTier::MaxHighIsoNind
+    } else if iso > 800
+        || matches!(
+            scene,
+            Some("NightSky" | "night_sky" | "Astro" | "astro" | "Macro" | "macro")
+        )
+    {
+        SmartDenoiseTier::StarSafeBm3d
+    } else {
+        SmartDenoiseTier::FastGpu
+    }
+}
+
+fn check_denoise_cancelled(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    if cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+        Err("Denoise cancelled by user".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_effective_denoise_method(method: &str, path_str: &str, file_bytes: &[u8]) -> &'static str {
+    let lower = method.to_lowercase();
+    if lower == "auto" {
+        let iso = crate::metadata::exif_processing::read_iso(path_str, file_bytes).unwrap_or(400);
+        match select_smart_denoise_tier(iso, 0.0, None) {
+            SmartDenoiseTier::FastGpu => "fast_gpu",
+            SmartDenoiseTier::StarSafeBm3d => "bm3d",
+            SmartDenoiseTier::MaxHighIsoNind => "ai",
+        }
+    } else if lower == "ai" {
+        "ai"
+    } else if lower == "fast_gpu" {
+        "fast_gpu"
+    } else {
+        "bm3d"
+    }
+}
 
 struct ProgressReporter<'a> {
     counter: &'a Arc<AtomicUsize>,
@@ -221,15 +299,46 @@ pub async fn analyze_image_noise_profile(
     let mad_factor = empirical_sigma * 150.0 * mp_scale * thermal_factor;
     let combined_intensity = ((iso_factor * 0.40 + mad_factor * 0.60).round() as u32).clamp(5, 85);
 
-    // Dynamic pro slider coordinates per ISO sub-tier
-    let (rec_engine, rec_luma, rec_chroma, rec_detail, rec_shadow_boost, rec_deband) = if effective_iso <= 250 {
-        ("bm3d", combined_intensity.min(12), 50, 40, 0, false)
-    } else if effective_iso <= 800 {
-        ("bm3d", combined_intensity.clamp(15, 38), 90, 30, 0, false)
-    } else if effective_iso <= 3200 {
-        ("ai", combined_intensity.clamp(35, 60), 100, 25, 20, false)
-    } else {
-        ("ai", combined_intensity.clamp(55, 80), 100, 20, 35, true)
+    let smart_tier = select_smart_denoise_tier(effective_iso, push, None);
+
+    // Dynamic pro slider coordinates aligned with Smart Auto-Tier rules
+    let (rec_engine, rec_luma, rec_chroma, rec_detail, rec_shadow_boost, rec_deband) = match smart_tier {
+        SmartDenoiseTier::FastGpu => (
+            "fast_gpu",
+            combined_intensity.clamp(10, 35),
+            if effective_iso <= 250 { 55 } else { 85 },
+            if effective_iso <= 250 { 40 } else { 32 },
+            0,
+            false,
+        ),
+        SmartDenoiseTier::StarSafeBm3d => (
+            "bm3d",
+            combined_intensity.clamp(25, 50),
+            95,
+            30,
+            10,
+            false,
+        ),
+        SmartDenoiseTier::MaxHighIsoNind => (
+            "ai",
+            combined_intensity.clamp(45, 80),
+            100,
+            22,
+            if effective_iso > 3200 { 35 } else { 20 },
+            effective_iso > 3200,
+        ),
+    };
+
+    let estimated_time_hint = match smart_tier {
+        SmartDenoiseTier::FastGpu => "~0.5-2s",
+        SmartDenoiseTier::StarSafeBm3d => "~4-12s",
+        SmartDenoiseTier::MaxHighIsoNind => {
+            if crate::ai::models::is_gpu_active() {
+                "~25-90s (DirectML GPU)"
+            } else {
+                "~60-180s (CPU)"
+            }
+        }
     };
 
     let snr_db = (20.0 * (1.0 / empirical_sigma.max(0.0005)).log10()).clamp(10.0, 50.0);
@@ -239,13 +348,19 @@ pub async fn analyze_image_noise_profile(
     let gpu_accelerator = if is_directml {
         "Intel Iris Xe (DirectML 96EU)"
     } else {
-        "CPU (AVX-512 DL Boost)"
+        "CPU (ONNX / Rayon)"
     };
     let pipeline_mode = if is_raw { "Raw-Bayer CFA" } else { "Post-Demosaic RGB" };
-    let est_speed_sec = if is_directml {
-        ((mp / 24.0) * 8.5).round().max(2.0) as u32
-    } else {
-        ((mp / 24.0) * 45.0).round().max(10.0) as u32
+    let est_speed_sec = match smart_tier {
+        SmartDenoiseTier::FastGpu => ((mp / 24.0) * 1.5).round().max(1.0) as u32,
+        SmartDenoiseTier::StarSafeBm3d => ((mp / 24.0) * 8.0).round().max(3.0) as u32,
+        SmartDenoiseTier::MaxHighIsoNind => {
+            if is_directml {
+                ((mp / 24.0) * 35.0).round().max(8.0) as u32
+            } else {
+                ((mp / 24.0) * 90.0).round().max(20.0) as u32
+            }
+        }
     };
 
     Ok(serde_json::json!({
@@ -264,6 +379,9 @@ pub async fn analyze_image_noise_profile(
         "sensor_type": profile.sensor_type,
         "dual_gain_active": is_high_gain,
         "recommended_engine": rec_engine,
+        "recommended_tier": smart_tier.as_str(),
+        "recommended_tier_label": smart_tier.label(),
+        "estimated_time_hint": estimated_time_hint,
         "recommended_intensity": rec_luma,
         "recommended_chroma": rec_chroma,
         "recommended_details": rec_detail,
@@ -337,12 +455,16 @@ pub async fn preview_denoised_roi(
         crop_for_denoiser = apply_chroma_luma_denoise(&crop_for_denoiser, intensity, chroma, grain);
     }
 
-    let mut denoised_crop = if method.to_lowercase() == "ai" {
+    let effective_method = resolve_effective_denoise_method(&method, &path_str, &file_bytes);
+
+    let mut denoised_crop = if effective_method == "ai" {
         if let Ok(model_arc) = crate::ai::models::get_or_init_denoise_model(
             &app_handle,
             &_state.ai_state,
             &_state.ai_init_lock,
-        ).await {
+        )
+        .await
+        {
             match crate::ai::tiling::run_ai_denoise(&crop_for_denoiser, &model_arc, &|_| {}) {
                 Ok(dyn_res) => dyn_res,
                 Err(_) => run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle),
@@ -350,6 +472,14 @@ pub async fn preview_denoised_roi(
         } else {
             run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle)
         }
+    } else if effective_method == "fast_gpu" {
+        let fast = apply_chroma_luma_denoise(
+            &crop_for_denoiser,
+            (intensity * 0.85).max(0.12),
+            chroma.max(0.85),
+            grain,
+        );
+        DynamicImage::ImageRgb32F(fast)
     } else {
         run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle)
     };
@@ -411,8 +541,27 @@ pub async fn apply_denoising(
     let should_deband = deband.unwrap_or(false);
     let grain = film_grain.unwrap_or(0.0);
 
+    let lower_method = method.to_lowercase();
+    let needs_ai = if lower_method == "ai" {
+        true
+    } else if lower_method == "auto" {
+        fs::read(&source_path)
+            .ok()
+            .and_then(|b| crate::metadata::exif_processing::read_iso(&path_str, &b))
+            .is_some_and(|iso| {
+                select_smart_denoise_tier(iso, 0.0, None) == SmartDenoiseTier::MaxHighIsoNind
+            })
+    } else {
+        false
+    };
+
+    state
+        .ai_denoise_cancel
+        .store(false, AtomicOrdering::SeqCst);
+    let cancel_token = state.ai_denoise_cancel.clone();
+
     let mut ai_session = None;
-    if method == "ai" {
+    if needs_ai {
         let session = crate::ai::models::get_or_init_denoise_model(
             &app_handle,
             &state.ai_state,
@@ -441,6 +590,7 @@ pub async fn apply_denoising(
             grain,
             app_handle.clone(),
             ai_session,
+            Some(cancel_token),
         ) {
             Ok((image, _)) => {
                 *denoise_result_handle.lock().unwrap() = Some(image);
@@ -477,16 +627,24 @@ pub async fn batch_denoise_images(
     let should_deband = deband.unwrap_or(false);
     let grain = film_grain.unwrap_or(0.0);
 
+    state
+        .ai_denoise_cancel
+        .store(false, AtomicOrdering::SeqCst);
+    let cancel_token = state.ai_denoise_cancel.clone();
+
     let mut ai_session = None;
-    if method == "ai" {
-        let session = crate::ai::models::get_or_init_denoise_model(
+    if method == "ai" || method == "auto" {
+        if let Ok(session) = crate::ai::models::get_or_init_denoise_model(
             &app_handle,
             &state.ai_state,
             &state.ai_init_lock,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        ai_session = Some(session);
+        {
+            ai_session = Some(session);
+        } else if method == "ai" {
+            return Err("Failed to initialize AI denoise model".to_string());
+        }
     }
 
     tokio::task::spawn_blocking(move || {
@@ -494,6 +652,9 @@ pub async fn batch_denoise_images(
         let mut results = Vec::new();
 
         for (i, path_str) in paths.iter().enumerate() {
+            if cancel_token.load(AtomicOrdering::Relaxed) {
+                break;
+            }
             let _ = app_handle.emit(
                 "denoise-batch-progress",
                 serde_json::json!({
@@ -521,6 +682,7 @@ pub async fn batch_denoise_images(
                 grain,
                 app_handle.clone(),
                 ai_session.clone(),
+                Some(cancel_token.clone()),
             ) {
                 Ok((image, _)) => {
                     let is_raw = crate::decode::formats::is_raw_file(&real_path);
@@ -1476,6 +1638,7 @@ fn run_bm3d_fast_tile(
     DynamicImage::ImageRgb32F(out_img)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn denoise_image(
     path_str: String,
     intensity: f32,
@@ -1490,7 +1653,10 @@ fn denoise_image(
     film_grain: f32,
     app_handle: AppHandle,
     ai_session: Option<Arc<Mutex<ort::session::Session>>>,
+    cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<(DynamicImage, String), String> {
+    let cancel_ref = cancel_token.as_deref();
+    check_denoise_cancelled(cancel_ref)?;
     let path = Path::new(&path_str);
     if !path.exists() {
         return Err("File not found".to_string());
@@ -1502,37 +1668,94 @@ fn denoise_image(
     let _ = app_handle.emit("denoise-progress", "Loading image...");
 
     let file_bytes = fs::read(path).map_err(|e| e.to_string())?;
+    check_denoise_cancelled(cancel_ref)?;
+    let effective_method = resolve_effective_denoise_method(&method, &path_str, &file_bytes);
     let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
         .map_err(|e| e.to_string())?;
 
     let mut rgb_img_for_denoiser = dynamic_img.to_rgb32f();
 
     if deband {
+        check_denoise_cancelled(cancel_ref)?;
         let _ = app_handle.emit("denoise-progress", "Removing sensor readout banding stripes...");
         remove_sensor_banding(&mut rgb_img_for_denoiser);
         remove_canon_adc_banding(&mut rgb_img_for_denoiser);
     }
 
     if chroma_intensity > 0.0 || film_grain > 0.0 {
+        check_denoise_cancelled(cancel_ref)?;
         rgb_img_for_denoiser = apply_chroma_luma_denoise(&rgb_img_for_denoiser, intensity, chroma_intensity, film_grain);
     }
 
-    let out_dynamic = if method == "ai" {
+    let out_dynamic = if effective_method == "ai" {
         let session_arc = ai_session.ok_or_else(|| "AI Session not provided".to_string())?;
-        crate::ai::tiling::run_ai_denoise(
+        let is_gpu = crate::ai::models::is_gpu_active();
+        let emit_progress = |tp: crate::ai::tiling::TileProgress| {
+            let eta = tp.eta_sec.map(|s| format!(" · ETA {}s", s)).unwrap_or_default();
+            let _ = app_handle.emit(
+                "denoise-progress",
+                format!(
+                    "{} [{}/{}] {:.0}% ({}){}",
+                    tp.stage,
+                    tp.tile_index,
+                    tp.total_tiles,
+                    tp.progress * 100.0,
+                    tp.provider,
+                    eta
+                ),
+            );
+        };
+        match crate::ai::tiling::run_ai_denoise_with_control(
             &rgb_img_for_denoiser,
             &session_arc,
-            &|progress| {
+            cancel_ref,
+            is_gpu,
+            &emit_progress,
+        ) {
+            Ok(img) => img,
+            Err(err)
+                if is_gpu
+                    && !cancel_ref.is_some_and(|c| c.load(AtomicOrdering::Relaxed))
+                    && (err.to_string().contains("DIRECTML_FIRST_TILE_SLOW")
+                        || !crate::ai::models::is_gpu_active()) =>
+            {
                 let _ = app_handle.emit(
                     "denoise-progress",
-                    format!("Denoising… {:.0}%", progress * 100.0),
+                    "DirectML stalled — falling back to CPU ONNX...",
                 );
-            },
-        )
-        .map_err(|e| e.to_string())?
+                let state = app_handle.state::<AppState>();
+                let cpu_session = tauri::async_runtime::block_on(
+                    crate::ai::models::force_cpu_denoise_model(
+                        &app_handle,
+                        &state.ai_state,
+                        &state.ai_init_lock,
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
+                crate::ai::tiling::run_ai_denoise_with_control(
+                    &rgb_img_for_denoiser,
+                    &cpu_session,
+                    cancel_ref,
+                    false,
+                    &emit_progress,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    } else if effective_method == "fast_gpu" {
+        let _ = app_handle.emit("denoise-progress", "Fast Edge-Safe Denoise...");
+        let fast = apply_chroma_luma_denoise(
+            &rgb_img_for_denoiser,
+            (intensity * 0.90).max(0.15),
+            chroma_intensity.max(0.85),
+            film_grain,
+        );
+        DynamicImage::ImageRgb32F(fast)
     } else {
         run_bm3d(&rgb_img_for_denoiser, intensity, &app_handle)?
     };
+    check_denoise_cancelled(cancel_ref)?;
 
     let mut out_dynamic_final = out_dynamic;
 
@@ -3793,6 +4016,46 @@ mod tests {
             "Recovered dy should match forward transform -1.5 (got {})",
             transform.dy
         );
+    }
+
+    #[test]
+    fn test_smart_denoise_tier_selection() {
+        assert_eq!(
+            select_smart_denoise_tier(400, 0.0, None),
+            SmartDenoiseTier::FastGpu
+        );
+        assert_eq!(
+            select_smart_denoise_tier(800, 0.5, Some("Landscape")),
+            SmartDenoiseTier::FastGpu
+        );
+        assert_eq!(
+            select_smart_denoise_tier(1200, 0.0, None),
+            SmartDenoiseTier::StarSafeBm3d
+        );
+        assert_eq!(
+            select_smart_denoise_tier(400, 0.0, Some("NightSky")),
+            SmartDenoiseTier::StarSafeBm3d
+        );
+        assert_eq!(
+            select_smart_denoise_tier(400, 0.0, Some("Macro")),
+            SmartDenoiseTier::StarSafeBm3d
+        );
+        assert_eq!(
+            select_smart_denoise_tier(3200, 0.0, None),
+            SmartDenoiseTier::MaxHighIsoNind
+        );
+        assert_eq!(
+            select_smart_denoise_tier(400, 1.5, None),
+            SmartDenoiseTier::MaxHighIsoNind
+        );
+    }
+
+    #[test]
+    fn test_check_denoise_cancelled_flag() {
+        let flag = AtomicBool::new(false);
+        assert!(check_denoise_cancelled(Some(&flag)).is_ok());
+        flag.store(true, AtomicOrdering::SeqCst);
+        assert!(check_denoise_cancelled(Some(&flag)).is_err());
     }
 }
 

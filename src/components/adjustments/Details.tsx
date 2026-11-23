@@ -1,7 +1,9 @@
 import { memo, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, Loader2, Sparkles } from 'lucide-react';
+import { ChevronDown, Loader2, Sparkles, X } from 'lucide-react';
 import clsx from 'clsx';
+import { Invokes } from '../../types/invokes';
 import Slider, { SliderChangeEvent } from '../ui/Slider';
 import Switch from '../ui/Switch';
 import Button from '../ui/Button';
@@ -46,6 +48,9 @@ function DetailsPanel({
   const [isEnhancedPresenceOpen, setIsEnhancedPresenceOpen] = useState(false);
   const aiDenoiseProgress = useEditorStore((state) =>
     state.selectedImage ? state.aiDenoiseProgress[state.selectedImage.path] : undefined,
+  );
+  const aiDenoiseMeta = useEditorStore((state) =>
+    state.selectedImage ? state.aiDenoiseMeta[state.selectedImage.path] : undefined,
   );
   const aiUpscaleProgress = useEditorStore((state) =>
     state.selectedImage ? state.aiUpscaleProgress[state.selectedImage.path] : undefined,
@@ -374,18 +379,39 @@ function DetailsPanel({
                 }
               >
                 {aiDenoiseProgress !== undefined ? (
-                  <div className="flex flex-col items-center justify-center gap-1 p-4 text-text-secondary text-center">
+                  <div className="flex flex-col items-center justify-center gap-1.5 p-4 text-text-secondary text-center">
                     <div className="flex items-center gap-2">
                       <Loader2 size={16} className="animate-spin shrink-0" />
                       <Text variant={TextVariants.label}>
                         {aiModelDownloadStatus
                           ? t('editor.masks.settings.aiModelDownloading')
-                          : t('editor.ai.denoising')}
+                          : aiDenoiseMeta?.stage || t('editor.ai.denoising')}
                       </Text>
                     </div>
-                    <Text variant={TextVariants.small} className="text-accent">
-                      {aiModelDownloadStatus || `${Math.round(aiDenoiseProgress * 100)}%`}
+                    <Text variant={TextVariants.small} className="text-accent font-mono">
+                      {aiModelDownloadStatus ||
+                        `${Math.round(aiDenoiseProgress * 100)}%${
+                          aiDenoiseMeta?.tileIndex && aiDenoiseMeta?.totalTiles
+                            ? ` · Tile ${aiDenoiseMeta.tileIndex}/${aiDenoiseMeta.totalTiles}`
+                            : ''
+                        }${aiDenoiseMeta?.etaSec !== undefined ? ` · ~${aiDenoiseMeta.etaSec}s` : ''}`}
                     </Text>
+                    {aiDenoiseMeta?.provider && !aiModelDownloadStatus && (
+                      <Text variant={TextVariants.small} className="text-text-secondary/80 font-mono text-[11px]">
+                        Backend: {aiDenoiseMeta.provider}
+                      </Text>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        invoke(Invokes.CancelAiDenoise).catch(() => {});
+                        setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, aiDenoiseEnabled: false }));
+                      }}
+                      className="mt-1 inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] bg-surface border border-border-color/60 hover:bg-card-active text-text-secondary hover:text-text-primary transition-colors cursor-pointer"
+                    >
+                      <X size={12} />
+                      <span>Cancel</span>
+                    </button>
                   </div>
                 ) : (
                   <>
