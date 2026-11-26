@@ -505,7 +505,7 @@ export default function MainLibrary(props: MainLibraryProps) {
                       {'Spiders protect their nest. Photo by '}
                       <button
                         type="button"
-                        onClick={() => open('https://www.gettyimages.fi/search/2/image?artistexact=marius%20rimkevicius%20%2F%20500px&sort=mostpopular&license=rf%2Crm')}
+                        onClick={() => open('https://www.gettyimages.fi/search/2/image?artistexact=marius%20rimkevicius%20%2F%20500px&sort=best&license=rf%2Crm')}
                         className="hover:underline text-text-primary font-medium cursor-pointer"
                       >
                         Marius R.
