@@ -116,6 +116,30 @@ export type HdrDeghostSensitivity = 'off' | 'low' | 'medium' | 'high';
 export type HdrDeghostMode = 'fast' | 'opticalFlow';
 export type HdrPreviewMode = 'sdr' | 'hdr10' | 'headroom';
 
+export interface SmartCollectionRule {
+  minRating?: number;
+  flag?: string;
+  isEdited?: boolean;
+  minIso?: number;
+  colorLabel?: string;
+  cameraContains?: string;
+  lensContains?: string;
+  tagContains?: string;
+}
+
+export interface SmartCollectionInfo {
+  id: string;
+  name: string;
+  builtin: boolean;
+  rules: SmartCollectionRule;
+  count: number;
+}
+
+export interface SemanticSearchHit {
+  path: string;
+  score: number;
+}
+
 export interface MergeBrushStroke {
   points: [number, number][];
   radiusNorm: number;

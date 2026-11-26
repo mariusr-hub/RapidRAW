@@ -71,7 +71,7 @@ import { openMergeModal, useUIStore } from '../store/useUIStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { getOpenImageDefaults, hasCustomDefaults, openImageHasCustomDefaults } from '../utils/developDefaults';
 import { Invokes } from '../types/invokes';
-import { ImageFlag, AlbumItem, Album, AlbumGroup } from '../types/library';
+import { ImageFile, ImageFlag, AlbumItem, Album, AlbumGroup, SemanticSearchHit } from '../types/library';
 import { Option, OPTION_SEPARATOR, Panel } from '../types/ui';
 import { EditInApp } from '../types/settings';
 import {
@@ -1294,6 +1294,53 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
             ]
           : []),
         { type: OPTION_SEPARATOR },
+        {
+          disabled: !isSingleSelection,
+          icon: Sparkles,
+          label: t('contextMenus.thumbnail.findVisuallySimilar', 'Find Visually Similar Photos'),
+          onClick: () => {
+            const targetPath = finalSelection[0];
+            invoke<SemanticSearchHit[]>(Invokes.FindVisuallySimilar, { path: targetPath, limit: 60 })
+              .then((hits) => {
+                if (hits.length === 0) {
+                  toast.info('No visually similar photos indexed yet. Enable AI Tagging or rebuild the search index.');
+                  return;
+                }
+                const { imageList } = useLibraryStore.getState();
+                const existingMap = new globalThis.Map(imageList.map((im) => [im.path, im]));
+                const scores: Record<string, number> = {};
+                const similarItems: ImageFile[] = hits.map((hit) => {
+                  scores[hit.path] = hit.score;
+                  const existing = existingMap.get(hit.path);
+                  if (existing) return existing;
+                  return {
+                    path: hit.path,
+                    modified: 0,
+                    is_edited: false,
+                    rating: 0,
+                    flag: null,
+                    tags: null,
+                    exif: null,
+                    is_virtual_copy: hit.path.includes('?vc='),
+                    is_cloud_placeholder: false,
+                    is_raw: /\.(arw|cr2|cr3|dng|nef|raf|orf|rw2|pef|srw|raw)$/i.test(hit.path),
+                    group_id: null,
+                    needs_ai: false,
+                  };
+                });
+                useLibraryStore.getState().setLibrary({
+                  imageList: similarItems,
+                  semanticScores: scores,
+                  similarSourcePath: targetPath,
+                  activeSmartCollectionId: null,
+                  activeAlbumId: null,
+                  multiSelectedPaths: [],
+                  libraryActivePath: similarItems[0]?.path ?? null,
+                });
+              })
+              .catch((err) => toast.error(`Similarity search failed: ${err}`));
+          },
+        },
         {
           disabled: !isSingleSelection,
           icon: Folder,

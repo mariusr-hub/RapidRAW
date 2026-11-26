@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
+import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import {
   CheckCheck,
@@ -33,7 +34,8 @@ import {
   LibraryDisplayMode,
   THUMBNAIL_SIZE_STEPS,
 } from '../../types/settings';
-import { ImageFile, RawStatus, EditedStatus, FlagStatus } from '../../types/library';
+import { ImageFile, RawStatus, EditedStatus, FlagStatus, SemanticSearchHit } from '../../types/library';
+import { Invokes } from '../../types/invokes';
 import { GroupBadgeInfo, GroupId } from '../../utils/imageGrouping';
 import { ImportState, Status } from '../../types/export';
 import Text from '../ui/Text';
@@ -217,7 +219,34 @@ export default function MainLibrary(props: MainLibraryProps) {
   };
 
   const searchCriteria = useLibraryStore((state) => state.searchCriteria);
+  const activeSmartCollectionId = useLibraryStore((state) => state.activeSmartCollectionId);
+  const similarSourcePath = useLibraryStore((state) => state.similarSourcePath);
   const setLibrary = useLibraryStore((state) => state.setLibrary);
+
+  useEffect(() => {
+    const query = searchCriteria.text.trim();
+    if (query.length < 3) {
+      setLibrary({ semanticScores: {} });
+      return;
+    }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      invoke<SemanticSearchHit[]>(Invokes.SemanticSearchCatalog, { query, limit: 250 })
+        .then((hits) => {
+          if (!active) return;
+          const map: Record<string, number> = {};
+          for (const h of hits) {
+            map[h.path] = h.score;
+          }
+          setLibrary({ semanticScores: map });
+        })
+        .catch((err) => console.warn('Semantic search lookup failed:', err));
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [searchCriteria.text, setLibrary]);
   const navHistory = useLibraryStore((state) => state.navHistory);
   const navIndex = useLibraryStore((state) => state.navIndex);
   const canGoBack = navIndex > 0;
@@ -732,6 +761,26 @@ export default function MainLibrary(props: MainLibraryProps) {
           </>
         )}
       </header>
+
+      {(activeSmartCollectionId || similarSourcePath) && (
+        <div className="mx-3 mb-2 px-3 py-1.5 rounded-lg bg-accent/10 border border-accent/30 flex items-center justify-between gap-2 text-xs">
+          <span className="text-text-primary truncate">
+            {similarSourcePath
+              ? `Visually similar to ${similarSourcePath.split(/[\\/]/).pop()}`
+              : `Smart Collection (${props.imageList.length} matches)`}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setLibrary({ activeSmartCollectionId: null, similarSourcePath: null });
+              props.onLibraryRefresh();
+            }}
+            className="px-2 py-0.5 rounded bg-surface hover:bg-card-active text-text-secondary hover:text-text-primary cursor-pointer"
+          >
+            Back to Folder
+          </button>
+        </div>
+      )}
 
       {props.imageList.length > 0 ? (
         libraryDisplayMode === LibraryDisplayMode.Cull ? (

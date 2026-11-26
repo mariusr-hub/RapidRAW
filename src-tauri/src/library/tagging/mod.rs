@@ -149,6 +149,121 @@ pub fn extract_color_tags(image: &DynamicImage) -> Vec<String> {
     }
 }
 
+fn l2_normalize_clip(raw: &[f32]) -> Vec<f32> {
+    let norm = raw.iter().map(|&v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        let inv = 1.0 / norm;
+        raw.iter().map(|&v| v * inv).collect()
+    } else {
+        raw.to_vec()
+    }
+}
+
+fn encode_clip_texts(
+    texts: &[String],
+    tokenizer: &Tokenizer,
+) -> Result<(Array<i64, ndarray::Dim<[usize; 2]>>, Array<i64, ndarray::Dim<[usize; 2]>>)> {
+    let encodings = tokenizer
+        .encode_batch(texts.to_vec(), true)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let max_len = encodings
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let mut ids_data = Vec::new();
+    let mut mask_data = Vec::new();
+    for encoding in encodings {
+        let mut ids = encoding
+            .get_ids()
+            .iter()
+            .map(|&i| i as i64)
+            .collect::<Vec<_>>();
+        let mut mask = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect::<Vec<_>>();
+        ids.resize(max_len, 0);
+        mask.resize(max_len, 0);
+        ids_data.extend_from_slice(&ids);
+        mask_data.extend_from_slice(&mask);
+    }
+
+    let ids_array = Array::from_shape_vec((texts.len(), max_len), ids_data)?;
+    let mask_array = Array::from_shape_vec((texts.len(), max_len), mask_data)?;
+    Ok((ids_array, mask_array))
+}
+
+fn find_clip_embed_output<'a>(
+    outputs: &'a ort::session::SessionOutputs<'a>,
+    preferred_name: &str,
+    fallback_idx: usize,
+) -> Result<Vec<f32>> {
+    for (name, val) in outputs.iter() {
+        if name.eq_ignore_ascii_case(preferred_name) {
+            let arr = val.try_extract_array::<f32>()?;
+            if let Some(s) = arr.as_slice() {
+                return Ok(l2_normalize_clip(s));
+            }
+            return Ok(l2_normalize_clip(&arr.iter().copied().collect::<Vec<f32>>()));
+        }
+    }
+    if outputs.len() > fallback_idx {
+        let arr = outputs[fallback_idx].try_extract_array::<f32>()?;
+        if let Some(s) = arr.as_slice() {
+            return Ok(l2_normalize_clip(s));
+        }
+        return Ok(l2_normalize_clip(&arr.iter().copied().collect::<Vec<f32>>()));
+    }
+    Err(anyhow::anyhow!(
+        "CLIP ONNX model does not expose standalone '{preferred_name}' output"
+    ))
+}
+
+pub fn extract_clip_image_embedding(
+    image: &DynamicImage,
+    clip_session_mutex: &Mutex<Session>,
+    tokenizer: &Tokenizer,
+) -> Result<Vec<f32>> {
+    let image_input = preprocess_clip_image(image);
+    let dummy_text = vec!["photo".to_string()];
+    let (ids_array, mask_array) = encode_clip_texts(&dummy_text, tokenizer)?;
+
+    let image_val = Tensor::from_array(image_input.into_dyn().as_standard_layout().into_owned())?;
+    let ids_val = Tensor::from_array(ids_array.into_dyn().as_standard_layout().into_owned())?;
+    let mask_val = Tensor::from_array(mask_array.into_dyn().as_standard_layout().into_owned())?;
+
+    let mut clip_session = clip_session_mutex.lock().unwrap();
+    let outputs = crate::ai::models::gpu_inference(
+        clip_session.run(ort::inputs![ids_val, image_val, mask_val]),
+    )?;
+    find_clip_embed_output(&outputs, "image_embeds", 3)
+}
+
+pub fn extract_clip_text_embedding(
+    query: &str,
+    clip_session_mutex: &Mutex<Session>,
+    tokenizer: &Tokenizer,
+) -> Result<Vec<f32>> {
+    let image_input = Array::<f32, _>::zeros((1, 3, 224, 224));
+    let texts = vec![query.to_string()];
+    let (ids_array, mask_array) = encode_clip_texts(&texts, tokenizer)?;
+
+    let image_val = Tensor::from_array(image_input.into_dyn().as_standard_layout().into_owned())?;
+    let ids_val = Tensor::from_array(ids_array.into_dyn().as_standard_layout().into_owned())?;
+    let mask_val = Tensor::from_array(mask_array.into_dyn().as_standard_layout().into_owned())?;
+
+    let mut clip_session = clip_session_mutex.lock().unwrap();
+    let outputs = crate::ai::models::gpu_inference(
+        clip_session.run(ort::inputs![ids_val, image_val, mask_val]),
+    )?;
+    find_clip_embed_output(&outputs, "text_embeds", 2)
+}
+
 pub fn generate_tags_with_clip(
     image: &DynamicImage,
     clip_session_mutex: &Mutex<Session>,
@@ -295,7 +410,8 @@ pub async fn start_background_indexing(
         return Ok(());
     }
 
-    let max_concurrent_tasks = settings.tagging_thread_count.unwrap_or(3).max(1) as usize;
+    // Single background worker thread prevents thermal throttling on thin/light laptops.
+    let max_concurrent_tasks = 1usize;
     let custom_ai_tags = settings.custom_ai_tags.clone();
     let ai_tag_count = settings.ai_tag_count.unwrap_or(10) as usize;
 
@@ -372,6 +488,9 @@ pub async fn start_background_indexing(
                 let tags_inner = Arc::clone(&custom_ai_tags_shared);
 
                 async move {
+                    while crate::library::catalog_db::is_foreground_busy() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                     let path_str = path.to_string_lossy().to_string();
                     let (source_path, sidecar_path) = parse_virtual_path(&path_str);
 
@@ -381,6 +500,17 @@ pub async fn start_background_indexing(
                         gpu_context_inner.as_ref(),
                     ) {
                         Ok(image) => {
+                            if let Ok(embedding) = extract_clip_image_embedding(
+                                &image,
+                                &clip_models_inner.model,
+                                &clip_models_inner.tokenizer,
+                            ) {
+                                crate::library::catalog_db::upsert_clip_embedding(
+                                    &app_handle_inner,
+                                    &path_str,
+                                    &embedding,
+                                );
+                            }
                             if let Ok(ai_tags) = generate_tags_with_clip(
                                 &image,
                                 &clip_models_inner.model,
@@ -390,7 +520,7 @@ pub async fn start_background_indexing(
                             ) {
                                 println!("Found AI tags for {}: {:?}", path_str, ai_tags);
 
-                                let _ = crate::metadata::sidecar::update_sidecar(
+                                if let Ok(updated) = crate::metadata::sidecar::update_sidecar(
                                     &sidecar_path,
                                     &source_path,
                                     |metadata| {
@@ -409,7 +539,13 @@ pub async fn start_background_indexing(
 
                                         metadata.tags = Some(final_tags);
                                     },
-                                );
+                                ) {
+                                    crate::library::catalog_db::update_tags(
+                                        &app_handle_inner,
+                                        &path_str,
+                                        &updated.tags,
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -475,6 +611,7 @@ fn modify_tags_for_path(
         let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
         xmp::sync_metadata_to_xmp(&source_path, &sidecar_path, &metadata, create_if_missing);
     }
+    crate::library::catalog_db::update_tags(app_handle, path_str, &metadata.tags);
 
     Ok(())
 }

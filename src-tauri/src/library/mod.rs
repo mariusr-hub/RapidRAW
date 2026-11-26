@@ -1,4 +1,5 @@
 pub mod albums;
+pub mod catalog_db;
 pub mod culling;
 pub mod file_ops;
 pub mod folders;

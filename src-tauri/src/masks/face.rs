@@ -280,6 +280,21 @@ fn fit_landmarks(
     Ok(best)
 }
 
+pub(crate) fn fit_face_landmarks_in_box(
+    session: &Mutex<Session>,
+    image: &RgbImage,
+    face_box: [f32; 4],
+) -> Result<Option<Vec<[f32; 2]>>> {
+    for quarter in 0..4 {
+        let angle = (quarter as f32) * FRAC_PI_2;
+        let (landmarks, score, _) = fit_landmarks(session, image, face_box, angle)?;
+        if score >= FACE_PRESENCE_THRESHOLD && landmarks.len() >= LANDMARK_COUNT {
+            return Ok(Some(landmarks));
+        }
+    }
+    Ok(None)
+}
+
 fn run_segmenter(
     session: &Mutex<Session>,
     image: &RgbImage,

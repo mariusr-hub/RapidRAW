@@ -519,6 +519,34 @@ export default function DataManagementSettings({
         </Text>
         <div className="divide-y divide-border-color">
           <Row
+            title={t('settings.data.rebuildIndexTitle', 'Search & Smart Collections Index')}
+            description={
+              rootPaths.length > 0
+                ? t('settings.data.rebuildIndexDesc', 'Rebuild the SQLite metadata & semantic search index across your library roots.')
+                : t('settings.data.noFolders')
+            }
+            status={statuses.rebuildIndex}
+            action={
+              <ActionButton
+                busy={busy.rebuildIndex}
+                disabled={rootPaths.length === 0}
+                icon={<RefreshCw size={13} />}
+                onClick={() =>
+                  run('rebuildIndex', async () => {
+                    const count = await invoke<number>(Invokes.RebuildCatalogIndex, { rootPaths });
+                    onLibraryRefresh();
+                    return t('settings.data.statuses.rebuildIndexSuccess', {
+                      count,
+                      defaultValue: `Indexed ${count} photos.`,
+                    });
+                  })
+                }
+              >
+                {t('settings.data.rebuildSearchIndex', 'Rebuild Search Index')}
+              </ActionButton>
+            }
+          />
+          <Row
             title={t('settings.data.deleteEdits')}
             description={
               rootPaths.length > 0 ? (

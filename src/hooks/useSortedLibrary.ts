@@ -76,6 +76,7 @@ function computeGroupedLibrary(
   options: { includeBadges: boolean } = { includeBadges: true },
 ): GroupedLibrary {
   const { imageList, imageRatings, filterCriteria, searchCriteria, sortCriteria } = libraryState;
+  const semanticScores: Record<string, number> = libraryState.semanticScores ?? {};
   const exifByPath: Record<string, Record<string, string>> = libraryState.exifByPath ?? NO_EXIF;
   const { appSettings } = settingsState;
 
@@ -205,8 +206,11 @@ function computeGroupedLibrary(
 
     let textMatch = true;
     if (lowerCaseSearchText !== '') {
+      const semanticHit = (semanticScores[image.path] ?? 0) >= 0.22;
       textMatch =
-        filename.includes(lowerCaseSearchText) || lowerCaseImageTags.some((t) => t.includes(lowerCaseSearchText));
+        semanticHit ||
+        filename.includes(lowerCaseSearchText) ||
+        lowerCaseImageTags.some((t) => t.includes(lowerCaseSearchText));
     }
 
     return tagsMatch && textMatch;
@@ -278,6 +282,13 @@ function computeGroupedLibrary(
   };
 
   list.sort((a, b) => {
+    if (lowerCaseSearchText !== '') {
+      const sa = semanticScores[a.path] ?? 0;
+      const sb = semanticScores[b.path] ?? 0;
+      if (Math.abs(sb - sa) >= 0.01) {
+        return sb - sa;
+      }
+    }
     let comparison: number;
 
     switch (key) {
@@ -331,6 +342,7 @@ export function useSortedLibrary() {
   const imageRatings = useLibraryStore((state) => state.imageRatings);
   const filterCriteria = useLibraryStore((state) => state.filterCriteria);
   const searchCriteria = useLibraryStore((state) => state.searchCriteria);
+  const semanticScores = useLibraryStore((state) => state.semanticScores);
   const sortCriteria = useLibraryStore((state) => state.sortCriteria);
   const needsExif = useLibraryStore((state) => usesExif(state.sortCriteria, state.searchCriteria));
   const exifByPath = useLibraryStore((state) => (needsExif ? state.exifByPath : NO_EXIF));
@@ -342,11 +354,11 @@ export function useSortedLibrary() {
 
   const displayList = useMemo(() => {
     return computeGroupedLibrary(
-      { imageList, imageRatings, filterCriteria, searchCriteria, sortCriteria, exifByPath },
+      { imageList, imageRatings, filterCriteria, searchCriteria, sortCriteria, exifByPath, semanticScores },
       { appSettings },
       { includeBadges: false },
     ).displayList;
-  }, [imageList, sortCriteria, imageRatings, filterCriteria, searchCriteria, appSettings, exifByPath]);
+  }, [imageList, sortCriteria, imageRatings, filterCriteria, searchCriteria, appSettings, exifByPath, semanticScores]);
 
   const badges = useMemo(
     () => (groupingMode !== 'off' ? buildImageGroups(imageList, groupingMode, groupEditedFiles).badges : null),

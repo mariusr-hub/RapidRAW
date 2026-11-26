@@ -65,6 +65,65 @@ fn compute_exposure_balance(thumb: &DynamicImage) -> f32 {
     (100.0 - highlight_penalty - shadow_penalty + midtone_bonus).clamp(10.0, 100.0)
 }
 
+pub fn compute_keeper_rank_score(
+    eye_state: &str,
+    iris_sharpness: f32,
+    face_exposure_quality: f32,
+) -> f32 {
+    let eyes_open = match eye_state {
+        "open" => 100.0,
+        "squinting" => 35.0,
+        _ => 0.0,
+    };
+    (eyes_open * 0.45
+        + iris_sharpness.clamp(0.0, 100.0) * 0.35
+        + face_exposure_quality.clamp(0.0, 100.0) * 0.20)
+        .clamp(0.0, 100.0)
+}
+
+/// Groups near-duplicate burst poses whose normalized CLIP cosine similarity exceeds `threshold` (0.94).
+pub fn dedupe_burst_frames_by_clip(
+    embeddings: &[(String, Vec<f32>)],
+    threshold: f32,
+) -> Vec<Vec<usize>> {
+    let n = embeddings.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut visited = vec![false; n];
+    let mut clusters = Vec::new();
+    for i in 0..n {
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        let mut cluster = vec![i];
+        let (_, ref emb_i) = embeddings[i];
+        let mut cursor = 0usize;
+        while cursor < cluster.len() {
+            let cur = cluster[cursor];
+            cursor += 1;
+            let ref_vec = if cur == i { emb_i } else { &embeddings[cur].1 };
+            for j in 0..n {
+                if visited[j] || ref_vec.len() != embeddings[j].1.len() || ref_vec.is_empty() {
+                    continue;
+                }
+                let dot: f32 = ref_vec
+                    .iter()
+                    .zip(&embeddings[j].1)
+                    .map(|(&a, &b)| a * b)
+                    .sum();
+                if dot > threshold {
+                    visited[j] = true;
+                    cluster.push(j);
+                }
+            }
+        }
+        clusters.push(cluster);
+    }
+    clusters
+}
+
 #[tauri::command]
 pub fn curate_hero_shots(
     paths: Vec<String>,
@@ -122,16 +181,16 @@ pub fn curate_hero_shots(
             let sharpness = compute_sharpness_score(&image);
             let exposure_bal = compute_exposure_balance(&image);
             let face_loupes = crate::enhanced::speed_culler::detect_face_loupes(&image);
-            let clarity = if let Some(best_face) = face_loupes
+            let (clarity, overall) = if let Some(best_face) = face_loupes
                 .iter()
-                .max_by(|a, b| a.sharpness_score.total_cmp(&b.sharpness_score))
+                .max_by(|a, b| a.iris_sharpness.total_cmp(&b.iris_sharpness))
             {
-                best_face.sharpness_score.clamp(0.0, 100.0)
+                let iris = best_face.iris_sharpness.max(best_face.sharpness_score).clamp(0.0, 100.0);
+                let rank = compute_keeper_rank_score(&best_face.eye_state, iris, exposure_bal);
+                (iris, rank)
             } else {
-                sharpness
+                (sharpness, sharpness * 0.55 + sharpness * 0.25 + exposure_bal * 0.20)
             };
-
-            let overall = sharpness * 0.55 + clarity * 0.25 + exposure_bal * 0.20;
 
             let done = processed_counter.fetch_add(1, Ordering::SeqCst) + 1;
             let percent = (done as f32 / total as f32) * 100.0;
@@ -160,6 +219,38 @@ pub fn curate_hero_shots(
         .collect();
     if cancel_token.load(Ordering::Relaxed) {
         return Err("Hero curation cancelled by user".to_string());
+    }
+
+    // Deduplicate identical burst poses via cached CLIP embeddings (> 0.94 cosine),
+    // retaining the top-ranked keeper from each burst pose cluster.
+    let clip_map = crate::library::catalog_db::get_clip_embeddings_for_paths(&app_handle, &paths);
+    if clip_map.len() >= 2 {
+        let embedded_entries: Vec<(String, Vec<f32>)> = scores
+            .iter()
+            .filter_map(|s| clip_map.get(&s.file_path).map(|v| (s.file_path.clone(), v.clone())))
+            .collect();
+        if embedded_entries.len() >= 2 {
+            let clusters = dedupe_burst_frames_by_clip(&embedded_entries, 0.94);
+            let mut keep_paths = std::collections::HashSet::new();
+            for cluster in clusters {
+                if let Some((best_path, _)) = cluster
+                    .into_iter()
+                    .filter_map(|idx| {
+                        let p = &embedded_entries[idx].0;
+                        scores.iter().find(|s| &s.file_path == p).map(|s| (p.clone(), s.overall_score))
+                    })
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                {
+                    keep_paths.insert(best_path);
+                }
+            }
+            for s in &scores {
+                if !clip_map.contains_key(&s.file_path) {
+                    keep_paths.insert(s.file_path.clone());
+                }
+            }
+            scores.retain(|s| keep_paths.contains(&s.file_path));
+        }
     }
 
     // Find winner
@@ -215,5 +306,28 @@ mod tests {
 
         let expo_score = compute_exposure_balance(&sharp_dyn);
         assert!(expo_score >= 50.0, "Balanced image should score >= 50: got {}", expo_score);
+    }
+
+    #[test]
+    fn test_clip_burst_deduplication_and_keeper_ranking() {
+        let e0 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let e1 = vec![0.98f32, 0.198, 0.0, 0.0]; // cosine ~ 0.98 > 0.94 with e0
+        let e2 = vec![0.0f32, 1.0, 0.0, 0.0]; // distinct pose
+        let clusters = dedupe_burst_frames_by_clip(
+            &[
+                ("p0.arw".into(), e0),
+                ("p1.arw".into(), e1),
+                ("p2.arw".into(), e2),
+            ],
+            0.94,
+        );
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0], vec![0, 1]);
+        assert_eq!(clusters[1], vec![2]);
+
+        let open_sharp = compute_keeper_rank_score("open", 85.0, 80.0);
+        let squint_sharp = compute_keeper_rank_score("squinting", 85.0, 80.0);
+        let blink_sharp = compute_keeper_rank_score("blink", 85.0, 80.0);
+        assert!(open_sharp > squint_sharp && squint_sharp > blink_sharp);
     }
 }

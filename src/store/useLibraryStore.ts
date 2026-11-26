@@ -49,6 +49,10 @@ interface LibraryState {
   sortCriteria: SortCriteria;
   filterCriteria: FilterCriteria;
   searchCriteria: SearchCriteria;
+  semanticScores: Record<string, number>;
+  activeSmartCollectionId: string | null;
+  similarSourcePath: string | null;
+  smartCollectionsRefreshKey: number;
 
   // UI State specific to the Library View
   isTreeLoading: boolean;
@@ -92,6 +96,10 @@ export const useLibraryStore = create<LibraryState>((set) => ({
   sortCriteria: { key: 'name', order: SortDirection.Ascending },
   filterCriteria: { colors: [], rating: 0, rawStatus: RawStatus.All },
   searchCriteria: { tags: [], text: '', mode: 'OR' },
+  semanticScores: {},
+  activeSmartCollectionId: null,
+  similarSourcePath: null,
+  smartCollectionsRefreshKey: 0,
 
   isTreeLoading: false,
   isViewLoading: false,

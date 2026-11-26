@@ -107,11 +107,20 @@ pub fn save_metadata_and_update_thumbnail(
         crate::ai::jobs::resolve(&app_handle, std::slice::from_ref(&path));
     }
 
-    if let Ok(settings) = load_settings(app_handle.clone())
-        && settings.enable_xmp_sync.unwrap_or(false)
-    {
-        let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-        sync_metadata_to_xmp(&source_path, &sidecar_path, &metadata, create_if_missing);
+    if let Ok(settings) = load_settings(app_handle.clone()) {
+        if settings.enable_xmp_sync.unwrap_or(false) {
+            let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+            sync_metadata_to_xmp(&source_path, &sidecar_path, &metadata, create_if_missing);
+        }
+        let is_raw = crate::decode::formats::is_raw_file(&source_path);
+        let tm_override = crate::render::options::resolve_tonemapper_override(&settings, is_raw);
+        let is_edited = crate::metadata::sidecar::is_image_edited(
+            &metadata.adjustments,
+            &source_path,
+            is_raw,
+            tm_override,
+        );
+        crate::library::catalog_db::update_edited(&app_handle, &path, is_edited);
     }
 
     let loaded_image_lock = state.original_image.lock().unwrap();
@@ -609,6 +618,7 @@ pub fn set_color_label_for_paths(
             metadata.tags = Some(tags);
         }
     });
+    crate::library::catalog_db::update_color_labels(&app_handle, &paths, color.as_deref());
 
     Ok(())
 }
@@ -625,6 +635,7 @@ pub fn set_rating_for_paths(
             metadata.flag = None;
         }
     });
+    crate::library::catalog_db::update_ratings(&app_handle, &paths, rating);
 
     if rating >= 4 {
         for p in &paths {
@@ -649,6 +660,7 @@ pub fn set_flag_for_paths(
     update_metadata_for_paths(&paths, &app_handle, |metadata| {
         metadata.flag = flag;
     });
+    crate::library::catalog_db::update_flags(&app_handle, &paths, flag);
 
     if let Some(f) = flag
         && (f == ImageFlag::Pick || f == ImageFlag::Reject)

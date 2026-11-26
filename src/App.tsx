@@ -257,6 +257,20 @@ function App() {
   const [thumbnailSize, setThumbnailSize] = useState(defaultThumbnailSize);
   const [thumbnailAspectRatio, setThumbnailAspectRatio] = useState(ThumbnailAspectRatio.Contain);
 
+  const isForegroundBusy = useUIStore(
+    (state) =>
+      state.activeView === 'editor' ||
+      state.speedCullerModalState.isOpen ||
+      state.mergeModalState.isOpen ||
+      state.denoiseModalState.isOpen,
+  );
+
+  useEffect(() => {
+    invoke(Invokes.SetForegroundBusy, { busy: isForegroundBusy }).catch((err) =>
+      console.warn('Failed to update foreground busy flag:', err),
+    );
+  }, [isForegroundBusy]);
+
   const { requestThumbnails, clearThumbnailQueue, markGenerated } = useThumbnails();
 
   const transformWrapperRef = useRef<any>(null);

@@ -157,21 +157,48 @@ pub fn start_metadata_workers(app_handle: tauri::AppHandle) {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ImageFile {
     pub path: String,
-    modified: u64,
-    is_edited: bool,
-    rating: u8,
-    flag: Option<ImageFlag>,
-    tags: Option<Vec<String>>,
-    exif: Option<HashMap<String, String>>,
-    is_virtual_copy: bool,
-    is_cloud_placeholder: bool,
-    is_raw: bool,
-    group_id: Option<String>,
+    pub(crate) modified: u64,
+    pub(crate) is_edited: bool,
+    pub(crate) rating: u8,
+    pub(crate) flag: Option<ImageFlag>,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) exif: Option<HashMap<String, String>>,
+    pub(crate) is_virtual_copy: bool,
+    pub(crate) is_cloud_placeholder: bool,
+    pub(crate) is_raw: bool,
+    pub(crate) group_id: Option<String>,
     #[serde(default)]
-    needs_ai: bool,
+    pub(crate) needs_ai: bool,
 }
 
 impl ImageFile {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_catalog(
+        path: String,
+        modified: u64,
+        is_edited: bool,
+        rating: u8,
+        flag: Option<ImageFlag>,
+        tags: Option<Vec<String>>,
+        is_raw: bool,
+    ) -> Self {
+        let is_virtual_copy = path.contains("?vc=");
+        Self {
+            path,
+            modified,
+            is_edited,
+            rating,
+            flag,
+            tags,
+            exif: None,
+            is_virtual_copy,
+            is_cloud_placeholder: false,
+            is_raw,
+            group_id: None,
+            needs_ai: false,
+        }
+    }
+
     pub fn placeholder(path: String, modified: u64) -> Self {
         let is_raw = crate::decode::formats::is_raw_file(&path);
         Self {
@@ -583,7 +610,7 @@ pub async fn list_images_in_dir(
             }
         }
 
-        Ok(collect_image_files(
+        let items = collect_image_files(
             images,
             |(entry, file_name)| {
                 let path = entry.path();
@@ -595,7 +622,13 @@ pub async fn list_images_in_dir(
             },
             sidecars_by_path,
             &app_handle,
-        ))
+        );
+        crate::library::catalog_db::sync_listed_images_background(
+            app_handle.clone(),
+            path,
+            items.clone(),
+        );
+        Ok(items)
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))?
@@ -629,7 +662,7 @@ pub async fn list_images_recursive(
             }
         }
 
-        Ok(collect_image_files(
+        let items = collect_image_files(
             images,
             |entry| ListedImage {
                 modified: modified_secs(
@@ -641,7 +674,13 @@ pub async fn list_images_recursive(
             },
             sidecars_by_path,
             &app_handle,
-        ))
+        );
+        crate::library::catalog_db::sync_listed_images_background(
+            app_handle.clone(),
+            path,
+            items.clone(),
+        );
+        Ok(items)
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))?

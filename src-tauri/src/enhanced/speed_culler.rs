@@ -12,7 +12,15 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, State};
+
+const LEFT_EYE_EAR: [usize; 6] = [362, 385, 387, 263, 373, 380];
+const RIGHT_EYE_EAR: [usize; 6] = [33, 160, 158, 133, 153, 144];
+const RIGHT_IRIS_LM: [usize; 5] = [468, 469, 470, 471, 472];
+const LEFT_IRIS_LM: [usize; 5] = [473, 474, 475, 476, 477];
+
+static CULL_ANALYZE_GEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaceLoupeCrop {
@@ -25,6 +33,9 @@ pub struct FaceLoupeCrop {
     pub is_eyes_open: bool,
     pub is_sharp: bool,
     pub crop_data_url: String,
+    pub ear_min: Option<f32>,
+    pub eye_state: String,
+    pub iris_sharpness: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +58,88 @@ pub struct TriageCullResult {
 
 pub fn compute_sharpness_variance(img: &DynamicImage) -> f32 {
     rapidraw_dsp::calculate_laplacian_variance(&img.to_rgb8()).sqrt().clamp(0.0, 100.0)
+}
+
+fn dist2d(a: [f32; 2], b: [f32; 2]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn single_eye_ear(landmarks: &[[f32; 2]], idx: &[usize; 6]) -> Option<f32> {
+    if landmarks.len() <= *idx.iter().max()? {
+        return None;
+    }
+    let p1 = landmarks[idx[0]];
+    let p2 = landmarks[idx[1]];
+    let p3 = landmarks[idx[2]];
+    let p4 = landmarks[idx[3]];
+    let p5 = landmarks[idx[4]];
+    let p6 = landmarks[idx[5]];
+    let horiz = dist2d(p1, p4);
+    if horiz <= 1e-4 {
+        return None;
+    }
+    Some((dist2d(p2, p6) + dist2d(p3, p5)) / (2.0 * horiz))
+}
+
+/// Computes `(left_ear, right_ear, ear_min)` from 478-point MediaPipe landmarks.
+pub fn compute_eye_aspect_ratio(landmarks: &[[f32; 2]]) -> Option<(f32, f32, f32)> {
+    let left = single_eye_ear(landmarks, &LEFT_EYE_EAR)?;
+    let right = single_eye_ear(landmarks, &RIGHT_EYE_EAR)?;
+    Some((left, right, left.min(right)))
+}
+
+/// Classifies eye openness state from `ear_min`:
+/// - `> 0.19`: `"open"` (`is_eyes_open = true`)
+/// - `0.15..=0.19`: `"squinting"` (`is_eyes_open = false`)
+/// - `< 0.15`: `"blink"` (`is_eyes_open = false`)
+pub fn classify_eye_state(ear_min: f32) -> (&'static str, bool) {
+    if ear_min > 0.19 {
+        ("open", true)
+    } else if ear_min >= 0.15 {
+        ("squinting", false)
+    } else {
+        ("blink", false)
+    }
+}
+
+/// Computes Laplacian sharpness strictly inside the left/right iris bounding boxes.
+pub fn compute_iris_sharpness(rgb: &image::RgbImage, landmarks: &[[f32; 2]]) -> Option<f32> {
+    if landmarks.len() < 478 {
+        return None;
+    }
+    let (w, h) = rgb.dimensions();
+    if w < 8 || h < 8 {
+        return None;
+    }
+    let mut best: Option<f32> = None;
+    for iris in [&RIGHT_IRIS_LM, &LEFT_IRIS_LM] {
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for &i in iris {
+            let [x, y] = landmarks[i];
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        let pad = ((max_x - min_x).max(max_y - min_y) * 0.35).max(3.0);
+        let x0 = (min_x - pad).floor().clamp(0.0, (w - 4) as f32) as u32;
+        let y0 = (min_y - pad).floor().clamp(0.0, (h - 4) as f32) as u32;
+        let x1 = (max_x + pad).ceil().clamp((x0 + 4) as f32, w as f32) as u32;
+        let y1 = (max_y + pad).ceil().clamp((y0 + 4) as f32, h as f32) as u32;
+        let pw = x1.saturating_sub(x0);
+        let ph = y1.saturating_sub(y0);
+        if pw >= 4 && ph >= 4 {
+            let sub = image::imageops::crop_imm(rgb, x0, y0, pw, ph).to_image();
+            let score = rapidraw_dsp::calculate_laplacian_variance(&sub).sqrt().clamp(0.0, 100.0);
+            best = Some(best.map_or(score, |prev| prev.max(score)));
+        }
+    }
+    best
 }
 
 /// Detects multiple distinct skin-tone face clusters and extracts 100% crop patches
@@ -181,30 +274,55 @@ pub(crate) fn detect_face_loupes(img: &DynamicImage) -> Vec<FaceLoupeCrop> {
             is_eyes_open,
             is_sharp,
             crop_data_url,
+            ear_min: None,
+            eye_state: if is_eyes_open { "open" } else { "blink" }.to_string(),
+            iris_sharpness: eye_contrast,
         });
     }
     loupes
 }
 
-#[tauri::command]
-pub fn analyze_culling_frame(
+pub(crate) fn analyze_culling_frame_sync(
     path: String,
-    app_handle: AppHandle,
-    state: State<crate::app::state::AppState>,
+    app_handle: &AppHandle,
+    state: &crate::app::state::AppState,
+    abort_gen: Option<u64>,
 ) -> Result<CullingFrameAnalysis, String> {
+    let check_gen = || -> Result<(), String> {
+        if let Some(g) = abort_gen
+            && CULL_ANALYZE_GEN.load(Ordering::Relaxed) != g
+        {
+            return Err("superseded".to_string());
+        }
+        Ok(())
+    };
+    check_gen()?;
+
     let (source_path, _) = parse_virtual_path(&path);
     let path_str = source_path.to_string_lossy().to_string();
 
     let bytes = read_file_mapped(Path::new(&path_str)).map_err(|e| e.to_string())?;
-    let settings = crate::app::settings::load_settings(app_handle).unwrap_or_default();
+    check_gen()?;
+    let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
     let img = load_base_image_from_bytes(&bytes, &path_str, false, &settings, None)
         .map_err(|e| e.to_string())?;
+    check_gen()?;
 
     let sharpness = compute_sharpness_variance(&img);
     let is_blurry = sharpness < 14.0;
     let (w, h) = img.dimensions();
+    let rgb = img.to_rgb8();
 
-    // Prefer cached 478-point face landmarks from face_masking.rs when available
+    // Try cached MediaPipe landmarks session (without triggering downloads during culling)
+    let landmarks_session = if let Ok(guard) = state.ai_state.lock()
+        && let Some(ai) = guard.as_ref()
+        && let Some(models) = ai.models.as_ref()
+    {
+        models.face_landmarks().ok()
+    } else {
+        None
+    };
+
     let mut faces: Vec<FaceLoupeCrop> = Vec::new();
     if let Ok(ai_guard) = state.ai_state.lock()
         && let Some(ai) = ai_guard.as_ref()
@@ -212,6 +330,7 @@ pub fn analyze_culling_frame(
         && crate::ai::jobs::source_id(&source_path).as_deref() == Some(analysis.path_hash.as_str())
     {
         for (face_index, face) in analysis.faces.iter().take(6).enumerate() {
+            check_gen()?;
             let box_size = (face.size * 1.4).clamp(80.0, (w.min(h) as f32) * 0.6);
             let crop_x = (face.center[0] - box_size * 0.5).clamp(0.0, (w as f32 - box_size).max(0.0)) as u32;
             let crop_y = (face.center[1] - box_size * 0.5).clamp(0.0, (h as f32 - box_size).max(0.0)) as u32;
@@ -221,6 +340,25 @@ pub fn analyze_culling_frame(
             let face_sharp = compute_sharpness_variance(&cropped);
             let eye_band = cropped.crop_imm(0, (crop_h as f32 * 0.2) as u32, crop_w, (crop_h as f32 * 0.35).max(1.0) as u32);
             let eye_sharp = compute_sharpness_variance(&eye_band);
+
+            let (ear_min, eye_state, is_eyes_open, iris_sharpness) = if let Some(ref lm_sess) = landmarks_session
+                && let Ok(Some(lm)) = crate::masks::face::fit_face_landmarks_in_box(
+                    lm_sess,
+                    &rgb,
+                    [crop_x as f32, crop_y as f32, (crop_x + crop_w) as f32, (crop_y + crop_h) as f32],
+                )
+            {
+                let iris = compute_iris_sharpness(&rgb, &lm).unwrap_or(eye_sharp);
+                if let Some((_, _, min_ear)) = compute_eye_aspect_ratio(&lm) {
+                    let (label, open) = classify_eye_state(min_ear);
+                    (Some(min_ear), label.to_string(), open, iris)
+                } else {
+                    (None, if eye_sharp > 12.0 { "open" } else { "blink" }.to_string(), eye_sharp > 12.0, iris)
+                }
+            } else {
+                (None, if eye_sharp > 12.0 { "open" } else { "blink" }.to_string(), eye_sharp > 12.0, eye_sharp)
+            };
+
             let thumb = cropped.resize_to_fill(200, 200, image::imageops::FilterType::Triangle);
             let mut buf = Cursor::new(Vec::new());
             let _ = thumb.to_rgb8().write_to(&mut buf, ImageFormat::Jpeg);
@@ -231,14 +369,39 @@ pub fn analyze_culling_frame(
                 width: crop_w as f32 / w as f32,
                 height: crop_h as f32 / h as f32,
                 sharpness_score: face_sharp,
-                is_eyes_open: eye_sharp > 12.0,
-                is_sharp: face_sharp > 18.0,
+                is_eyes_open,
+                is_sharp: iris_sharpness > 16.0 || face_sharp > 18.0,
                 crop_data_url: format!("data:image/jpeg;base64,{}", general_purpose::STANDARD.encode(buf.get_ref())),
+                ear_min,
+                eye_state,
+                iris_sharpness,
             });
         }
     }
     if faces.is_empty() {
         faces = detect_face_loupes(&img);
+        if let Some(ref lm_sess) = landmarks_session {
+            for face in &mut faces {
+                check_gen()?;
+                let fx0 = face.x * w as f32;
+                let fy0 = face.y * h as f32;
+                let fx1 = (face.x + face.width) * w as f32;
+                let fy1 = (face.y + face.height) * h as f32;
+                if let Ok(Some(lm)) =
+                    crate::masks::face::fit_face_landmarks_in_box(lm_sess, &rgb, [fx0, fy0, fx1, fy1])
+                {
+                    let iris = compute_iris_sharpness(&rgb, &lm).unwrap_or(face.iris_sharpness);
+                    face.iris_sharpness = iris;
+                    face.is_sharp = iris > 16.0 || face.sharpness_score > 18.0;
+                    if let Some((_, _, min_ear)) = compute_eye_aspect_ratio(&lm) {
+                        let (label, open) = classify_eye_state(min_ear);
+                        face.ear_min = Some(min_ear);
+                        face.eye_state = label.to_string();
+                        face.is_eyes_open = open;
+                    }
+                }
+            }
+        }
     }
 
     // Compute basic exposure rating
@@ -262,6 +425,26 @@ pub fn analyze_culling_frame(
 }
 
 #[tauri::command]
+pub async fn analyze_culling_frame(
+    path: String,
+    app_handle: AppHandle,
+    state: State<'_, crate::app::state::AppState>,
+) -> Result<CullingFrameAnalysis, String> {
+    let my_gen = CULL_ANALYZE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let state_arc = std::sync::Arc::new(state.inner());
+    let app_clone = app_handle.clone();
+    // Safety note: State<'_, AppState> borrows from Tauri's managed state (app_handle.state::<AppState>())
+    drop(state_arc);
+    tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        let app_state = app_handle.state::<crate::app::state::AppState>();
+        analyze_culling_frame_sync(path, &app_clone, &app_state, Some(my_gen))
+    })
+    .await
+    .map_err(|e| format!("Culling analysis task failed: {e}"))?
+}
+
+#[tauri::command]
 pub fn batch_auto_triage_cull(
     paths: Vec<String>,
     blur_threshold: Option<f32>,
@@ -272,8 +455,16 @@ pub fn batch_auto_triage_cull(
     let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("batch_auto_triage_cull");
     let learned_cutoff = paths.first().and_then(|first_path| {
         let (src, _) = parse_virtual_path(first_path);
-        let bytes = std::fs::read(&src).ok()?;
-        let (make, model) = crate::metadata::exif_processing::read_camera_make_model(first_path, &bytes)?;
+        let src_str = src.to_string_lossy();
+        let (make, model) = if let Some(map) = crate::metadata::exif_processing::read_rrexif_sidecar(&src) {
+            (
+                map.get("Make").cloned().unwrap_or_default(),
+                map.get("Model").cloned().unwrap_or_default(),
+            )
+        } else {
+            let mapped = read_file_mapped(&src).ok()?;
+            crate::metadata::exif_processing::read_camera_make_model(&src_str, &mapped)?
+        };
         let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
         crate::enhanced::local_priors::get_culler_sharpness_cutoff(&cam_key, "unknown_lens")
     });
@@ -296,7 +487,7 @@ pub fn batch_auto_triage_cull(
             }),
         );
 
-        if let Ok(analysis) = analyze_culling_frame(path_str.clone(), app_handle.clone(), state.clone()) {
+        if let Ok(analysis) = analyze_culling_frame_sync(path_str.clone(), &app_handle, state.inner(), None) {
             let mut reject = false;
             if analysis.sharpness_score < min_sharpness {
                 rejected_blurry_count += 1;
@@ -812,6 +1003,9 @@ mod tests {
             is_eyes_open: true,
             is_sharp: true,
             crop_data_url: "".to_string(),
+            ear_min: Some(0.28),
+            eye_state: "open".to_string(),
+            iris_sharpness: 80.0,
         }];
 
         let blink_face = vec![FaceLoupeCrop {
@@ -824,6 +1018,9 @@ mod tests {
             is_eyes_open: false, // Closed eyes / blink!
             is_sharp: true,
             crop_data_url: "".to_string(),
+            ear_min: Some(0.11),
+            eye_state: "blink".to_string(),
+            iris_sharpness: 80.0,
         }];
 
         let score_open = compute_hero_score(80.0, 75.0, &open_eyes_face);
@@ -835,6 +1032,58 @@ mod tests {
             score_open,
             score_blink
         );
+    }
+
+    #[test]
+    fn test_ear_eye_aspect_ratio_open_squint_blink() {
+        let mut lm = vec![[0.0f32, 0.0f32]; 478];
+        let set_eye = |lm: &mut Vec<[f32; 2]>, idx: &[usize; 6], half_h: f32| {
+            lm[idx[0]] = [100.0, 100.0];
+            lm[idx[3]] = [140.0, 100.0];
+            lm[idx[1]] = [114.0, 100.0 - half_h];
+            lm[idx[5]] = [114.0, 100.0 + half_h];
+            lm[idx[2]] = [126.0, 100.0 - half_h];
+            lm[idx[4]] = [126.0, 100.0 + half_h];
+        };
+
+        // Open eyes: vertical span 12 -> EAR = 0.30
+        set_eye(&mut lm, &LEFT_EYE_EAR, 6.0);
+        set_eye(&mut lm, &RIGHT_EYE_EAR, 6.0);
+        let (_, _, ear_open) = compute_eye_aspect_ratio(&lm).unwrap();
+        assert!((ear_open - 0.30).abs() < 1e-3);
+        assert_eq!(classify_eye_state(ear_open), ("open", true));
+
+        // Squinting left eye: EAR = 0.17
+        set_eye(&mut lm, &LEFT_EYE_EAR, 3.4);
+        let (_, _, ear_squint) = compute_eye_aspect_ratio(&lm).unwrap();
+        assert_eq!(classify_eye_state(ear_squint), ("squinting", false));
+
+        // Blink: EAR = 0.08
+        set_eye(&mut lm, &RIGHT_EYE_EAR, 1.6);
+        let (_, _, ear_blink) = compute_eye_aspect_ratio(&lm).unwrap();
+        assert_eq!(classify_eye_state(ear_blink), ("blink", false));
+    }
+
+    #[test]
+    fn test_iris_sharpness_distinguishes_sharp_pupil_from_blurred() {
+        let mut sharp = image::RgbImage::from_pixel(64, 64, image::Rgb([128, 128, 128]));
+        let flat = image::RgbImage::from_pixel(64, 64, image::Rgb([128, 128, 128]));
+        for y in 24..40 {
+            for x in 24..40 {
+                let v = if (x + y) % 2 == 0 { 220 } else { 40 };
+                sharp.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+        let mut lm = vec![[0.0f32, 0.0f32]; 478];
+        for (k, &idx) in RIGHT_IRIS_LM.iter().enumerate() {
+            lm[idx] = [28.0 + (k as f32) * 2.0, 32.0];
+        }
+        for (k, &idx) in LEFT_IRIS_LM.iter().enumerate() {
+            lm[idx] = [28.0 + (k as f32) * 2.0, 32.0];
+        }
+        let s_sharp = compute_iris_sharpness(&sharp, &lm).unwrap();
+        let s_flat = compute_iris_sharpness(&flat, &lm).unwrap();
+        assert!(s_sharp > s_flat + 10.0);
     }
 
     #[test]

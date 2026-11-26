@@ -520,6 +520,9 @@ pub async fn move_files(
 
     renames.retain(|source, _| moved.contains(Path::new(source)));
     sync_album_path_changes(&app_handle, Some(&renames), None, None);
+    for (old_str, new_str) in &renames {
+        crate::library::catalog_db::rename_path(&app_handle, old_str, new_str);
+    }
 
     result
 }
@@ -649,6 +652,8 @@ pub fn delete_files_from_disk(paths: Vec<String>, app_handle: AppHandle) -> Resu
     }
 
     sync_album_path_changes(&app_handle, None, Some(&deletions), None);
+    let deleted_list: Vec<String> = deletions.into_iter().collect();
+    crate::library::catalog_db::delete_paths(&app_handle, &deleted_list);
 
     Ok(())
 }
@@ -758,6 +763,8 @@ pub fn delete_files_with_associated(
     }
 
     sync_album_path_changes(&app_handle, None, Some(&deletions), None);
+    let deleted_list: Vec<String> = deletions.into_iter().collect();
+    crate::library::catalog_db::delete_paths(&app_handle, &deleted_list);
 
     Ok(())
 }
@@ -1135,6 +1142,9 @@ pub fn rename_files(
     }
 
     sync_album_path_changes(&app_handle, Some(&renames), None, None);
+    for (old_str, new_str) in &renames {
+        crate::library::catalog_db::rename_path(&app_handle, old_str, new_str);
+    }
 
     // One entry per input path, in order, keeping virtual copy ids; unrenamed files keep their path.
     let final_new_paths = paths

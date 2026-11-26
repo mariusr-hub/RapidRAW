@@ -26,6 +26,8 @@ import {
   FolderPlus,
   RefreshCw,
   Menu,
+  Sparkles,
+  Trash2,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
@@ -39,7 +41,16 @@ import { useShallow } from 'zustand/react/shallow';
 import { useLibraryStore } from '../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useUIStore } from '../../../store/useUIStore';
-import { AlbumItem, AlbumGroup, Album, SortDirection, type FolderNode } from '../../../types/library';
+import {
+  AlbumItem,
+  AlbumGroup,
+  Album,
+  ImageFile,
+  SmartCollectionInfo,
+  SmartCollectionRule,
+  SortDirection,
+  type FolderNode,
+} from '../../../types/library';
 import { Invokes } from '../../../types/invokes';
 import { FolderTreeSort } from '../../../types/settings';
 import { useLibraryActions } from '../../../hooks/useLibraryActions';
@@ -727,6 +738,13 @@ export default function FolderTree({
 
   const [searchQuery, setSearchQuery] = useState('');
   const [isHovering, setIsHovering] = useState(false);
+  const [smartCollections, setSmartCollections] = useState<SmartCollectionInfo[]>([]);
+  const [newSmartName, setNewSmartName] = useState('');
+  const [showNewSmartInput, setShowNewSmartInput] = useState(false);
+  const activeSmartCollectionId = useLibraryStore((state) => state.activeSmartCollectionId);
+  const smartCollectionsRefreshKey = useLibraryStore((state) => state.smartCollectionsRefreshKey);
+  const filterCriteria = useLibraryStore((state) => state.filterCriteria);
+  const searchCriteria = useLibraryStore((state) => state.searchCriteria);
   const pinnedFolders = appSettings?.pinnedFolders || [];
   const openSections = appSettings?.openTreeSections ?? ['current'];
   const showImageCounts = appSettings?.enableFolderImageCounts ?? false;
@@ -738,6 +756,80 @@ export default function FolderTree({
   useEffect(() => {
     invoke(Invokes.GetAlbums).then((res: any) => useLibraryStore.getState().setLibrary({ albumTree: res }));
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    invoke<SmartCollectionInfo[]>(Invokes.ListSmartCollections)
+      .then((res) => {
+        if (active) setSmartCollections(res);
+      })
+      .catch((err) => console.warn('Failed to load smart collections:', err));
+    return () => {
+      active = false;
+    };
+  }, [smartCollectionsRefreshKey, folderTrees.length]);
+
+  const handleSelectSmartCollection = async (col: SmartCollectionInfo) => {
+    try {
+      const items = await invoke<ImageFile[]>(Invokes.QuerySmartCollection, { id: col.id });
+      const ratings: Record<string, number> = {};
+      for (const item of items) {
+        if (item.rating > 0) ratings[item.path] = item.rating;
+      }
+      useLibraryStore.getState().setLibrary({
+        imageList: items,
+        imageRatings: ratings,
+        activeSmartCollectionId: col.id,
+        similarSourcePath: null,
+        activeAlbumId: null,
+        multiSelectedPaths: [],
+        libraryActivePath: items[0]?.path ?? null,
+      });
+    } catch (err) {
+      console.warn('Failed to query smart collection:', err);
+    }
+  };
+
+  const handleSaveCurrentFilterCollection = async () => {
+    const trimmed = newSmartName.trim();
+    if (!trimmed) return;
+    const rules: SmartCollectionRule = {
+      ...(filterCriteria.rating > 0 ? { minRating: filterCriteria.rating } : {}),
+      ...(filterCriteria.flagStatus === 'picked' ? { flag: 'pick' } : {}),
+      ...(filterCriteria.editedStatus === 'editedOnly'
+        ? { isEdited: true }
+        : filterCriteria.editedStatus === 'uneditedOnly'
+          ? { isEdited: false }
+          : {}),
+      ...(filterCriteria.colors?.length === 1 && filterCriteria.colors[0] !== 'none'
+        ? { colorLabel: filterCriteria.colors[0] }
+        : {}),
+      ...(searchCriteria.text.trim() ? { tagContains: searchCriteria.text.trim() } : {}),
+    };
+    try {
+      await invoke<SmartCollectionInfo>(Invokes.SaveSmartCollection, { name: trimmed, rules });
+      setNewSmartName('');
+      setShowNewSmartInput(false);
+      useLibraryStore.getState().setLibrary((s) => ({
+        smartCollectionsRefreshKey: s.smartCollectionsRefreshKey + 1,
+      }));
+    } catch (err) {
+      console.warn('Failed to save smart collection:', err);
+    }
+  };
+
+  const handleDeleteSmartCollection = async (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    try {
+      await invoke(Invokes.DeleteSmartCollection, { id });
+      useLibraryStore.getState().setLibrary((s) => ({
+        activeSmartCollectionId: s.activeSmartCollectionId === id ? null : s.activeSmartCollectionId,
+        smartCollectionsRefreshKey: s.smartCollectionsRefreshKey + 1,
+      }));
+    } catch (err) {
+      console.warn('Failed to delete smart collection:', err);
+    }
+  };
 
   const toggleSection = (section: string) => {
     if (appSettings) {
@@ -1062,6 +1154,87 @@ export default function FolderTree({
               selectedAlbumId={activeAlbumId}
               showImageCounts={showImageCounts && isHovering}
             />
+
+            {smartCollections.length > 0 && !isSearching && (
+              <>
+                <div className="flex items-center justify-between pr-1">
+                  <div className="flex-1">
+                    <SectionHeader
+                      title={t('library.folders.sections.smartCollections', 'Smart Collections')}
+                      isOpen={openSections.includes('smart') || !appSettings?.openTreeSections}
+                      onToggle={() => toggleSection('smart')}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowNewSmartInput((v) => !v)}
+                    className="p-1 rounded hover:bg-card-active text-text-secondary hover:text-text-primary cursor-pointer"
+                    data-tooltip="Save current filter as Smart Collection"
+                  >
+                    <Plus size={13} />
+                  </button>
+                </div>
+                {(openSections.includes('smart') || !appSettings?.openTreeSections) && (
+                  <div className="pt-0.5 pb-2 space-y-0.5">
+                    {showNewSmartInput && (
+                      <div className="flex items-center gap-1 px-2 pb-1">
+                        <input
+                          type="text"
+                          value={newSmartName}
+                          onChange={(e) => setNewSmartName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') handleSaveCurrentFilterCollection();
+                            if (e.key === 'Escape') setShowNewSmartInput(false);
+                          }}
+                          placeholder="Collection name..."
+                          className="flex-1 min-w-0 h-6 px-2 text-xs bg-bg-primary border border-border-color rounded focus:outline-hidden"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleSaveCurrentFilterCollection}
+                          className="px-2 h-6 rounded text-[11px] bg-accent text-button-text font-medium cursor-pointer"
+                        >
+                          Save
+                        </button>
+                      </div>
+                    )}
+                    {smartCollections.map((col) => {
+                      const active = activeSmartCollectionId === col.id;
+                      return (
+                        <div
+                          key={col.id}
+                          onClick={() => handleSelectSmartCollection(col)}
+                          className={clsx(
+                            'group flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-xs cursor-pointer transition-colors',
+                            active
+                              ? 'bg-accent/15 text-accent font-medium'
+                              : 'text-text-secondary hover:bg-card-active hover:text-text-primary',
+                          )}
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <Sparkles size={13} className="shrink-0 opacity-80" />
+                            <span className="truncate">{col.name}</span>
+                          </span>
+                          <span className="flex items-center gap-1 shrink-0">
+                            <span className="text-[11px] font-mono opacity-65">{col.count}</span>
+                            {!col.builtin && (
+                              <button
+                                type="button"
+                                onClick={(e) => handleDeleteSmartCollection(e, col.id)}
+                                className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:text-red-400 cursor-pointer"
+                                title="Delete smart collection"
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            )}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
 
             {filteredTrees && filteredTrees.length > 0 && (
               <>

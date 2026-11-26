@@ -28,6 +28,9 @@ interface FaceLoupeCrop {
   is_eyes_open: boolean;
   is_sharp: boolean;
   crop_data_url: string;
+  ear_min: number | null;
+  eye_state: string;
+  iris_sharpness: number;
 }
 
 interface CullingFrameAnalysis {
@@ -185,12 +188,13 @@ export default function SpeedCullerModal() {
     };
   }, [isOpen, currentPath, cacheRawPreview]);
 
-  // Pre-load lookahead ring buffer (previous 1, next 2 images) to high-res previews with request deduplication
+  // Pre-load lookahead ring buffer (next 3, previous 1 images) to 2048px previews with request deduplication
   useEffect(() => {
     if (!isOpen || paths.length === 0) return;
     const preloadIndices = [
       currentIndex + 1,
       currentIndex + 2,
+      currentIndex + 3,
       currentIndex - 1,
     ].filter((i) => i >= 0 && i < paths.length);
 
@@ -214,7 +218,7 @@ export default function SpeedCullerModal() {
     });
   }, [isOpen, currentIndex, paths, cacheRawPreview]);
 
-  // Background face analysis for active frame with 120ms debounce
+  // Background Channel 2 face & EAR analysis for active frame with stale-frame preemption
   useEffect(() => {
     if (!isOpen || !currentPath) {
       setAnalysis(null);
@@ -224,7 +228,7 @@ export default function SpeedCullerModal() {
     let isMounted = true;
     const timer = setTimeout(() => {
       setIsAnalyzing(true);
-      invoke<CullingFrameAnalysis>('analyze_culling_frame', { path: currentPath })
+      invoke<CullingFrameAnalysis>(Invokes.AnalyzeCullingFrame, { path: currentPath })
         .then((res) => {
           if (isMounted) {
             setAnalysis(res);
@@ -233,11 +237,13 @@ export default function SpeedCullerModal() {
         })
         .catch((err) => {
           if (isMounted) {
-            console.warn('Frame analysis failed:', err);
+            if (!String(err).includes('superseded')) {
+              console.warn('Frame analysis failed:', err);
+            }
             setIsAnalyzing(false);
           }
         });
-    }, 120);
+    }, 60);
 
     return () => {
       isMounted = false;
@@ -753,21 +759,30 @@ export default function SpeedCullerModal() {
                       alt={`Face ${fIdx + 1}`}
                       className="w-full h-full object-cover"
                     />
-                    <div className="absolute bottom-0 inset-x-0 bg-black/60 backdrop-blur-xs py-0.5 text-center text-[9px] font-mono text-white">
-                      {Math.round(face.sharpness_score)}%
+                    <div className="absolute bottom-0 inset-x-0 bg-black/65 backdrop-blur-xs py-0.5 text-center text-[9px] font-mono text-white">
+                      {Math.round(face.iris_sharpness || face.sharpness_score)}%
                     </div>
                   </div>
 
                   <span
                     className={`text-[9px] font-bold uppercase tracking-tight ${
-                      face.is_sharp && face.is_eyes_open
-                        ? 'text-emerald-400'
-                        : !face.is_eyes_open
+                      face.eye_state === 'blink' || (!face.is_eyes_open && face.eye_state !== 'squinting')
                         ? 'text-rose-400'
-                        : 'text-amber-400'
+                        : face.eye_state === 'squinting'
+                        ? 'text-amber-400'
+                        : face.is_sharp
+                        ? 'text-emerald-400'
+                        : 'text-amber-300'
                     }`}
+                    title={face.ear_min != null ? `EAR ${face.ear_min.toFixed(2)} · Iris ${Math.round(face.iris_sharpness)}%` : undefined}
                   >
-                    {!face.is_eyes_open ? 'Blink' : face.is_sharp ? 'Sharp' : 'Soft'}
+                    {face.eye_state === 'blink' || (!face.is_eyes_open && face.eye_state !== 'squinting')
+                      ? 'Blink'
+                      : face.eye_state === 'squinting'
+                      ? 'Squint'
+                      : face.is_sharp
+                      ? 'Open · Sharp'
+                      : 'Open · Soft'}
                   </span>
                 </div>
               ))}
