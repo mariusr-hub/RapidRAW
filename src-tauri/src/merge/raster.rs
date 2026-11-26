@@ -102,7 +102,17 @@ impl Raster {
                     sum[c] += wyj * acc[c];
                 }
             }
-            out[..ch.min(4)].copy_from_slice(&sum[..ch.min(4)]);
+            let r1 = self.index(x0 as usize + 1, y0 as usize + 1);
+            let r2 = self.index(x0 as usize + 1, y0 as usize + 2);
+            for c in 0..ch.min(4) {
+                let p00 = self.data[r1 + c];
+                let p10 = self.data[r1 + ch + c];
+                let p01 = self.data[r2 + c];
+                let p11 = self.data[r2 + ch + c];
+                let lo = p00.min(p10).min(p01).min(p11);
+                let hi = p00.max(p10).max(p01).max(p11);
+                out[c] = sum[c].clamp(lo, hi);
+            }
             return;
         }
         for (c, value) in out.iter_mut().enumerate().take(ch) {
@@ -114,7 +124,13 @@ impl Raster {
                 }
                 sum += wyj * row;
             }
-            *value = sum;
+            let p00 = self.get_clamped(x0 + 1, y0 + 1, c);
+            let p10 = self.get_clamped(x0 + 2, y0 + 1, c);
+            let p01 = self.get_clamped(x0 + 1, y0 + 2, c);
+            let p11 = self.get_clamped(x0 + 2, y0 + 2, c);
+            let lo = p00.min(p10).min(p01).min(p11);
+            let hi = p00.max(p10).max(p01).max(p11);
+            *value = sum.clamp(lo, hi);
         }
     }
 }
@@ -684,4 +700,87 @@ pub fn encoded_luminance(image: &Raster) -> Raster {
     map_pixels(image, 1, |p, o| {
         o[0] = transfer.encode(luminance(p).max(0.0))
     })
+}
+
+pub fn tone_compressed_luminance(image: &Raster) -> Raster {
+    let total = image.width * image.height;
+    let step = (total / 32_000).max(1);
+    let mut samples: Vec<f32> = (0..total)
+        .step_by(step)
+        .filter_map(|i| {
+            let lum = luminance(image.pixel_at(i));
+            (lum.is_finite() && lum > 1e-5).then_some(lum)
+        })
+        .collect();
+    let median = if samples.is_empty() {
+        0.18
+    } else {
+        let mid = samples.len() / 2;
+        *samples.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1
+    };
+    let scale = 0.36 / median.max(1e-5);
+    let transfer = srgb_transfer();
+    map_pixels(image, 1, |p, o| {
+        let lum = luminance(p);
+        let clean = if lum.is_finite() { lum.max(0.0) } else { 0.0 };
+        let mapped = (clean * scale) / (1.0 + clean * scale);
+        o[0] = transfer.encode(mapped.clamp(0.0, 1.0));
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bicubic_anti_ringing_prevents_negative_hdr_overshoot() {
+        let (w, h) = (16usize, 16usize);
+        let mut data = Vec::with_capacity(w * h * 3);
+        for _y in 0..h {
+            for x in 0..w {
+                let v = if x < 8 { 0.01 } else { 8.0 };
+                data.extend_from_slice(&[v, v, v]);
+            }
+        }
+        let raster = Raster::from_data(w, h, 3, data);
+        let mut out = [0.0f32; 3];
+        for step in 0..100 {
+            let x = 5.0 + step as f32 * 0.06;
+            raster.bicubic(x, 8.25, &mut out);
+            for c in 0..3 {
+                assert!(
+                    out[c] >= 0.01 - 1e-5 && out[c] <= 8.0 + 1e-5,
+                    "Bicubic ringing out of [0.01, 8.0] at x={}: {}",
+                    x,
+                    out[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_tone_compressed_luminance_preserves_midtone_contrast_with_bright_hdr_sky() {
+        let (w, h) = (30usize, 10usize);
+        let mut data = Vec::with_capacity(w * h * 3);
+        for _y in 0..h {
+            for x in 0..w {
+                let v = if x < 10 {
+                    0.02
+                } else if x < 20 {
+                    0.18
+                } else {
+                    12.0
+                };
+                data.extend_from_slice(&[v, v, v]);
+            }
+        }
+        let raster = Raster::from_data(w, h, 3, data);
+        let luma = tone_compressed_luminance(&raster);
+        let mid = luma.get(15, 5, 0);
+        assert!(
+            mid > 0.35 && mid < 0.70,
+            "Midtone should stay well-contrasted despite 12.0 sky: got {}",
+            mid
+        );
+    }
 }

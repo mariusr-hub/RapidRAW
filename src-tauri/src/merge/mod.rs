@@ -41,18 +41,58 @@ pub enum MergeKind {
 pub struct MergeContext<'a> {
     pub settings: &'a AppSettings,
     pub memory_budget: &'a Arc<MemoryBudget>,
+    pub app_handle: &'a AppHandle,
     pub progress: &'a (dyn Fn(String) + Sync),
+    pub is_cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
 impl MergeContext<'_> {
     pub fn loader(&self, linear_raw: bool) -> SourceLoader<'_> {
-        SourceLoader::new(self.settings, self.memory_budget, linear_raw)
+        self.loader_with_options(linear_raw, false, true)
+    }
+
+    pub fn loader_with_half_size(&self, linear_raw: bool, half_size: bool) -> SourceLoader<'_> {
+        self.loader_with_options(linear_raw, half_size, true)
+    }
+
+    pub fn loader_with_options(
+        &self,
+        linear_raw: bool,
+        half_size: bool,
+        apply_edits: bool,
+    ) -> SourceLoader<'_> {
+        SourceLoader::new(
+            self.settings,
+            self.memory_budget,
+            self.app_handle,
+            linear_raw,
+            half_size,
+            apply_edits,
+        )
+    }
+
+    pub fn loader_for_hdr_brackets(
+        &self,
+        linear_raw: bool,
+        half_size: bool,
+        apply_edits: bool,
+    ) -> SourceLoader<'_> {
+        self.loader_with_options(linear_raw, half_size, apply_edits)
+            .with_hdr_linear(linear_raw)
     }
 
     pub fn report(&self, message: impl Into<String>) {
         let message = message.into();
         log::info!("merge: {}", message);
         (self.progress)(message);
+    }
+
+    pub fn check_cancelled(&self) -> Result<(), String> {
+        if (self.is_cancelled)() {
+            Err("The merge was cancelled.".to_string())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -63,12 +103,18 @@ pub fn parse_settings<T: DeserializeOwned>(settings: &Value) -> Result<T, String
 fn build_session(
     kind: MergeKind,
     paths: &[String],
+    half_size: bool,
+    settings: &Value,
     context: &MergeContext,
 ) -> Result<Box<dyn MergeSession>, String> {
+    let apply_edits = settings
+        .get("applyEdits")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     Ok(match kind {
-        MergeKind::Panorama => Box::new(panorama::build_session(paths, context)?),
-        MergeKind::Hdr => Box::new(hdr::build_session(paths, context)?),
-        MergeKind::FocusStack => Box::new(focus::build_session(paths, context)?),
+        MergeKind::Panorama => Box::new(panorama::build_session(paths, half_size, settings, context)?),
+        MergeKind::Hdr => Box::new(hdr::build_session(paths, half_size, apply_edits, context)?),
+        MergeKind::FocusStack => Box::new(focus::build_session(paths, half_size, context)?),
     })
 }
 
@@ -89,21 +135,31 @@ pub async fn start_merge(
     let current_generation = state.merge_generation.clone();
     let memory_budget = state.memory_budget.clone();
     let paths = source_paths(&paths);
+    let half_size = settings
+        .get("halfSize")
+        .or_else(|| settings.get("fastDraft"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     tokio::task::spawn_blocking(move || {
         let app_settings = load_settings(app_handle.clone()).unwrap_or_default();
         let progress = |message: String| {
             let _ = app_handle.emit("merge-progress", message);
         };
+        let is_cancelled = || current_generation.load(Ordering::SeqCst) != generation;
         let context = MergeContext {
             settings: &app_settings,
             memory_budget: &memory_budget,
+            app_handle: &app_handle,
             progress: &progress,
+            is_cancelled: &is_cancelled,
         };
         let start = std::time::Instant::now();
-        let mut session = build_session(kind, &paths, &context)?;
+        let mut session = build_session(kind, &paths, half_size, &settings, &context)?;
+        context.check_cancelled()?;
         context.report("Creating preview...");
         let preview = session.preview(&settings)?;
+        context.check_cancelled()?;
         log::info!(
             "{:?} merge of {} images took {:.2?}",
             kind,
@@ -157,19 +213,32 @@ pub async fn save_merge(
         let progress = |message: String| {
             let _ = app_handle.emit("merge-progress", message);
         };
+        let is_cancelled = || current_generation.load(Ordering::SeqCst) != generation;
         let context = MergeContext {
             settings: &app_settings,
             memory_budget: &memory_budget,
+            app_handle: &app_handle,
             progress: &progress,
+            is_cancelled: &is_cancelled,
         };
         let start = std::time::Instant::now();
+        let format = output::MergeOutputFormat::from_settings(&settings);
         match session.render(&settings, &context) {
             Ok(output) => {
-                drop(session);
                 context.report("Saving...");
-                let path = save_output(output);
-                log::info!("Full resolution merge saved in {:.2?}", start.elapsed());
-                path
+                match save_output(output, format) {
+                    Ok(path) => {
+                        drop(session);
+                        log::info!("Full resolution merge saved in {:.2?}", start.elapsed());
+                        Ok(path)
+                    }
+                    Err(e) => {
+                        if current_generation.load(Ordering::SeqCst) == generation {
+                            *slot.lock().unwrap() = Some(session);
+                        }
+                        Err(e)
+                    }
+                }
             }
             Err(e) => {
                 if current_generation.load(Ordering::SeqCst) == generation {

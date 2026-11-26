@@ -285,6 +285,7 @@ pub fn develop_raw_image(
     let is_linear_format = is_linear_raw_format(&raw_image);
     let is_floating_point = matches!(raw_image.data, RawImageData::Float(_));
 
+    let is_hdr_linear = linear_mode == "hdr_linear";
     let (apply_ungamma, apply_calibration) = match linear_mode.as_str() {
         "gamma" => (true, true),
         "skip_calib" => (false, false),
@@ -321,6 +322,7 @@ pub fn develop_raw_image(
         orientation,
         denoise,
         sharpen,
+        recover_highlights: !is_hdr_linear,
     };
 
     if let (Some(wb), Some(camera_to_working)) = (cfa_balance, &camera_to_working)
@@ -448,7 +450,7 @@ pub fn develop_raw_image(
                     b = srgb_to_linear(b.max(0.0));
                 }
 
-                let (rec_r, rec_g, rec_b) = if is_floating_point {
+                let (rec_r, rec_g, rec_b) = if is_floating_point || is_hdr_linear {
                     (r, g, b)
                 } else {
                     recover_clipped_pixel(r, g, b)
@@ -549,6 +551,97 @@ fn cfa_white_balance(raw_image: &RawImage) -> Option<[f32; 3]> {
             raw_image.wb_coeffs[2],
         ])
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct LinearBayerFrame {
+    pub data: Vec<f32>,
+    pub width: usize,
+    pub height: usize,
+    pub cfa: [[u8; 2]; 2],
+    pub wb: [f32; 3],
+    pub cam_to_working: [[f32; 3]; 3],
+    pub orientation: Orientation,
+}
+
+pub(crate) fn extract_linear_bayer_cfa(file_bytes: &[u8]) -> Result<LinearBayerFrame> {
+    let source = RawSource::new_from_slice(file_bytes);
+    let decoder = rawler::get_decoder(&source)?;
+    let orientation = metadata_orientation(decoder.as_ref(), &source).unwrap_or(Orientation::Normal);
+    let mut raw_image: RawImage = decoder.raw_image(&source, &RawDecodeParams::default(), false)?;
+
+    raw_image.wb_coeffs = crate::decode::multi_exposure::neutralize_wb_if_multiexposure(
+        raw_image.wb_coeffs,
+        file_bytes,
+    );
+
+    let RawPhotometricInterpretation::Cfa(config) = &raw_image.photometric else {
+        return Err(anyhow!("RAW file does not contain a mosaic CFA"));
+    };
+    if raw_image.cpp != 1 || config.cfa.width != 2 || config.cfa.height != 2 || !config.cfa.is_rgb() {
+        return Err(anyhow!("CFA layout is not a 2x2 RGB Bayer pattern"));
+    }
+    let RawImageData::Integer(raw_u16) = &raw_image.data else {
+        return Err(anyhow!("Expected integer raw CFA samples"));
+    };
+    if raw_u16.len() < raw_image.width * raw_image.height {
+        return Err(anyhow!("Truncated RAW CFA buffer"));
+    }
+
+    let domain = crate::decode::demosaic::active_domain(&raw_image, 64)
+        .ok_or_else(|| anyhow!("Invalid active RAW domain"))?;
+
+    // Preserve Bayer phase parity by aligning origin and dimensions to even boundaries.
+    let x0 = domain.p.x + (domain.p.x & 1);
+    let y0 = domain.p.y + (domain.p.y & 1);
+    let width = (domain.p.x + domain.d.w).saturating_sub(x0) & !1;
+    let height = (domain.p.y + domain.d.h).saturating_sub(y0) & !1;
+    if width < 64 || height < 64 {
+        return Err(anyhow!("Active Bayer region too small"));
+    }
+
+    let cfa: [[u8; 2]; 2] =
+        std::array::from_fn(|y| std::array::from_fn(|x| config.cfa.color_at(y, x) as u8));
+    let black = raw_image.blacklevel.as_bayer_array();
+    let white = white_level(&raw_image);
+    let wb = cfa_white_balance(&raw_image).unwrap_or([1.0; 3]);
+
+    let cam_to_working = CameraToWorking::new(&raw_image)
+        .map(|c| {
+            [
+                [c.matrix[0][0], c.matrix[0][1], c.matrix[0][2]],
+                [c.matrix[1][0], c.matrix[1][1], c.matrix[1][2]],
+                [c.matrix[2][0], c.matrix[2][1], c.matrix[2][2]],
+            ]
+        })
+        .unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+
+    let mut data = vec![0.0f32; width * height];
+    let stride = raw_image.width;
+    data.par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(dy, row)| {
+            let sy = y0 + dy;
+            let src_row = &raw_u16[sy * stride + x0..sy * stride + x0 + width];
+            let b0 = black[(dy & 1) * 2];
+            let b1 = black[(dy & 1) * 2 + 1];
+            let s0 = 1.0 / (white - b0).max(1.0);
+            let s1 = 1.0 / (white - b1).max(1.0);
+            for (dx, dst) in row.iter_mut().enumerate() {
+                let (b, s) = if (dx & 1) == 0 { (b0, s0) } else { (b1, s1) };
+                *dst = ((src_row[dx] as f32 - b) * s).max(0.0);
+            }
+        });
+
+    Ok(LinearBayerFrame {
+        data,
+        width,
+        height,
+        cfa,
+        wb,
+        cam_to_working,
+        orientation,
+    })
 }
 
 pub fn read_as_shot(file_bytes: &[u8]) -> Option<AsShot> {

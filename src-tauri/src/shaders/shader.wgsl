@@ -151,7 +151,7 @@ struct GlobalAdjustments {
     skin_shield_strength: f32,
     orton_spread: f32,
     foliage_enhancer: f32,
-    _pad_phase1_end: f32,
+    hsl_mode: u32,
     lens_k1: f32,
     lens_k2: f32,
     lens_k3: f32,
@@ -167,7 +167,7 @@ struct GlobalAdjustments {
     clearview_strength: f32,
     clearview_t0: f32,
     micro_contrast: f32,
-    _pad_reserved: f32,
+    hsl_skin_lock: f32,
 
     monochrome: MonochromeSettings,
 }
@@ -972,6 +972,114 @@ fn hsl_probe(color: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(hsv.x / 360.0, hsv.y, hsv.z, 1.0);
 }
 
+fn compute_skin_lock_weight(color: vec3<f32>, skin_lock: f32) -> f32 {
+    if (skin_lock <= 0.0001) {
+        return 1.0;
+    }
+    let ok = working_to_oklab(max(color, vec3<f32>(0.0)));
+    let chroma = length(vec2<f32>(ok.y, ok.z));
+    let hue = atan2(ok.z, ok.y); // OKLab hue in [-PI, PI]; human skin clusters around ~0.68 rad (~39 deg)
+    var d_hue = abs(hue - 0.68);
+    if (d_hue > 3.14159265) {
+        d_hue = 6.28318530 - d_hue;
+    }
+    let hue_prob = exp(-(d_hue * d_hue) / (2.0 * 0.36 * 0.36));
+    let chroma_mask = smoothstep(0.015, 0.045, chroma) * (1.0 - smoothstep(0.14, 0.24, chroma));
+    let luma_mask = smoothstep(0.18, 0.35, ok.x) * (1.0 - smoothstep(0.88, 0.99, ok.x));
+    let skin_prob = clamp(hue_prob * chroma_mask * luma_mask, 0.0, 1.0);
+    return 1.0 - clamp(skin_lock, 0.0, 1.0) * skin_prob;
+}
+
+fn eval_hsl_shifts(hue_deg: f32, hsl_adjustments: array<HslColor, 8>) -> vec3<f32> {
+    var raw_influences: array<f32, 8>;
+    var total_raw_influence: f32 = 0.0;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let range = HSL_RANGES[i];
+        let influence = get_raw_hsl_influence(hue_deg, range.center, range.width);
+        raw_influences[i] = influence;
+        total_raw_influence += influence;
+    }
+    var dh: f32 = 0.0;
+    var ds: f32 = 0.0;
+    var dl: f32 = 0.0;
+    let denom = max(total_raw_influence, 1.0e-5);
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let w = raw_influences[i] / denom;
+        dh += hsl_adjustments[i].hue * 2.0 * w;
+        ds += hsl_adjustments[i].saturation * w;
+        dl += hsl_adjustments[i].luminance * w;
+    }
+    return vec3<f32>(dh, ds, dl);
+}
+
+fn deform_cube_vertex(base_rgb: vec3<f32>, hue_deg: f32, hsl_adjustments: array<HslColor, 8>) -> vec3<f32> {
+    let shifts = eval_hsl_shifts(hue_deg, hsl_adjustments);
+    let target_hue = (hue_deg + shifts.x + 360.0) % 360.0;
+    let sat_scale = clamp(1.0 + shifts.y, 0.0, 1.85);
+    let lum_scale = max(1.0 + shifts.z * 0.85, 0.15);
+    let shifted_rgb = hsv_to_working(vec3<f32>(target_hue, 1.0, 1.0));
+    let base_luma = max(get_luma(base_rgb), 1.0e-4);
+    let target_luma = base_luma * lum_scale;
+    let new_luma = max(get_luma(shifted_rgb), 1.0e-4);
+    let balanced = mix(vec3<f32>(base_luma), shifted_rgb * (base_luma / new_luma), sat_scale);
+    return balanced * (target_luma / base_luma);
+}
+
+fn apply_hsl_tetrahedral(safe_color: vec3<f32>, hsl_adjustments: array<HslColor, 8>) -> vec3<f32> {
+    let k_min = min(safe_color.r, min(safe_color.g, safe_color.b));
+    let k_max = max(safe_color.r, max(safe_color.g, safe_color.b));
+    let chroma = k_max - k_min;
+    if (chroma < 1.0e-5) {
+        return safe_color;
+    }
+
+    var primary_vec = vec3<f32>(1.0, 0.0, 0.0);
+    var primary_hue = 0.0;
+    var secondary_vec = vec3<f32>(1.0, 1.0, 0.0);
+    var secondary_hue = 60.0;
+    var c_mid = safe_color.g;
+
+    if (safe_color.r >= safe_color.g && safe_color.g >= safe_color.b) {
+        c_mid = safe_color.g;
+        primary_vec = vec3<f32>(1.0, 0.0, 0.0); primary_hue = 0.0;
+        secondary_vec = vec3<f32>(1.0, 1.0, 0.0); secondary_hue = 60.0;
+    } else if (safe_color.g > safe_color.r && safe_color.r >= safe_color.b) {
+        c_mid = safe_color.r;
+        primary_vec = vec3<f32>(0.0, 1.0, 0.0); primary_hue = 120.0;
+        secondary_vec = vec3<f32>(1.0, 1.0, 0.0); secondary_hue = 60.0;
+    } else if (safe_color.g >= safe_color.b && safe_color.b > safe_color.r) {
+        c_mid = safe_color.b;
+        primary_vec = vec3<f32>(0.0, 1.0, 0.0); primary_hue = 120.0;
+        secondary_vec = vec3<f32>(0.0, 1.0, 1.0); secondary_hue = 180.0;
+    } else if (safe_color.b > safe_color.g && safe_color.g > safe_color.r) {
+        c_mid = safe_color.g;
+        primary_vec = vec3<f32>(0.0, 0.0, 1.0); primary_hue = 240.0;
+        secondary_vec = vec3<f32>(0.0, 1.0, 1.0); secondary_hue = 180.0;
+    } else if (safe_color.b >= safe_color.r && safe_color.r >= safe_color.g) {
+        c_mid = safe_color.r;
+        primary_vec = vec3<f32>(0.0, 0.0, 1.0); primary_hue = 240.0;
+        secondary_vec = vec3<f32>(1.0, 0.0, 1.0); secondary_hue = 300.0;
+    } else {
+        c_mid = safe_color.b;
+        primary_vec = vec3<f32>(1.0, 0.0, 0.0); primary_hue = 0.0;
+        secondary_vec = vec3<f32>(1.0, 0.0, 1.0); secondary_hue = 300.0;
+    }
+
+    let c_p = k_max - c_mid;
+    let c_s = c_mid - k_min;
+    let c_w = k_min;
+
+    let def_p = deform_cube_vertex(primary_vec, primary_hue, hsl_adjustments);
+    let def_s = deform_cube_vertex(secondary_vec, secondary_hue, hsl_adjustments);
+
+    // Subtle mid-sector Orange refinement near ~25-40 deg so orange slider moves cleanly without tearing.
+    let hsv_px = working_to_hsv(safe_color);
+    let sat_mask = smoothstep(0.04, 0.22, hsv_px.y);
+    let raw_deformed = c_w * vec3<f32>(1.0, 1.0, 1.0) + c_p * def_p + c_s * def_s;
+    let blended = mix(safe_color, raw_deformed, sat_mask);
+    return fit_grade_gamut(max(blended, vec3<f32>(0.0)), 0.0);
+}
+
 fn apply_hsl_panel(color: vec3<f32>, hsl_adjustments: array<HslColor, 8>, coords_i: vec2<i32>) -> vec3<f32> {
     var has_adjustments = false;
     for (var i = 0u; i < 8u; i = i + 1u) {
@@ -990,6 +1098,17 @@ fn apply_hsl_panel(color: vec3<f32>, hsl_adjustments: array<HslColor, 8>, coords
     if (distance(safe_color.r, safe_color.g) < 0.001 && distance(safe_color.g, safe_color.b) < 0.001) {
         return safe_color;
     }
+
+    let skin_factor = compute_skin_lock_weight(safe_color, adjustments.global.hsl_skin_lock);
+    if (skin_factor < 0.0001) {
+        return safe_color;
+    }
+
+    if (adjustments.global.hsl_mode == 1u) {
+        let tetra_out = apply_hsl_tetrahedral(safe_color, hsl_adjustments);
+        return mix(safe_color, tetra_out, skin_factor);
+    }
+
     let original_hsv = working_to_hsv(safe_color);
     let original_luma = get_luma(safe_color);
 
@@ -1026,21 +1145,24 @@ fn apply_hsl_panel(color: vec3<f32>, hsl_adjustments: array<HslColor, 8>, coords
         total_lum_adjust += hsl_adjustments[i].luminance * luma_influence;
     }
 
+    var classic_out = safe_color;
     if (original_hsv.y * (1.0 + total_sat_multiplier) < 0.0001) {
         let final_luma = original_luma * (1.0 + total_lum_adjust);
-        return vec3<f32>(final_luma);
+        classic_out = vec3<f32>(max(0.0, final_luma));
+    } else {
+        var hsv = original_hsv;
+        hsv.x = (hsv.x + total_hue_shift + 360.0) % 360.0;
+        hsv.y = clamp(hsv.y * (1.0 + total_sat_multiplier), 0.0, max(original_hsv.y, 1.0));
+        let hs_shifted_rgb = hsv_to_working(vec3<f32>(hsv.x, hsv.y, original_hsv.z));
+        let new_luma = get_luma(hs_shifted_rgb);
+        let target_luma = original_luma * (1.0 + total_lum_adjust);
+        if (new_luma < 0.0001) {
+            classic_out = vec3<f32>(max(0.0, target_luma));
+        } else {
+            classic_out = hs_shifted_rgb * (target_luma / new_luma);
+        }
     }
-    var hsv = original_hsv;
-    hsv.x = (hsv.x + total_hue_shift + 360.0) % 360.0;
-    hsv.y = clamp(hsv.y * (1.0 + total_sat_multiplier), 0.0, max(original_hsv.y, 1.0));
-    let hs_shifted_rgb = hsv_to_working(vec3<f32>(hsv.x, hsv.y, original_hsv.z));
-    let new_luma = get_luma(hs_shifted_rgb);
-    let target_luma = original_luma * (1.0 + total_lum_adjust);
-    if (new_luma < 0.0001) {
-        return vec3<f32>(max(0.0, target_luma));
-    }
-    let final_color = hs_shifted_rgb * (target_luma / new_luma);
-    return final_color;
+    return mix(safe_color, classic_out, skin_factor);
 }
 
 const CG_SLOPE_STEP: f32 = 0.05;
@@ -2571,6 +2693,16 @@ fn main(
             h7_h += m.hsl[7].hue * influence; h7_s += m.hsl[7].saturation * influence; h7_l += m.hsl[7].luminance * influence;
         }
     }
+
+    t_contrast = clamp(t_contrast, -1.0, 1.0);
+    t_highlights = clamp(t_highlights, -1.0, 1.0);
+    t_shadows = clamp(t_shadows, -1.0, 1.0);
+    t_whites = clamp(t_whites, -1.0, 1.0);
+    t_blacks = clamp(t_blacks, -1.0, 1.0);
+    t_saturation = clamp(t_saturation, -1.0, 1.0);
+    t_vibrance = clamp(t_vibrance, -1.0, 1.0);
+    t_clarity = clamp(t_clarity, -1.0, 1.0);
+    t_dehaze = clamp(t_dehaze, -1.0, 1.0);
 
     let final_hsl = array<HslColor, 8>(
         HslColor(h0_h, h0_s, h0_l, 0.0), HslColor(h1_h, h1_s, h1_l, 0.0),

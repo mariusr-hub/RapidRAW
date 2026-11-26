@@ -392,6 +392,7 @@ fn input_for(
 fn run_upscaler(
     input: &Rgb32FImage,
     session: &Session,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     on_progress: &(dyn Fn(f32) + Sync),
 ) -> Result<Rgb32FImage, String> {
     let (w, h) = input.dimensions();
@@ -400,7 +401,7 @@ fn run_upscaler(
         .par_iter_mut()
         .for_each(|v| *v = v.clamp(0.0, 1.0).powf(1.0 / GAMMA));
 
-    let mut output = crate::ai::tiling::run_ai_upscale(&encoded, session, FACTOR, on_progress)
+    let mut output = crate::ai::tiling::run_ai_upscale_with_cancel(&encoded, session, FACTOR, cancel, on_progress)
         .map_err(|e| e.to_string())?;
     drop(encoded);
     if output.dimensions() != (w * FACTOR, h * FACTOR) {
@@ -455,6 +456,11 @@ pub fn ensure_generated(
             continue;
         };
         let path = path.clone();
+        let state = app_handle.state::<AppState>();
+        state
+            .ai_denoise_cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let cancel = Arc::clone(&state.ai_denoise_cancel);
         CACHE.spawn(
             app_handle,
             loaded_image,
@@ -462,7 +468,7 @@ pub fn ensure_generated(
             false,
             load_session(app_handle.clone()),
             move |session, base, progress| {
-                run_upscaler(&input_for(base, &path, input)?, &session, progress)
+                run_upscaler(&input_for(base, &path, input)?, &session, Some(&cancel), progress)
             },
         );
         return;
@@ -477,9 +483,14 @@ pub fn has_cached_entry(path: &str, adjustments: &serde_json::Value) -> bool {
 }
 
 pub fn is_generating(path: &str) -> bool {
-    [None, Some(DenoiseMethod::Nind), Some(DenoiseMethod::Bm3d)]
-        .into_iter()
-        .any(|input| CACHE.is_pending(&key(path, input)))
+    [
+        None,
+        Some(DenoiseMethod::Nind),
+        Some(DenoiseMethod::Bm3d),
+        Some(DenoiseMethod::RawPreDemosaic),
+    ]
+    .into_iter()
+    .any(|input| CACHE.is_pending(&key(path, input)))
 }
 
 pub fn generate_for_base(
@@ -496,6 +507,8 @@ pub fn generate_for_base(
                 Err("AI denoise result is not available".to_string())
             };
         }
+        let state = app_handle.state::<AppState>();
+        let cancel = Arc::clone(&state.ai_denoise_cancel);
         let generated = CACHE.generate_blocking(
             app_handle,
             path,
@@ -503,7 +516,7 @@ pub fn generate_for_base(
             key(path, input),
             load_session(app_handle.clone()),
             |session, base, progress| {
-                run_upscaler(&input_for(base, path, input)?, &session, progress)
+                run_upscaler(&input_for(base, path, input)?, &session, Some(&cancel), progress)
             },
         )?;
         if !generated {

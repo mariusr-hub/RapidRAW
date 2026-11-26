@@ -227,9 +227,15 @@ export const HeroCuratorModal: React.FC<HeroCuratorModalProps> = ({
           <div className="flex justify-end items-center gap-2 px-6 py-4 bg-bg-secondary/40 border-t border-border-color">
             <button
               type="button"
-              onClick={onClose}
-              disabled={isAnalyzing}
-              className="px-4 py-2 rounded-md text-text-secondary hover:bg-surface transition-colors text-sm disabled:opacity-50"
+              onClick={() => {
+                if (isAnalyzing) {
+                  invoke('cancel_ai_denoise').catch((err) => console.warn('Cancel failed:', err));
+                  setIsAnalyzing(false);
+                  return;
+                }
+                onClose();
+              }}
+              className="px-4 py-2 rounded-md text-text-secondary hover:bg-surface transition-colors text-sm cursor-pointer"
             >
               {result ? 'Done' : 'Cancel'}
             </button>

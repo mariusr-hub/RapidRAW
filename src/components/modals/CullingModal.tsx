@@ -295,6 +295,16 @@ export default function CullingModal({
           />
         </div>
       )}
+      <button
+        type="button"
+        onClick={() => {
+          invoke(Invokes.CancelAiDenoise).catch((err) => console.warn('Cancel failed:', err));
+          onClose();
+        }}
+        className="mt-4 px-4 py-1.5 rounded-md text-xs text-text-secondary hover:bg-bg-primary border border-border-color/50 transition-colors cursor-pointer"
+      >
+        {t('modals.culling.cancel')}
+      </button>
     </div>
   );
 
@@ -527,7 +537,7 @@ export default function CullingModal({
 
   return (
     <div
-      className={`fixed inset-0 flex items-center justify-center z-50 bg-black/30 backdrop-blur-xs transition-opacity duration-300 ease-in-out ${
+      className={`fixed inset-0 flex items-center justify-center p-2 sm:p-4 z-50 bg-black/30 backdrop-blur-xs transition-opacity duration-300 ease-in-out ${
         show ? 'opacity-100' : 'opacity-0'
       }`}
       onClick={onClose}
@@ -535,7 +545,7 @@ export default function CullingModal({
       aria-modal="true"
     >
       <div
-        className={`bg-surface rounded-lg shadow-xl p-6 w-full max-w-3xl transform transition-all duration-300 ease-out ${
+        className={`bg-surface rounded-lg shadow-xl p-5 sm:p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto transform transition-all duration-300 ease-out ${
           show ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4'
         }`}
         onClick={(e) => e.stopPropagation()}

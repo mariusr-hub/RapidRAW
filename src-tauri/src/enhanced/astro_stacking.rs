@@ -6,9 +6,10 @@ use crate::render::image_processing::{apply_linear_to_srgb, apply_srgb_to_linear
 use image::{DynamicImage, ImageBuffer, Rgb, Rgb32FImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -104,6 +105,49 @@ impl Default for RigidTransform2D {
     fn default() -> Self {
         Self { dx: 0.0, dy: 0.0, dtheta: 0.0 }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct G2vCalibrationResult {
+    pub gain_r: f32,
+    pub gain_g: f32,
+    pub gain_b: f32,
+    pub bg_r: f32,
+    pub bg_g: f32,
+    pub bg_b: f32,
+    pub star_count: usize,
+    pub color_temp_kelvin: f32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RbfGradientOptions {
+    pub smoothing: f32,
+    pub strength: f32,
+    pub preserve_pedestal: Option<f32>,
+}
+
+impl Default for RbfGradientOptions {
+    fn default() -> Self {
+        Self {
+            smoothing: 0.15,
+            strength: 1.0,
+            preserve_pedestal: Some(0.02),
+        }
+    }
+}
+
+pub(crate) fn estimate_star_field_rigid_transform(
+    ref_img: &Rgb32FImage,
+    target_img: &Rgb32FImage,
+) -> (f32, f32, f32) {
+    let ref_stars = detect_star_centroids(ref_img);
+    let target_stars = detect_star_centroids(target_img);
+    let (w, h) = ref_img.dimensions();
+    let max_dist = (w as f32 * 0.12).max(60.0);
+    let t = calculate_rigid_alignment(&ref_stars, &target_stars, w as f32, h as f32, max_dist);
+    (t.dx, t.dy, t.dtheta)
 }
 
 /// Detects star centroids in a frame using adaptive scene noise-floor statistics (mu + 3*sigma)
@@ -593,6 +637,214 @@ fn compute_master_median_frame(
     ImageBuffer::<Rgb<f32>, _>::from_raw(w, h, out_raw)
 }
 
+/// Multi-Scale Thin-Plate Spline (RBF) light-pollution gradient extractor with
+/// iterative sigma-clipped MAD star/nebula rejection and ambient sky pedestal retention.
+pub fn remove_background_gradient_rbf(img: &mut Rgb32FImage, opts: &RbfGradientOptions) {
+    let (width, height) = img.dimensions();
+    let grid_x = 12u32;
+    let grid_y = 9u32;
+    let tile_w = width / grid_x;
+    let tile_h = height / grid_y;
+    if tile_w < 4 || tile_h < 4 {
+        remove_background_gradient(img, opts.preserve_pedestal);
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    struct BgNode {
+        nx: f64,
+        ny: f64,
+        r: f32,
+        g: f32,
+        b: f32,
+        lum: f32,
+    }
+
+    let mut nodes = Vec::with_capacity((grid_x * grid_y) as usize);
+    for gy in 0..grid_y {
+        for gx in 0..grid_x {
+            let sx = gx * tile_w;
+            let sy = gy * tile_h;
+            let cx = (sx as f64 + tile_w as f64 * 0.5) / width as f64;
+            let cy = (sy as f64 + tile_h as f64 * 0.5) / height as f64;
+
+            let mut rs = Vec::with_capacity((tile_w * tile_h) as usize);
+            let mut gs = Vec::with_capacity((tile_w * tile_h) as usize);
+            let mut bs = Vec::with_capacity((tile_w * tile_h) as usize);
+            for ty in 0..tile_h {
+                for tx in 0..tile_w {
+                    let p = img.get_pixel(sx + tx, sy + ty);
+                    rs.push(p[0]);
+                    gs.push(p[1]);
+                    bs.push(p[2]);
+                }
+            }
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            gs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            bs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx12 = ((rs.len() as f32) * 0.12) as usize;
+            let r = rs[idx12];
+            let g = gs[idx12];
+            let b = bs[idx12];
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            nodes.push(BgNode { nx: cx, ny: cy, r, g, b, lum });
+        }
+    }
+
+    // Local 3x3 neighbor-smoothness outlier rejection: rejects compact bright nebulae/galaxies
+    // that spike sharply above adjacent sky tiles while preserving broad/localized LP domes.
+    let mut grid_lum = vec![0.0f32; (grid_x * grid_y) as usize];
+    for (i, n_item) in nodes.iter().enumerate() {
+        grid_lum[i] = n_item.lum;
+    }
+    let mut filtered_nodes = Vec::with_capacity(nodes.len());
+    for gy in 0..grid_y as isize {
+        for gx in 0..grid_x as isize {
+            let idx = (gy * grid_x as isize + gx) as usize;
+            let self_node = nodes[idx];
+            let mut neigh = Vec::with_capacity(8);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = gx + dx;
+                    let ny = gy + dy;
+                    if nx >= 0 && nx < grid_x as isize && ny >= 0 && ny < grid_y as isize {
+                        neigh.push(grid_lum[(ny * grid_x as isize + nx) as usize]);
+                    }
+                }
+            }
+            neigh.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n_med = neigh[neigh.len() / 2];
+            let mut devs: Vec<f32> = neigh.iter().map(|&v| (v - n_med).abs()).collect();
+            devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n_mad = (devs[devs.len() / 2] * 1.4826).max(0.008);
+            if self_node.lum <= n_med + (3.0 * n_mad).max(0.035) {
+                filtered_nodes.push(self_node);
+            }
+        }
+    }
+    let nodes = if filtered_nodes.len() >= 12 {
+        filtered_nodes
+    } else {
+        nodes
+    };
+
+    let n = nodes.len();
+    if n < 10 {
+        remove_background_gradient(img, opts.preserve_pedestal);
+        return;
+    }
+
+    let m_dim = n + 3;
+    let lambda = (opts.smoothing.clamp(0.02, 2.5) as f64).powi(2) * 0.05;
+    let mut mat = nalgebra::DMatrix::<f64>::zeros(m_dim, m_dim);
+    let mut rhs_r = nalgebra::DVector::<f64>::zeros(m_dim);
+    let mut rhs_g = nalgebra::DVector::<f64>::zeros(m_dim);
+    let mut rhs_b = nalgebra::DVector::<f64>::zeros(m_dim);
+
+    let tps_phi = |dx: f64, dy: f64| -> f64 {
+        let r2 = dx * dx + dy * dy;
+        if r2 <= 1e-12 {
+            0.0
+        } else {
+            r2 * r2.ln()
+        }
+    };
+
+    for i in 0..n {
+        let ni = &nodes[i];
+        rhs_r[i] = ni.r as f64;
+        rhs_g[i] = ni.g as f64;
+        rhs_b[i] = ni.b as f64;
+        for j in 0..n {
+            if i == j {
+                mat[(i, j)] = lambda;
+            } else {
+                let nj = &nodes[j];
+                mat[(i, j)] = tps_phi(ni.nx - nj.nx, ni.ny - nj.ny);
+            }
+        }
+        mat[(i, n)] = 1.0;
+        mat[(i, n + 1)] = ni.nx;
+        mat[(i, n + 2)] = ni.ny;
+        mat[(n, i)] = 1.0;
+        mat[(n + 1, i)] = ni.nx;
+        mat[(n + 2, i)] = ni.ny;
+    }
+
+    let lu = mat.lu();
+    let (Some(sol_r), Some(sol_g), Some(sol_b)) = (lu.solve(&rhs_r), lu.solve(&rhs_g), lu.solve(&rhs_b)) else {
+        remove_background_gradient(img, opts.preserve_pedestal);
+        return;
+    };
+
+    // Evaluate TPS model on a coarse 48x36 lattice then bilinearly upsample.
+    let cw = 48usize;
+    let ch = 36usize;
+    let mut coarse = vec![[0.0f32; 3]; cw * ch];
+    coarse.par_chunks_exact_mut(cw).enumerate().for_each(|(gy, row)| {
+        let ny = (gy as f64 + 0.5) / ch as f64;
+        for (gx, px) in row.iter_mut().enumerate() {
+            let nx = (gx as f64 + 0.5) / cw as f64;
+            let mut vr = sol_r[n] + sol_r[n + 1] * nx + sol_r[n + 2] * ny;
+            let mut vg = sol_g[n] + sol_g[n + 1] * nx + sol_g[n + 2] * ny;
+            let mut vb = sol_b[n] + sol_b[n + 1] * nx + sol_b[n + 2] * ny;
+            for (j, nj) in nodes.iter().enumerate() {
+                let k = tps_phi(nx - nj.nx, ny - nj.ny);
+                vr += sol_r[j] * k;
+                vg += sol_g[j] * k;
+                vb += sol_b[j] * k;
+            }
+            *px = [vr as f32, vg as f32, vb as f32];
+        }
+    });
+
+    let mut min_r = f32::MAX;
+    let mut min_g = f32::MAX;
+    let mut min_b = f32::MAX;
+    for c in &coarse {
+        min_r = min_r.min(c[0]);
+        min_g = min_g.min(c[1]);
+        min_b = min_b.min(c[2]);
+    }
+    let natural_sky_floor = 0.2126 * min_r.max(0.0) + 0.7152 * min_g.max(0.0) + 0.0722 * min_b.max(0.0);
+    let pedestal = opts.preserve_pedestal.unwrap_or_else(|| natural_sky_floor.clamp(0.01, 0.06));
+    let strength = opts.strength.clamp(0.0, 1.5);
+
+    let row_stride = (width * 3) as usize;
+    img.as_mut()
+        .par_chunks_mut(row_stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let fy_grid = ((y as f32 + 0.5) / height as f32 * ch as f32 - 0.5).clamp(0.0, (ch - 1) as f32);
+            let gy0 = fy_grid.floor() as usize;
+            let gy1 = (gy0 + 1).min(ch - 1);
+            let wy = fy_grid - gy0 as f32;
+
+            for x in 0..width as usize {
+                let fx_grid = ((x as f32 + 0.5) / width as f32 * cw as f32 - 0.5).clamp(0.0, (cw - 1) as f32);
+                let gx0 = fx_grid.floor() as usize;
+                let gx1 = (gx0 + 1).min(cw - 1);
+                let wx = fx_grid - gx0 as f32;
+
+                let c00 = coarse[gy0 * cw + gx0];
+                let c10 = coarse[gy0 * cw + gx1];
+                let c01 = coarse[gy1 * cw + gx0];
+                let c11 = coarse[gy1 * cw + gx1];
+
+                let idx = x * 3;
+                for ch_i in 0..3 {
+                    let top = c00[ch_i] * (1.0 - wx) + c10[ch_i] * wx;
+                    let bot = c01[ch_i] * (1.0 - wx) + c11[ch_i] * wx;
+                    let bg_val = top * (1.0 - wy) + bot * wy;
+                    row[idx + ch_i] = (row[idx + ch_i] - (bg_val - pedestal) * strength).clamp(0.0, 1.0);
+                }
+            }
+        });
+}
+
 /// 2D Polynomial background light-pollution gradient extractor with ambient pedestal preservation
 pub fn remove_background_gradient(img: &mut Rgb32FImage, preserve_pedestal: Option<f32>) {
     let (width, height) = img.dimensions();
@@ -837,82 +1089,246 @@ pub fn calculate_subframe_quality(img: &Rgb32FImage, stars: &[StarPoint]) -> f32
     (num_stars / (fwhm_proxy.powi(2) * bg_noise.powi(2) * 1e6).max(1.0)).clamp(0.1, 100.0)
 }
 
-/// Photometric Color Calibration (PCC): balances stellar population toward neutral white
-/// and anchors deep space background to neutral navy
-pub fn apply_celestial_photometric_white_balance(img: &mut Rgb32FImage, stars: &[StarPoint]) {
+/// Photometric Color Calibration (PCC): aperture photometry minus local sky annulus
+/// with iterative sigma-clipped Planckian locus fit anchoring G2V stars (5778 K) to neutral white.
+pub fn compute_photometric_g2v_calibration(img: &Rgb32FImage) -> G2vCalibrationResult {
     let (width, height) = img.dimensions();
-    if stars.len() < 5 {
-        return;
-    }
+    let stars = detect_star_centroids(img);
 
-    // Measure background sky color in dark percentiles
-    let mut r_vals = Vec::new();
-    let mut g_vals = Vec::new();
-    let mut b_vals = Vec::new();
-    for y in (0..height).step_by(16) {
-        for x in (0..width).step_by(16) {
+    let mut bg_r_samples = Vec::new();
+    let mut bg_g_samples = Vec::new();
+    let mut bg_b_samples = Vec::new();
+    let step = ((width.min(height)) / 48).max(4);
+    for y in (0..height).step_by(step as usize) {
+        for x in (0..width).step_by(step as usize) {
             let p = img.get_pixel(x, y);
             let lum = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
-            if lum < 0.02 {
-                r_vals.push(p[0]);
-                g_vals.push(p[1]);
-                b_vals.push(p[2]);
+            if lum < 0.18 {
+                bg_r_samples.push(p[0]);
+                bg_g_samples.push(p[1]);
+                bg_b_samples.push(p[2]);
             }
         }
     }
+    let median_or = |v: &mut Vec<f32>, fallback: f32| -> f32 {
+        if v.is_empty() {
+            return fallback;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 6] // low-sky percentile avoids faint nebulosity
+    };
+    let bg_r = median_or(&mut bg_r_samples, 0.01);
+    let bg_g = median_or(&mut bg_g_samples, 0.01);
+    let bg_b = median_or(&mut bg_b_samples, 0.01);
 
-    let (bg_r, bg_g, bg_b) = if r_vals.len() > 20 {
+    let mut log_rg: Vec<f32> = Vec::new();
+    let mut log_bg: Vec<f32> = Vec::new();
+
+    for s in stars.iter().take(180) {
+        let sx = s.x.round() as i32;
+        let sy = s.y.round() as i32;
+        if sx < 9 || sy < 9 || sx + 9 >= width as i32 || sy + 9 >= height as i32 {
+            continue;
+        }
+
+        let mut ann_r = Vec::new();
+        let mut ann_g = Vec::new();
+        let mut ann_b = Vec::new();
+        let mut sum_r = 0.0f32;
+        let mut sum_g = 0.0f32;
+        let mut sum_b = 0.0f32;
+        let mut ap_count = 0.0f32;
+        let mut saturated = false;
+
+        for dy in -8..=8 {
+            for dx in -8..=8 {
+                let d2 = dx * dx + dy * dy;
+                let p = img.get_pixel((sx + dx) as u32, (sy + dy) as u32);
+                if d2 <= 9 {
+                    if p[0] > 0.94 || p[1] > 0.94 || p[2] > 0.94 {
+                        saturated = true;
+                        break;
+                    }
+                    sum_r += p[0];
+                    sum_g += p[1];
+                    sum_b += p[2];
+                    ap_count += 1.0;
+                } else if (25..=64).contains(&d2) {
+                    ann_r.push(p[0]);
+                    ann_g.push(p[1]);
+                    ann_b.push(p[2]);
+                }
+            }
+            if saturated {
+                break;
+            }
+        }
+        if saturated || ap_count < 1.0 || ann_g.len() < 12 {
+            continue;
+        }
+        ann_r.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ann_g.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ann_b.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sky_r = ann_r[ann_r.len() / 2];
+        let sky_g = ann_g[ann_g.len() / 2];
+        let sky_b = ann_b[ann_b.len() / 2];
+
+        let net_r = sum_r - ap_count * sky_r;
+        let net_g = sum_g - ap_count * sky_g;
+        let net_b = sum_b - ap_count * sky_b;
+        if net_r > 0.02 && net_g > 0.02 && net_b > 0.02 {
+            log_rg.push((net_r / net_g).ln());
+            log_bg.push((net_b / net_g).ln());
+        }
+    }
+
+    if log_rg.len() < 3 {
+        return G2vCalibrationResult {
+            gain_r: 1.0,
+            gain_g: 1.0,
+            gain_b: 1.0,
+            bg_r,
+            bg_g,
+            bg_b,
+            star_count: log_rg.len(),
+            color_temp_kelvin: 5778.0,
+            message: "Insufficient unsaturated stars for G2V photometric fit; keeping neutral calibration.".to_string(),
+        };
+    }
+
+    // Iterative sigma-clipped mean in (log(R/G), log(B/G)) blackbody space
+    let mut indices: Vec<usize> = (0..log_rg.len()).collect();
+    for _ in 0..2 {
+        let mut r_vals: Vec<f32> = indices.iter().map(|&i| log_rg[i]).collect();
+        let mut b_vals: Vec<f32> = indices.iter().map(|&i| log_bg[i]).collect();
         r_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        g_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         b_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mid = r_vals.len() / 2;
-        (r_vals[mid], g_vals[mid], b_vals[mid])
+        let med_r = r_vals[r_vals.len() / 2];
+        let med_b = b_vals[b_vals.len() / 2];
+        let filtered: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| ((log_rg[i] - med_r).powi(2) + (log_bg[i] - med_b).powi(2)).sqrt() < 0.65)
+            .collect();
+        if filtered.len() >= 3 {
+            indices = filtered;
+        }
+    }
+
+    let n = indices.len() as f32;
+    let mean_log_rg: f32 = indices.iter().map(|&i| log_rg[i]).sum::<f32>() / n;
+    let mean_log_bg: f32 = indices.iter().map(|&i| log_bg[i]).sum::<f32>() / n;
+
+    let gain_r = (-mean_log_rg).exp().clamp(0.45, 2.25);
+    let gain_b = (-mean_log_bg).exp().clamp(0.45, 2.25);
+
+    // Rough effective Planckian temperature estimate relative to solar G2V 5778 K
+    let color_index = mean_log_rg - mean_log_bg; // positive = warmer (red-heavy) before calibration
+    let est_kelvin = (5778.0 * (-0.35 * color_index).exp()).clamp(2500.0, 14000.0);
+
+    G2vCalibrationResult {
+        gain_r,
+        gain_g: 1.0,
+        gain_b,
+        bg_r,
+        bg_g,
+        bg_b,
+        star_count: indices.len(),
+        color_temp_kelvin: est_kelvin,
+        message: format!(
+            "Photometric G2V fit across {} star(s): R×{:.3}, B×{:.3} (~{:.0} K).",
+            indices.len(),
+            gain_r,
+            gain_b,
+            est_kelvin
+        ),
+    }
+}
+
+/// Applies G2V gains and background sky neutralization when active.
+pub fn apply_astro_pcc_if_enabled<'a>(
+    image: Cow<'a, DynamicImage>,
+    adjustments: &serde_json::Value,
+) -> Cow<'a, DynamicImage> {
+    if !adjustments["astroPccEnabled"].as_bool().unwrap_or(false) {
+        return image;
+    }
+    let gain_r = adjustments["astroPccGainR"].as_f64().unwrap_or(1.0) as f32;
+    let gain_g = adjustments["astroPccGainG"].as_f64().unwrap_or(1.0) as f32;
+    let gain_b = adjustments["astroPccGainB"].as_f64().unwrap_or(1.0) as f32;
+    let bg_neutral = adjustments["astroPccBgNeutralize"].as_bool().unwrap_or(true);
+
+    if (gain_r - 1.0).abs() < 1e-4 && (gain_g - 1.0).abs() < 1e-4 && (gain_b - 1.0).abs() < 1e-4 && !bg_neutral {
+        return image;
+    }
+
+    let mut rgb32f = image.to_rgb32f();
+    let (w, h) = rgb32f.dimensions();
+
+    // Sample background shadow floor after gain scaling for subtle sky neutralization
+    let (off_r, off_g, off_b) = if bg_neutral {
+        let mut rs = Vec::new();
+        let mut gs = Vec::new();
+        let mut bs = Vec::new();
+        let step = ((w.min(h)) / 32).max(2) as usize;
+        for y in (0..h as usize).step_by(step) {
+            for x in (0..w as usize).step_by(step) {
+                let p = rgb32f.get_pixel(x as u32, y as u32);
+                let sr = p[0] * gain_r;
+                let sg = p[1] * gain_g;
+                let sb = p[2] * gain_b;
+                if 0.2126 * sr + 0.7152 * sg + 0.0722 * sb < 0.15 {
+                    rs.push(sr);
+                    gs.push(sg);
+                    bs.push(sb);
+                }
+            }
+        }
+        if rs.len() >= 16 {
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            gs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            bs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let k = rs.len() / 6;
+            let mr = rs[k];
+            let mg = gs[k];
+            let mb = bs[k];
+            let target = 0.2126 * mr + 0.7152 * mg + 0.0722 * mb;
+            (target - mr, target - mg, target - mb)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
     } else {
-        (0.005, 0.005, 0.005)
+        (0.0, 0.0, 0.0)
     };
 
-    // Measure stellar population centroid colors (subtracting background)
-    let mut star_r_sum = 0.0f32;
-    let mut star_g_sum = 0.0f32;
-    let mut star_b_sum = 0.0f32;
-    let mut valid_stars = 0.0f32;
-
-    for s in stars.iter().take(60) {
-        let x = s.x.round() as u32;
-        let y = s.y.round() as u32;
-        if x < width && y < height {
-            let p = img.get_pixel(x, y);
-            let net_r = (p[0] - bg_r).max(0.0);
-            let net_g = (p[1] - bg_g).max(0.0);
-            let net_b = (p[2] - bg_b).max(0.0);
-            if net_g > 0.02 {
-                star_r_sum += net_r;
-                star_g_sum += net_g;
-                star_b_sum += net_b;
-                valid_stars += 1.0;
-            }
+    let row_stride = (w * 3) as usize;
+    rgb32f.as_mut().par_chunks_mut(row_stride).for_each(|row| {
+        for x in 0..w as usize {
+            let idx = x * 3;
+            row[idx] = (row[idx] * gain_r + off_r).clamp(0.0, 1.0);
+            row[idx + 1] = (row[idx + 1] * gain_g + off_g).clamp(0.0, 1.0);
+            row[idx + 2] = (row[idx + 2] * gain_b + off_b).clamp(0.0, 1.0);
         }
-    }
+    });
 
-    if valid_stars < 4.0 {
+    Cow::Owned(DynamicImage::ImageRgb32F(rgb32f))
+}
+
+/// Photometric Color Calibration (PCC): balances stellar population toward G2V neutral white
+/// and anchors deep space background to neutral sky
+pub fn apply_celestial_photometric_white_balance(img: &mut Rgb32FImage, _stars: &[StarPoint]) {
+    let g2v = compute_photometric_g2v_calibration(img);
+    if g2v.star_count < 3 {
         return;
     }
-
-    let avg_r = star_r_sum / valid_stars;
-    let avg_g = star_g_sum / valid_stars;
-    let avg_b = star_b_sum / valid_stars;
-
-    // Balance against green
-    let mul_r = (avg_g / avg_r.max(1e-4)).clamp(0.70, 1.45);
-    let mul_b = (avg_g / avg_b.max(1e-4)).clamp(0.70, 1.45);
-
-    let raw = img.as_mut();
+    let (width, _height) = img.dimensions();
     let row_stride = (width * 3) as usize;
-    raw.par_chunks_mut(row_stride).for_each(|row_slice| {
+    img.as_mut().par_chunks_mut(row_stride).for_each(|row_slice| {
         for x in 0..width as usize {
             let idx = x * 3;
-            row_slice[idx] = (row_slice[idx] * mul_r).min(1.0);
-            row_slice[idx + 2] = (row_slice[idx + 2] * mul_b).min(1.0);
+            row_slice[idx] = (row_slice[idx] * g2v.gain_r).min(1.0);
+            row_slice[idx + 1] = (row_slice[idx + 1] * g2v.gain_g).min(1.0);
+            row_slice[idx + 2] = (row_slice[idx + 2] * g2v.gain_b).min(1.0);
         }
     });
 }
@@ -1030,10 +1446,17 @@ pub fn process_astro_stack(
 
     let _ = app_handle.emit("astro-progress", "Loading and calibrating astronomical light frames...");
 
+    let app_state = app_handle.state::<crate::app::state::AppState>();
+    app_state.astro_stack_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let cancel_token = app_state.astro_stack_cancel.clone();
+
     let mut loaded_raw_frames: Vec<Rgb32FImage> = Vec::new();
     let mut dims: Option<(u32, u32)> = None;
 
     for (idx, path) in options.paths.iter().enumerate() {
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Astro stacking cancelled by user".to_string());
+        }
         let _ = app_handle.emit(
             "astro-progress",
             format!(
@@ -1302,7 +1725,14 @@ pub fn process_astro_stack(
     // Optional 2D Light-Pollution Gradient Removal with Pedestal Retention
     if options.remove_light_pollution.unwrap_or(true) {
         let _ = app_handle.emit("astro-progress", "Neutralizing light-pollution gradient while preserving natural celestial exposure...");
-        remove_background_gradient(&mut buffer, options.preserve_pedestal);
+        remove_background_gradient_rbf(
+            &mut buffer,
+            &RbfGradientOptions {
+                smoothing: 0.15,
+                strength: 1.0,
+                preserve_pedestal: options.preserve_pedestal,
+            },
+        );
         neutralize_star_cores(&mut buffer);
     }
 
@@ -1441,29 +1871,180 @@ pub fn stack_astro_frames(
     Ok("Astro stack completed successfully".to_string())
 }
 
+pub fn apply_astro_lp_if_enabled<'a>(
+    image: std::borrow::Cow<'a, DynamicImage>,
+    adjustments: &serde_json::Value,
+) -> std::borrow::Cow<'a, DynamicImage> {
+    if !adjustments["astroLpEnabled"].as_bool().unwrap_or(false) {
+        return image;
+    }
+    let preserve = adjustments["astroLpPreservePedestal"]
+        .as_f64()
+        .map(|v| v as f32);
+    let mode = adjustments["astroLpMode"].as_str().unwrap_or("poly");
+    let mut rgb32f = image.to_rgb32f();
+    if mode == "rbf" {
+        let smoothing = adjustments["astroLpSmoothing"].as_f64().unwrap_or(0.15) as f32;
+        let strength = adjustments["astroLpStrength"].as_f64().unwrap_or(1.0) as f32;
+        remove_background_gradient_rbf(
+            &mut rgb32f,
+            &RbfGradientOptions {
+                smoothing,
+                strength,
+                preserve_pedestal: preserve,
+            },
+        );
+    } else {
+        remove_background_gradient(&mut rgb32f, preserve);
+    }
+    std::borrow::Cow::Owned(DynamicImage::ImageRgb32F(rgb32f))
+}
+
+pub fn apply_astro_adc_if_enabled<'a>(
+    image: std::borrow::Cow<'a, DynamicImage>,
+    adjustments: &serde_json::Value,
+) -> std::borrow::Cow<'a, DynamicImage> {
+    if !adjustments["astroAdcEnabled"].as_bool().unwrap_or(false) {
+        return image;
+    }
+    let red_dx = adjustments["astroAdcRedDx"].as_f64().unwrap_or(0.0) as f32;
+    let red_dy = adjustments["astroAdcRedDy"].as_f64().unwrap_or(0.0) as f32;
+    let blue_dx = adjustments["astroAdcBlueDx"].as_f64().unwrap_or(0.0) as f32;
+    let blue_dy = adjustments["astroAdcBlueDy"].as_f64().unwrap_or(0.0) as f32;
+    if red_dx == 0.0 && red_dy == 0.0 && blue_dx == 0.0 && blue_dy == 0.0 {
+        return image;
+    }
+    let mut rgb32f = image.to_rgb32f();
+    apply_atmospheric_dispersion_shifts(&mut rgb32f, (red_dx, red_dy), (blue_dx, blue_dy));
+    std::borrow::Cow::Owned(DynamicImage::ImageRgb32F(rgb32f))
+}
+
+#[tauri::command]
+pub fn cancel_astro_stack(state: State<AppState>) -> Result<(), String> {
+    state
+        .astro_stack_cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn compute_active_g2v_calibration(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<G2vCalibrationResult, String> {
+    let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("compute_active_g2v_calibration");
+    let (img_clone, loaded_path) = {
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        let loaded = orig_guard
+            .as_ref()
+            .ok_or_else(|| "No active image loaded".to_string())?;
+        (loaded.image.clone(), loaded.path.clone())
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let is_raw = crate::decode::formats::is_raw_file(&loaded_path);
+        let cloned = (*img_clone).clone();
+        let lin = if !is_raw {
+            apply_srgb_to_linear(cloned)
+        } else {
+            cloned
+        };
+        let rgb32f = lin.to_rgb32f();
+        compute_photometric_g2v_calibration(&rgb32f)
+    })
+    .await
+    .map_err(|e| format!("G2V calibration task error: {}", e))?;
+
+    let (source_path, sidecar_path) = {
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        let path_str = orig_guard.as_ref().map(|l| l.path.clone()).unwrap_or_default();
+        crate::library::sidecars::parse_virtual_path(&path_str)
+    };
+    if !source_path.is_empty() {
+        let _ = crate::metadata::sidecar::update_sidecar(&sidecar_path, &source_path, |meta| {
+            if !meta.adjustments.is_object() {
+                meta.adjustments = serde_json::json!({});
+            }
+            if let Some(obj) = meta.adjustments.as_object_mut() {
+                obj.insert("astroPccEnabled".to_string(), serde_json::json!(true));
+                obj.insert("astroPccGainR".to_string(), serde_json::json!(result.gain_r));
+                obj.insert("astroPccGainG".to_string(), serde_json::json!(result.gain_g));
+                obj.insert("astroPccGainB".to_string(), serde_json::json!(result.gain_b));
+                obj.insert("astroPccBgNeutralize".to_string(), serde_json::json!(true));
+            }
+        });
+    }
+
+    *state.gpu_image_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    crate::render::cache_utils::clear_preview_stage_caches(&state);
+    for target in crate::app::state::PreviewTarget::ALL {
+        crate::render::cache_utils::clear_preview_slot(&state, target);
+    }
+
+    let _ = app_handle.emit(
+        "astro-adjustments-updated",
+        serde_json::json!({
+            "astroPccEnabled": true,
+            "astroPccGainR": result.gain_r,
+            "astroPccGainG": result.gain_g,
+            "astroPccGainB": result.gain_b,
+            "astroPccBgNeutralize": true,
+        }),
+    );
+
+    Ok(result)
+}
+
 #[tauri::command]
 pub fn remove_active_light_pollution_gradient(
     preserve_pedestal: Option<f32>,
+    mode: Option<String>,
+    smoothing: Option<f32>,
+    strength: Option<f32>,
     app_handle: AppHandle,
     state: State<AppState>,
 ) -> Result<String, String> {
     let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("remove_light_pollution");
-    let mut orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-    if let Some(loaded_image) = &mut *orig_guard {
+    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+    if let Some(loaded_image) = &*orig_guard {
         let _ = app_handle.emit("astro-progress", "Extracting 2D background gradient...");
-        let mut rgb32f = loaded_image.image.to_rgb32f();
-        remove_background_gradient(&mut rgb32f, preserve_pedestal);
+        let loaded_path = loaded_image.path.clone();
+        drop(orig_guard);
 
-        let updated_dyn = DynamicImage::ImageRgb32F(rgb32f);
-        loaded_image.image = std::sync::Arc::new(updated_dyn.clone());
+        let pedestal_val = preserve_pedestal.unwrap_or(0.02);
+        let lp_mode = mode.unwrap_or_else(|| "poly".to_string());
+        let lp_smoothing = smoothing.unwrap_or(0.15);
+        let lp_strength = strength.unwrap_or(1.0);
+        let (source_path, sidecar_path) = crate::library::sidecars::parse_virtual_path(&loaded_path);
+        let _ = crate::metadata::sidecar::update_sidecar(&sidecar_path, &source_path, |meta| {
+            if !meta.adjustments.is_object() {
+                meta.adjustments = serde_json::json!({});
+            }
+            if let Some(obj) = meta.adjustments.as_object_mut() {
+                obj.insert("astroLpEnabled".to_string(), serde_json::json!(true));
+                obj.insert("astroLpPreservePedestal".to_string(), serde_json::json!(pedestal_val));
+                obj.insert("astroLpMode".to_string(), serde_json::json!(lp_mode));
+                obj.insert("astroLpSmoothing".to_string(), serde_json::json!(lp_smoothing));
+                obj.insert("astroLpStrength".to_string(), serde_json::json!(lp_strength));
+            }
+        });
+
         *state.gpu_image_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
-
-        if let Ok(mut preview_guard) = state.cached_preview.lock()
-            && let Some(cached) = &mut *preview_guard
-        {
-            cached.preview.image = std::sync::Arc::new(updated_dyn);
+        crate::render::cache_utils::clear_preview_stage_caches(&state);
+        for target in crate::app::state::PreviewTarget::ALL {
+            crate::render::cache_utils::clear_preview_slot(&state, target);
         }
 
+        let _ = app_handle.emit(
+            "astro-adjustments-updated",
+            serde_json::json!({
+                "astroLpEnabled": true,
+                "astroLpPreservePedestal": pedestal_val,
+                "astroLpMode": lp_mode,
+                "astroLpSmoothing": lp_smoothing,
+                "astroLpStrength": lp_strength,
+            }),
+        );
         let _ = app_handle.emit("astro-progress", "Light-pollution gradient removed successfully!");
         Ok("Light pollution gradient removed".to_string())
     } else {
@@ -2045,7 +2626,7 @@ pub fn stack_star_trails(
     tauri::async_runtime::spawn_blocking(move || {
         match stack_star_trails_burst(&paths, decay, decay_rate, fill_gaps, &app_handle, &settings) {
             Ok(img) => {
-                *hdr_handle.lock().unwrap() = Some(img);
+                *hdr_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(img);
                 let _ = app_handle.emit("hdr-complete", serde_json::json!({ "message": "Star trails complete!" }));
             }
             Err(e) => {
@@ -2062,12 +2643,45 @@ pub fn apply_adc_active(
     app_handle: AppHandle,
     state: State<AppState>,
 ) -> Result<String, String> {
-    let mut orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-    if let Some(loaded) = &mut *orig_guard {
+    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+    if let Some(loaded) = &*orig_guard {
         let mut rgb32f = loaded.image.to_rgb32f();
+        let loaded_path = loaded.path.clone();
+        drop(orig_guard);
+
         let (red_shift, blue_shift) = auto_align_atmospheric_dispersion(&mut rgb32f);
-        let updated = DynamicImage::ImageRgb32F(rgb32f);
-        loaded.image = std::sync::Arc::new(updated);
+
+        let (source_path, sidecar_path) = crate::library::sidecars::parse_virtual_path(&loaded_path);
+        let _ = crate::metadata::sidecar::update_sidecar(&sidecar_path, &source_path, |meta| {
+            if !meta.adjustments.is_object() {
+                meta.adjustments = serde_json::json!({});
+            }
+            if let Some(obj) = meta.adjustments.as_object_mut() {
+                obj.insert("astroAdcEnabled".to_string(), serde_json::json!(true));
+                obj.insert("astroAdcRedDx".to_string(), serde_json::json!(red_shift.0));
+                obj.insert("astroAdcRedDy".to_string(), serde_json::json!(red_shift.1));
+                obj.insert("astroAdcBlueDx".to_string(), serde_json::json!(blue_shift.0));
+                obj.insert("astroAdcBlueDy".to_string(), serde_json::json!(blue_shift.1));
+            }
+        });
+
+        *state.gpu_image_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::render::cache_utils::clear_preview_stage_caches(&state);
+        for target in crate::app::state::PreviewTarget::ALL {
+            crate::render::cache_utils::clear_preview_slot(&state, target);
+        }
+
+        let _ = app_handle.emit(
+            "astro-adjustments-updated",
+            serde_json::json!({
+                "astroAdcEnabled": true,
+                "astroAdcRedDx": red_shift.0,
+                "astroAdcRedDy": red_shift.1,
+                "astroAdcBlueDx": blue_shift.0,
+                "astroAdcBlueDy": blue_shift.1,
+            }),
+        );
+
         let msg = format!(
             "Atmospheric dispersion corrected: Red shift ({:+.2}, {:+.2}) px, Blue shift ({:+.2}, {:+.2}) px",
             red_shift.0, red_shift.1, blue_shift.0, blue_shift.1
@@ -2088,12 +2702,42 @@ pub fn apply_adc_manual(
     app_handle: AppHandle,
     state: State<AppState>,
 ) -> Result<String, String> {
-    let mut orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-    if let Some(loaded) = &mut *orig_guard {
-        let mut rgb32f = loaded.image.to_rgb32f();
-        apply_atmospheric_dispersion_shifts(&mut rgb32f, (red_shift_x, red_shift_y), (blue_shift_x, blue_shift_y));
-        let updated = DynamicImage::ImageRgb32F(rgb32f);
-        loaded.image = std::sync::Arc::new(updated);
+    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+    if let Some(loaded) = &*orig_guard {
+        let loaded_path = loaded.path.clone();
+        drop(orig_guard);
+
+        let (source_path, sidecar_path) = crate::library::sidecars::parse_virtual_path(&loaded_path);
+        let _ = crate::metadata::sidecar::update_sidecar(&sidecar_path, &source_path, |meta| {
+            if !meta.adjustments.is_object() {
+                meta.adjustments = serde_json::json!({});
+            }
+            if let Some(obj) = meta.adjustments.as_object_mut() {
+                obj.insert("astroAdcEnabled".to_string(), serde_json::json!(true));
+                obj.insert("astroAdcRedDx".to_string(), serde_json::json!(red_shift_x));
+                obj.insert("astroAdcRedDy".to_string(), serde_json::json!(red_shift_y));
+                obj.insert("astroAdcBlueDx".to_string(), serde_json::json!(blue_shift_x));
+                obj.insert("astroAdcBlueDy".to_string(), serde_json::json!(blue_shift_y));
+            }
+        });
+
+        *state.gpu_image_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::render::cache_utils::clear_preview_stage_caches(&state);
+        for target in crate::app::state::PreviewTarget::ALL {
+            crate::render::cache_utils::clear_preview_slot(&state, target);
+        }
+
+        let _ = app_handle.emit(
+            "astro-adjustments-updated",
+            serde_json::json!({
+                "astroAdcEnabled": true,
+                "astroAdcRedDx": red_shift_x,
+                "astroAdcRedDy": red_shift_y,
+                "astroAdcBlueDx": blue_shift_x,
+                "astroAdcBlueDy": blue_shift_y,
+            }),
+        );
+
         let _ = app_handle.emit("astro-progress", "Manual ADC shifts applied!");
         Ok("Manual ADC shifts applied".to_string())
     } else {
@@ -2284,6 +2928,102 @@ mod tests {
                 assert!(is_raw, "Astro CR2 frame must be recognized as RAW");
             }
         }
+    }
+
+    #[test]
+    fn test_photometric_g2v_recovers_known_channel_imbalance() {
+        let (w, h) = (96u32, 96u32);
+        let mut img = Rgb32FImage::new(w, h);
+        // Dark neutral-ish background plus 6 solar G2V stars skewed by (R=1.35, G=1.0, B=0.72)
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(x, y, Rgb([0.015, 0.012, 0.014]));
+            }
+        }
+        let centers = [(20.0f32, 20.0f32), (50.0, 22.0), (76.0, 25.0), (24.0, 68.0), (54.0, 70.0), (74.0, 72.0)];
+        for &(cx, cy) in &centers {
+            for dy in -4..=4 {
+                for dx in -4..=4 {
+                    let x = (cx as i32 + dx) as u32;
+                    let y = (cy as i32 + dy) as u32;
+                    let d2 = (dx * dx + dy * dy) as f32;
+                    let profile = 0.50 * (-d2 / 2.2).exp();
+                    let p = img.get_pixel(x, y);
+                    img.put_pixel(
+                        x,
+                        y,
+                        Rgb([
+                            (p[0] + profile * 1.35).min(0.92),
+                            (p[1] + profile * 1.00).min(0.92),
+                            (p[2] + profile * 0.72).min(0.92),
+                        ]),
+                    );
+                }
+            }
+        }
+
+        let res = compute_photometric_g2v_calibration(&img);
+        assert!(res.star_count >= 4, "Should measure >= 4 stars, got {}", res.star_count);
+        assert!(
+            (res.gain_r - (1.0 / 1.35)).abs() < 0.08,
+            "Expected gain_r near {:.3}, got {:.3}",
+            1.0 / 1.35,
+            res.gain_r
+        );
+        assert!(
+            (res.gain_b - (1.0 / 0.72)).abs() < 0.12,
+            "Expected gain_b near {:.3}, got {:.3}",
+            1.0 / 0.72,
+            res.gain_b
+        );
+    }
+
+    #[test]
+    fn test_rbf_gradient_removes_localized_dome_preserving_nebula_core() {
+        let (w, h) = (144u32, 108u32);
+        let mut img = Rgb32FImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let nx = x as f32 / w as f32;
+                let ny = y as f32 / h as f32;
+                // Smooth off-center orange light-pollution dome at (0.85, 0.85)
+                let dome = 0.25 * (-((nx - 0.85).powi(2) + (ny - 0.85).powi(2)) / 0.14).exp();
+                // Compact nebula core at (0.35, 0.45)
+                let nebula = 0.35 * (-((nx - 0.35).powi(2) + (ny - 0.45).powi(2)) / 0.008).exp();
+                let r = (0.02 + dome * 1.1 + nebula * 0.9).min(1.0);
+                let g = (0.02 + dome * 0.7 + nebula * 0.4).min(1.0);
+                let b = (0.02 + dome * 0.35 + nebula * 0.6).min(1.0);
+                img.put_pixel(x, y, Rgb([r, g, b]));
+            }
+        }
+
+        let corner_before = img.get_pixel(w - 12, h - 12)[0] - img.get_pixel(12, 12)[0];
+        let nebula_before = img.get_pixel((w as f32 * 0.35) as u32, (h as f32 * 0.45) as u32)[0];
+
+        remove_background_gradient_rbf(
+            &mut img,
+            &RbfGradientOptions {
+                smoothing: 0.12,
+                strength: 1.0,
+                preserve_pedestal: Some(0.02),
+            },
+        );
+
+        let corner_after = (img.get_pixel(w - 12, h - 12)[0] - img.get_pixel(12, 12)[0]).abs();
+        let nebula_after = img.get_pixel((w as f32 * 0.35) as u32, (h as f32 * 0.45) as u32)[0];
+
+        assert!(
+            corner_after < corner_before * 0.35,
+            "RBF should flatten off-center LP dome (before diff={}, after diff={})",
+            corner_before,
+            corner_after
+        );
+        assert!(
+            nebula_after > 0.20 && nebula_after > nebula_before * 0.55,
+            "RBF must preserve compact nebula core signal (before={}, after={})",
+            nebula_before,
+            nebula_after
+        );
     }
 }
 

@@ -522,6 +522,20 @@ impl OutputTransform {
     }
 }
 
+/// Checks whether a linear Rec.2020 `working_rgb` color falls outside the target
+/// color space gamut beyond `tolerance`.
+pub fn is_out_of_gamut_for_space(
+    working_rgb: [f32; 3],
+    target: OutputColorSpace,
+    tolerance: f32,
+) -> bool {
+    if !working_rgb.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let mapped = target.working_matrix() * Vec3::from_array(working_rgb);
+    mapped.min_element() < -tolerance || mapped.max_element() > 1.0 + tolerance
+}
+
 pub fn wgsl_vec3(v: Vec3) -> String {
     format!("vec3<f32>({:?}, {:?}, {:?})", v.x, v.y, v.z)
 }
@@ -556,4 +570,23 @@ pub fn with_shader_prelude(source: &str) -> String {
         include_str!("../shaders/color.wgsl"),
         source
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_soft_proof_oog_flags_wide_rec2020_primary_outside_srgb() {
+        // Pure Rec.2020 green primary [0.0, 0.8, 0.0] is far outside sRGB triangle
+        assert!(
+            is_out_of_gamut_for_space([0.0, 0.8, 0.0], OutputColorSpace::Srgb, 0.02),
+            "Pure Rec.2020 green must be flagged out-of-gamut for sRGB"
+        );
+        // Mid-neutral grey is strictly inside sRGB and Rec.2020
+        assert!(
+            !is_out_of_gamut_for_space([0.3, 0.3, 0.3], OutputColorSpace::Srgb, 0.02),
+            "Mid-gray must be inside sRGB gamut"
+        );
+    }
 }

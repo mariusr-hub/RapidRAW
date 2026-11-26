@@ -438,7 +438,7 @@ pub async fn sample_negative_border_mask(
 
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
     let img = {
-        let original_lock = state.original_image.lock().unwrap();
+        let original_lock = state.original_image.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(loaded) = original_lock.as_ref() {
             if loaded.path == source_path_str {
                 loaded.image.clone().as_ref().clone()
@@ -519,7 +519,7 @@ pub async fn auto_detect_negative_border_mask(
 
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
     let img = {
-        let original_lock = state.original_image.lock().unwrap();
+        let original_lock = state.original_image.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(loaded) = original_lock.as_ref() {
             if loaded.path == source_path_str {
                 loaded.image.clone().as_ref().clone()
@@ -652,7 +652,7 @@ pub async fn preview_negative_conversion(
             cached_img.clone()
         } else {
             let image_to_downscale = {
-                let original_lock = state.original_image.lock().unwrap();
+                let original_lock = state.original_image.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(loaded) = original_lock.as_ref() {
                     if loaded.path == source_path_str {
                         loaded.image.clone().as_ref().clone()

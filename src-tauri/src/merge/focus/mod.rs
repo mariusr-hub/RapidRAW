@@ -30,6 +30,7 @@ const DEPTH_BACKGROUND: f32 = 0.08;
 pub struct FocusSettings {
     pub method: Method,
     pub auto_crop: bool,
+    pub half_size: bool,
 }
 
 impl Default for FocusSettings {
@@ -37,6 +38,7 @@ impl Default for FocusSettings {
         FocusSettings {
             method: Method::Detail,
             auto_crop: true,
+            half_size: false,
         }
     }
 }
@@ -54,6 +56,7 @@ pub struct FocusSession {
     reference: usize,
     width: usize,
     height: usize,
+    half_size: bool,
     rendition: Rendition,
     name_source: String,
     unaligned: usize,
@@ -128,16 +131,22 @@ fn warp_frame(
     (warped, valid)
 }
 
-pub fn build_session(paths: &[String], context: &MergeContext) -> Result<FocusSession, String> {
+pub fn build_session(
+    paths: &[String],
+    half_size: bool,
+    context: &MergeContext,
+) -> Result<FocusSession, String> {
     let mut paths = paths.to_vec();
     paths.sort_by_cached_key(|p| natural_key(p));
     let scene = paths.iter().all(is_raw_file);
-    let loader = context.loader(scene);
+    let loader = context.loader_with_half_size(scene, half_size);
 
     context.report("Loading images...");
     let mut loaded = loader.load_all(&paths, |_, path| {
+        context.check_cancelled()?;
         context.report(format!("Processing '{}'", file_name(path)));
         let decoded = loader.decode(path)?;
+        context.check_cancelled()?;
         let image = decoded.image;
         let (width, height) = (image.width, image.height);
         let (aw, ah) = fit_size(width, height, ALIGN_MAX_DIMENSION);
@@ -212,6 +221,7 @@ pub fn build_session(paths: &[String], context: &MergeContext) -> Result<FocusSe
         reference,
         width,
         height,
+        half_size,
         rendition,
         name_source: paths[0].clone(),
         unaligned,
@@ -299,6 +309,7 @@ impl MergeSession for FocusSession {
                 self.frames.len(),
                 &rect,
             ))?),
+            is_scene_referred: matches!(self.rendition, Rendition::Scene { .. }),
             width: full.width,
             height: full.height,
             image_count: self.frames.len(),
@@ -312,7 +323,7 @@ impl MergeSession for FocusSession {
     fn render(&mut self, settings: &Value, context: &MergeContext) -> Result<MergeOutput, String> {
         let settings: FocusSettings = parse_settings(settings)?;
         let scene = matches!(self.rendition, Rendition::Scene { .. });
-        let loader = context.loader(scene);
+        let loader = context.loader_with_half_size(scene, self.half_size);
         let (width, height) = (self.width, self.height);
         let load = |index: usize, path: &str| -> Result<(Raster, Vec<f32>), String> {
             context.report(format!("Stacking '{}'", file_name(path)));
@@ -356,8 +367,10 @@ impl MergeSession for FocusSession {
             .filter(|&i| i != self.reference)
             .collect();
         loader.load_all(&others, |slot, path| {
+            context.check_cancelled()?;
             let index = indices[slot];
             let (image, valid) = load(index, path)?;
+            context.check_cancelled()?;
             let contribution = prepare(&image, &valid, settings.method, noise, false);
             drop(image);
             fusion.lock().unwrap().accumulate(index, contribution);
@@ -369,14 +382,51 @@ impl MergeSession for FocusSession {
             .map_err(|_| "Stacking the images failed unexpectedly.".to_string())?
             .finish();
         let (_, rect) = self.crop_rects(&settings);
+        let mut final_image = srgb_decoded(crop(&fused, &rect));
+        if settings.half_size && !self.half_size {
+            final_image = resize_area(
+                &final_image,
+                (final_image.width / 2).max(1),
+                (final_image.height / 2).max(1),
+            );
+        }
         Ok(MergeOutput {
-            image: srgb_decoded(crop(&fused, &rect)),
+            image: final_image,
+            linear_scene: None,
+            scene_exposure: self.rendition.scene_exposure(),
+            hdr_exposure_bias: 0.0,
             rendition: self.rendition,
             suffix: "Stacked",
             name_source: self.name_source.clone(),
             metadata_source: self.frames[self.reference].path.clone(),
             keeps_lens_geometry: true,
+            is_scene_referred: scene,
+            is_360_equirectangular: false,
             tone_mapper: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_focus_rendition_scene_exposure_propagates() {
+        let scene = Rendition::Scene {
+            exposure: 1.25,
+            agx: false,
+        };
+        assert!((scene.scene_exposure() - 1.25).abs() < 1e-6);
+        assert_eq!(Rendition::Display.scene_exposure(), 0.0);
+    }
+
+    #[test]
+    fn test_focus_half_size_guard_prevents_double_halving() {
+        // When session already decoded at half_size=true, render must NOT halve a second time.
+        let should_downscale = |settings_half: bool, session_half: bool| settings_half && !session_half;
+        assert!(!should_downscale(true, true));
+        assert!(should_downscale(true, false));
+        assert!(!should_downscale(false, false));
     }
 }

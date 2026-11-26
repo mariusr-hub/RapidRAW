@@ -5,17 +5,18 @@ use crate::decode::formats::is_raw_file;
 use crate::decode::image_loader::load_base_image_from_bytes;
 use crate::render::image_processing::apply_cpu_default_raw_processing;
 use base64::{Engine as _, engine::general_purpose};
-use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, Rgb32FImage};
+use image::{DynamicImage, GenericImageView, Rgb, Rgb32FImage};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
+
+static LAST_DENOISE_EDITS_BAKED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +87,8 @@ fn resolve_effective_denoise_method(method: &str, path_str: &str, file_bytes: &[
             SmartDenoiseTier::StarSafeBm3d => "bm3d",
             SmartDenoiseTier::MaxHighIsoNind => "ai",
         }
+    } else if lower == "raw_pre_demosaic" || lower == "rawpredemosaic" {
+        "raw_pre_demosaic"
     } else if lower == "ai" {
         "ai"
     } else if lower == "fast_gpu" {
@@ -99,6 +102,7 @@ struct ProgressReporter<'a> {
     counter: &'a Arc<AtomicUsize>,
     total_work: usize,
     app_handle: &'a AppHandle,
+    cancel: Option<&'a AtomicBool>,
 }
 
 const BLOCK_SIZE: usize = 8;
@@ -243,181 +247,330 @@ pub async fn analyze_image_noise_profile(
     exposure_push: Option<f32>,
     app_handle: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let (source_path, _) = parse_virtual_path(&path);
-    let path_str = source_path.to_string_lossy().to_string();
-    let file_bytes = fs::read(&source_path).map_err(|e| e.to_string())?;
-    let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
-        .map_err(|e| e.to_string())?;
-    let rgb = dynamic_img.to_rgb32f();
+    tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        let (source_path, _) = parse_virtual_path(&path);
+        let path_str = source_path.to_string_lossy().to_string();
+        let file_bytes = crate::library::file_ops::read_file_mapped(&source_path)
+            .map_err(|e| e.to_string())?;
+        let settings = load_settings(app_handle.clone()).unwrap_or_default();
+        let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
+            .map_err(|e| e.to_string())?;
+        let rgb = dynamic_img.to_rgb32f();
 
-    let (width, height) = rgb.dimensions();
+        let (width, height) = rgb.dimensions();
 
-    // 1. Flat patch extraction (with texture safeguard)
-    let flat_patch_sigma = estimate_flat_patch_noise(&rgb);
-    let global_mad_sigma = estimate_wavelet_mad_noise(&rgb);
-    let empirical_sigma = flat_patch_sigma.unwrap_or(global_mad_sigma);
+        // 1. Flat patch extraction (with texture safeguard)
+        let flat_patch_sigma = estimate_flat_patch_noise(&rgb);
+        let global_mad_sigma = estimate_wavelet_mad_noise(&rgb);
+        let empirical_sigma = flat_patch_sigma.unwrap_or(global_mad_sigma);
 
-    // 2. Heteroscedastic noise curve (alpha, beta)
-    let (alpha_shot, beta_read) = estimate_heteroscedastic_noise_curve(&rgb);
+        // 2. Heteroscedastic noise curve (alpha, beta)
+        let (alpha_shot, beta_read) = estimate_heteroscedastic_noise_curve(&rgb);
 
-    // 3. Sensor Profile (including Canon 77D / Dual Pixel APS-C / Sony / Nikon / Fuji + empirical fallback)
-    let (make, model) = crate::metadata::exif_processing::read_camera_make_model(&path_str, &file_bytes)
-        .unwrap_or_default();
-    let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
-    let mut profile = get_sensor_noise_profile(&make, &model);
-    if profile.sensor_type == "Universal CMOS Noise Model"
-        && let Some((fit_read, fit_shot)) =
-            crate::enhanced::local_priors::get_empirical_sensor_fit(&cam_key)
-    {
-        profile.base_read_noise = fit_read;
-        profile.shot_noise_coeff = fit_shot;
-        profile.sensor_type = "Universal CMOS (Empirical Local Fit)".into();
-    }
+        // 3. Sensor Profile (preset + empirical/ISO-bucket priors)
+        let (make, model) =
+            crate::metadata::exif_processing::read_camera_make_model(&path_str, &file_bytes)
+                .unwrap_or_default();
+        let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+        let mut profile = get_sensor_noise_profile(&make, &model);
+        if profile.sensor_type == "Universal CMOS Noise Model"
+            && let Some((fit_read, fit_shot)) =
+                crate::enhanced::local_priors::get_empirical_sensor_fit(&cam_key)
+        {
+            profile.base_read_noise = fit_read;
+            profile.shot_noise_coeff = fit_shot;
+            profile.sensor_type = "Universal CMOS (Empirical Local Fit)".into();
+        }
 
-    // 4. EXIF Parameters: ISO and Shutter Speed
-    let iso = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes);
-    let exposure_time = crate::metadata::exif_processing::read_exposure_time_secs(&path_str, &file_bytes);
+        // 4. EXIF Parameters: ISO and Shutter Speed
+        let iso = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes);
+        let exposure_time =
+            crate::metadata::exif_processing::read_exposure_time_secs(&path_str, &file_bytes);
 
-    // 5. Thermal Dark Current Factor for long exposures (> 1.0s)
-    let thermal_factor = if let Some(t_exp) = exposure_time {
-        if t_exp > 1.0 {
-            1.0 + 0.15 * (t_exp.log2()).max(0.0)
+        // 5. Thermal Dark Current Factor for long exposures (> 1.0s)
+        let thermal_factor = if let Some(t_exp) = exposure_time {
+            if t_exp > 1.0 {
+                1.0 + 0.15 * (t_exp.log2()).max(0.0)
+            } else {
+                1.0
+            }
         } else {
             1.0
+        };
+
+        // 6. Effective ISO (factoring in develop exposure push)
+        let push = exposure_push.unwrap_or(0.0).clamp(-4.0, 5.0);
+        let raw_iso = iso.unwrap_or(400) as f32;
+        let effective_iso = ((raw_iso * 2.0f32.powf(push.max(0.0))).round() as u32).max(50);
+
+        // 7. Megapixel density normalization
+        let mp = (width * height) as f32 / 1_000_000.0;
+        let mp_scale = (mp / 24.0).sqrt().clamp(0.85, 1.45);
+
+        // 8. Dual Conversion Gain (DCG) discontinuity check
+        let is_high_gain = profile
+            .dual_gain_iso
+            .map_or(false, |thresh| effective_iso >= thresh);
+        let gain_dip = if is_high_gain { -3.5 } else { 0.0 };
+
+        // 9. Multi-tier Smart Auto Calculations + Per-ISO Bucket Prior Update
+        let iso_factor =
+            ((effective_iso as f32 / 100.0).log2() * 11.5 + 18.0 + gain_dip).max(5.0);
+        let mad_factor = empirical_sigma * 150.0 * mp_scale * thermal_factor;
+        let combined_intensity =
+            ((iso_factor * 0.40 + mad_factor * 0.60).round() as u32).clamp(5, 85);
+
+        let smart_tier = select_smart_denoise_tier(effective_iso, push, None);
+
+        let iso_val_for_fit =
+            crate::metadata::exif_processing::read_iso(&path_str, &file_bytes).unwrap_or(effective_iso);
+        crate::enhanced::local_priors::record_empirical_sensor_noise(
+            &cam_key,
+            iso_val_for_fit,
+            empirical_sigma,
+        );
+        let chroma_ratio = if empirical_sigma > 1e-6 {
+            (global_mad_sigma / empirical_sigma).clamp(0.4, 2.5)
+        } else {
+            1.0
+        };
+        crate::enhanced::local_priors::record_iso_noise_bucket(
+            &cam_key,
+            iso_val_for_fit,
+            (beta_read * thermal_factor).max(0.0002),
+            alpha_shot.max(0.00005),
+            chroma_ratio,
+        );
+        let iso_bucket_opt =
+            crate::enhanced::local_priors::lookup_iso_noise_profile(&cam_key, effective_iso);
+
+        let (rec_engine, mut rec_luma, rec_chroma, mut rec_detail, rec_shadow_boost, rec_deband) =
+            match smart_tier {
+                SmartDenoiseTier::FastGpu => (
+                    "fast_gpu",
+                    combined_intensity.clamp(10, 35),
+                    if effective_iso <= 250 { 55 } else { 85 },
+                    if effective_iso <= 250 { 40 } else { 32 },
+                    0,
+                    false,
+                ),
+                SmartDenoiseTier::StarSafeBm3d => (
+                    "bm3d",
+                    combined_intensity.clamp(25, 50),
+                    95,
+                    30,
+                    10,
+                    false,
+                ),
+                SmartDenoiseTier::MaxHighIsoNind => (
+                    "ai",
+                    combined_intensity.clamp(45, 80),
+                    100,
+                    22,
+                    if effective_iso > 3200 { 35 } else { 20 },
+                    effective_iso > 3200,
+                ),
+            };
+
+        if let Some(learned_dn) =
+            crate::enhanced::local_priors::get_denoise_prior(&cam_key, effective_iso)
+        {
+            rec_luma = ((rec_luma as f32 * 0.65) + (learned_dn.ai_denoise_amount * 0.35))
+                .round()
+                .clamp(5.0, 95.0) as u32;
+            rec_detail = ((rec_detail as f32 * 0.65) + (learned_dn.ai_denoise_detail * 0.35))
+                .round()
+                .clamp(5.0, 85.0) as u32;
         }
-    } else {
-        1.0
-    };
 
-    // 6. Effective ISO (factoring in develop exposure push)
-    let push = exposure_push.unwrap_or(0.0).clamp(-4.0, 5.0);
-    let raw_iso = iso.unwrap_or(400) as f32;
-    let effective_iso = ((raw_iso * 2.0f32.powf(push.max(0.0))).round() as u32).max(50);
+        let estimated_time_hint = match smart_tier {
+            SmartDenoiseTier::FastGpu => "~0.5-2s",
+            SmartDenoiseTier::StarSafeBm3d => "~4-12s",
+            SmartDenoiseTier::MaxHighIsoNind => {
+                if crate::ai::models::is_gpu_active() {
+                    "~25-90s (DirectML GPU)"
+                } else {
+                    "~60-180s (CPU)"
+                }
+            }
+        };
 
-    // 7. Megapixel density normalization
-    let mp = (width * height) as f32 / 1_000_000.0;
-    let mp_scale = (mp / 24.0).sqrt().clamp(0.85, 1.45);
+        let snr_db = (20.0 * (1.0 / empirical_sigma.max(0.0005)).log10()).clamp(10.0, 50.0);
 
-    // 8. Dual Conversion Gain (DCG) discontinuity check
-    let is_high_gain = profile.dual_gain_iso.map_or(false, |thresh| effective_iso >= thresh);
-    let gain_dip = if is_high_gain { -3.5 } else { 0.0 };
+        let is_raw = crate::decode::formats::is_raw_file(&path_str);
+        let is_directml = crate::ai::processing::is_directml_active();
+        let gpu_accelerator = if is_directml {
+            "Intel Iris Xe (DirectML 96EU)"
+        } else {
+            "CPU (ONNX / Rayon)"
+        };
+        let pipeline_mode = if is_raw { "Raw-Bayer CFA" } else { "Post-Demosaic RGB" };
+        let est_speed_sec = match smart_tier {
+            SmartDenoiseTier::FastGpu => ((mp / 24.0) * 1.5).round().max(1.0) as u32,
+            SmartDenoiseTier::StarSafeBm3d => ((mp / 24.0) * 8.0).round().max(3.0) as u32,
+            SmartDenoiseTier::MaxHighIsoNind => {
+                if is_directml {
+                    ((mp / 24.0) * 35.0).round().max(8.0) as u32
+                } else {
+                    ((mp / 24.0) * 90.0).round().max(20.0) as u32
+                }
+            }
+        };
 
-    // 9. Multi-tier Smart Auto Calculations
-    let iso_factor = ((effective_iso as f32 / 100.0).log2() * 11.5 + 18.0 + gain_dip).max(5.0);
-    let mad_factor = empirical_sigma * 150.0 * mp_scale * thermal_factor;
-    let combined_intensity = ((iso_factor * 0.40 + mad_factor * 0.60).round() as u32).clamp(5, 85);
+        Ok(serde_json::json!({
+            "sigma": empirical_sigma,
+            "global_mad_sigma": global_mad_sigma,
+            "flat_patch_used": flat_patch_sigma.is_some(),
+            "alpha_shot": alpha_shot,
+            "beta_read": beta_read * thermal_factor,
+            "iso": iso,
+            "effective_iso": effective_iso,
+            "iso_calibrated": iso_bucket_opt.is_some(),
+            "calibrated_iso_bucket": iso_bucket_opt.map(|b| b.iso_bucket),
+            "exposure_time": exposure_time,
+            "exposure_push": push,
+            "snr_db": (snr_db * 10.0).round() / 10.0,
+            "make": profile.make,
+            "model": profile.model,
+            "sensor_type": profile.sensor_type,
+            "dual_gain_active": is_high_gain,
+            "recommended_engine": rec_engine,
+            "recommended_tier": smart_tier.as_str(),
+            "recommended_tier_label": smart_tier.label(),
+            "estimated_time_hint": estimated_time_hint,
+            "recommended_intensity": rec_luma,
+            "recommended_chroma": rec_chroma,
+            "recommended_details": rec_detail,
+            "recommended_shadow_boost": rec_shadow_boost,
+            "recommended_deband": rec_deband,
+            "preserve_details": (rec_detail as f32) / 100.0,
+            "gpu_accelerator": gpu_accelerator,
+            "pipeline_mode": pipeline_mode,
+            "est_speed_sec": est_speed_sec
+        }))
+    })
+    .await
+    .map_err(|e| format!("Noise profiling task failed: {}", e))?
+}
 
-    let smart_tier = select_smart_denoise_tier(effective_iso, push, None);
+#[tauri::command]
+pub async fn calibrate_camera_iso_noise_profile(
+    paths: Vec<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    if paths.is_empty() {
+        return Err("Provide at least 1 image path to calibrate ISO noise profile".to_string());
+    }
+    tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        let settings = load_settings(app_handle.clone()).unwrap_or_default();
+        let mut calibrated_buckets = Vec::new();
+        let mut last_cam_key = String::from("universal");
 
-    let iso_val_for_fit = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes).unwrap_or(effective_iso);
-    crate::enhanced::local_priors::record_empirical_sensor_noise(
-        &cam_key,
-        iso_val_for_fit,
-        empirical_sigma,
-    );
+        for p in &paths {
+            let (source_path, _) = parse_virtual_path(p);
+            let path_str = source_path.to_string_lossy().to_string();
+            let file_bytes = crate::library::file_ops::read_file_mapped(&source_path)
+                .map_err(|e| format!("Failed reading '{}': {}", path_str, e))?;
+            let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
+                .map_err(|e| format!("Failed decoding '{}': {}", path_str, e))?;
+            let rgb = dynamic_img.to_rgb32f();
+            let emp = estimate_flat_patch_noise(&rgb).unwrap_or_else(|| estimate_wavelet_mad_noise(&rgb));
+            let mad = estimate_wavelet_mad_noise(&rgb);
+            let (alpha_shot, beta_read) = estimate_heteroscedastic_noise_curve(&rgb);
+            let (make, model) =
+                crate::metadata::exif_processing::read_camera_make_model(&path_str, &file_bytes)
+                    .unwrap_or_default();
+            let iso = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes).unwrap_or(400);
+            let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+            last_cam_key = cam_key.clone();
+            let chroma_ratio = if emp > 1e-6 {
+                (mad / emp).clamp(0.4, 2.5)
+            } else {
+                1.0
+            };
+            crate::enhanced::local_priors::record_empirical_sensor_noise(&cam_key, iso, emp);
+            crate::enhanced::local_priors::record_iso_noise_bucket(
+                &cam_key,
+                iso,
+                beta_read.max(0.0002),
+                alpha_shot.max(0.00005),
+                chroma_ratio,
+            );
+            calibrated_buckets.push(crate::enhanced::local_priors::quantize_iso_bucket(iso));
+        }
 
-    let (rec_engine, mut rec_luma, rec_chroma, mut rec_detail, rec_shadow_boost, rec_deband) = match smart_tier {
-        SmartDenoiseTier::FastGpu => (
-            "fast_gpu",
-            combined_intensity.clamp(10, 35),
-            if effective_iso <= 250 { 55 } else { 85 },
-            if effective_iso <= 250 { 40 } else { 32 },
-            0,
-            false,
-        ),
-        SmartDenoiseTier::StarSafeBm3d => (
-            "bm3d",
-            combined_intensity.clamp(25, 50),
-            95,
-            30,
-            10,
-            false,
-        ),
-        SmartDenoiseTier::MaxHighIsoNind => (
-            "ai",
-            combined_intensity.clamp(45, 80),
-            100,
-            22,
-            if effective_iso > 3200 { 35 } else { 20 },
-            effective_iso > 3200,
-        ),
-    };
+        Ok(serde_json::json!({
+            "cameraKey": last_cam_key,
+            "calibratedBuckets": calibrated_buckets,
+            "filesProcessed": paths.len(),
+        }))
+    })
+    .await
+    .map_err(|e| format!("ISO noise calibration failed: {}", e))?
+}
 
-    if let Some(learned_dn) =
-        crate::enhanced::local_priors::get_denoise_prior(&cam_key, effective_iso)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DenoiseRoiPreview {
+    pub original_base64: String,
+    pub denoised_base64: String,
+    pub luma_original_base64: String,
+    pub luma_denoised_base64: String,
+    pub chroma_original_base64: String,
+    pub chroma_denoised_base64: String,
+    pub residual_base64: String,
+    pub x0: u32,
+    pub y0: u32,
+    pub size: u32,
+    pub full_width: u32,
+    pub full_height: u32,
+    pub effective_method: String,
+}
+
+/// Decomposes synchronized before/after ROI crops into Luminance (Y),
+/// neutral-gray-centered Chrominance (Cb/Cr deviation around 0.5), and amplified Noise Residual.
+pub(crate) fn decompose_roi_channels(
+    orig: &Rgb32FImage,
+    denoised: &Rgb32FImage,
+) -> (Rgb32FImage, Rgb32FImage, Rgb32FImage, Rgb32FImage, Rgb32FImage) {
+    let (w, h) = orig.dimensions();
+    let mut luma_orig = Rgb32FImage::new(w, h);
+    let mut luma_dn = Rgb32FImage::new(w, h);
+    let mut chroma_orig = Rgb32FImage::new(w, h);
+    let mut chroma_dn = Rgb32FImage::new(w, h);
+    let mut residual = Rgb32FImage::new(w, h);
+
+    for ((op, dp), (((lo, ld), (co, cd)), rs)) in orig
+        .as_raw()
+        .chunks_exact(3)
+        .zip(denoised.as_raw().chunks_exact(3))
+        .zip(
+            luma_orig
+                .as_mut()
+                .chunks_exact_mut(3)
+                .zip(luma_dn.as_mut().chunks_exact_mut(3))
+                .zip(
+                    chroma_orig
+                        .as_mut()
+                        .chunks_exact_mut(3)
+                        .zip(chroma_dn.as_mut().chunks_exact_mut(3)),
+                )
+                .zip(residual.as_mut().chunks_exact_mut(3)),
+        )
     {
-        rec_luma = ((rec_luma as f32 * 0.65) + (learned_dn.ai_denoise_amount * 0.35))
-            .round()
-            .clamp(5.0, 95.0) as u32;
-        rec_detail = ((rec_detail as f32 * 0.65) + (learned_dn.ai_denoise_detail * 0.35))
-            .round()
-            .clamp(5.0, 85.0) as u32;
+        let yo = (0.2126 * op[0] + 0.7152 * op[1] + 0.0722 * op[2]).clamp(0.0, 1.0);
+        let yd = (0.2126 * dp[0] + 0.7152 * dp[1] + 0.0722 * dp[2]).clamp(0.0, 1.0);
+        lo.copy_from_slice(&[yo, yo, yo]);
+        ld.copy_from_slice(&[yd, yd, yd]);
+
+        for c in 0..3 {
+            co[c] = (0.5 + (op[c] - yo)).clamp(0.0, 1.0);
+            cd[c] = (0.5 + (dp[c] - yd)).clamp(0.0, 1.0);
+            rs[c] = ((op[c] - dp[c]).abs() * 4.5).clamp(0.0, 1.0);
+        }
     }
 
-    let estimated_time_hint = match smart_tier {
-        SmartDenoiseTier::FastGpu => "~0.5-2s",
-        SmartDenoiseTier::StarSafeBm3d => "~4-12s",
-        SmartDenoiseTier::MaxHighIsoNind => {
-            if crate::ai::models::is_gpu_active() {
-                "~25-90s (DirectML GPU)"
-            } else {
-                "~60-180s (CPU)"
-            }
-        }
-    };
-
-    let snr_db = (20.0 * (1.0 / empirical_sigma.max(0.0005)).log10()).clamp(10.0, 50.0);
-
-    let is_raw = crate::decode::formats::is_raw_file(&path_str);
-    let is_directml = crate::ai::processing::is_directml_active();
-    let gpu_accelerator = if is_directml {
-        "Intel Iris Xe (DirectML 96EU)"
-    } else {
-        "CPU (ONNX / Rayon)"
-    };
-    let pipeline_mode = if is_raw { "Raw-Bayer CFA" } else { "Post-Demosaic RGB" };
-    let est_speed_sec = match smart_tier {
-        SmartDenoiseTier::FastGpu => ((mp / 24.0) * 1.5).round().max(1.0) as u32,
-        SmartDenoiseTier::StarSafeBm3d => ((mp / 24.0) * 8.0).round().max(3.0) as u32,
-        SmartDenoiseTier::MaxHighIsoNind => {
-            if is_directml {
-                ((mp / 24.0) * 35.0).round().max(8.0) as u32
-            } else {
-                ((mp / 24.0) * 90.0).round().max(20.0) as u32
-            }
-        }
-    };
-
-    Ok(serde_json::json!({
-        "sigma": empirical_sigma,
-        "global_mad_sigma": global_mad_sigma,
-        "flat_patch_used": flat_patch_sigma.is_some(),
-        "alpha_shot": alpha_shot,
-        "beta_read": beta_read * thermal_factor,
-        "iso": iso,
-        "effective_iso": effective_iso,
-        "exposure_time": exposure_time,
-        "exposure_push": push,
-        "snr_db": (snr_db * 10.0).round() / 10.0,
-        "make": profile.make,
-        "model": profile.model,
-        "sensor_type": profile.sensor_type,
-        "dual_gain_active": is_high_gain,
-        "recommended_engine": rec_engine,
-        "recommended_tier": smart_tier.as_str(),
-        "recommended_tier_label": smart_tier.label(),
-        "estimated_time_hint": estimated_time_hint,
-        "recommended_intensity": rec_luma,
-        "recommended_chroma": rec_chroma,
-        "recommended_details": rec_detail,
-        "recommended_shadow_boost": rec_shadow_boost,
-        "recommended_deband": rec_deband,
-        "preserve_details": (rec_detail as f32) / 100.0,
-        "gpu_accelerator": gpu_accelerator,
-        "pipeline_mode": pipeline_mode,
-        "est_speed_sec": est_speed_sec
-    }))
+    (luma_orig, luma_dn, chroma_orig, chroma_dn, residual)
 }
 
 #[tauri::command]
@@ -434,109 +587,236 @@ pub async fn preview_denoised_roi(
     protect_stars: Option<bool>,
     film_grain: Option<f32>,
     method: String,
+    js_adjustments: Option<serde_json::Value>,
     app_handle: tauri::AppHandle,
-    _state: tauri::State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    let (source_path, _) = parse_virtual_path(&path);
-    let path_str = source_path.to_string_lossy().to_string();
-    let file_bytes = fs::read(&source_path).map_err(|e| e.to_string())?;
+    state: tauri::State<'_, AppState>,
+) -> Result<DenoiseRoiPreview, String> {
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
-        .map_err(|e| e.to_string())?;
+    let app_for_prep = app_handle.clone();
+    let path_for_prep = path.clone();
+    let method_for_prep = method.clone();
+    let adj_for_prep = js_adjustments.clone();
 
-    let is_raw = is_raw_file(&path_str);
-    let mut full_rgb = dynamic_img.to_rgb32f();
-    if is_raw {
-        let mut dyn_raw = DynamicImage::ImageRgb32F(full_rgb);
-        apply_cpu_default_raw_processing(&mut dyn_raw);
-        full_rgb = dyn_raw.to_rgb32f();
-    }
+    let (
+        full_w,
+        full_h,
+        x0,
+        y0,
+        size,
+        orig_crop,
+        crop_for_denoiser,
+        effective_method,
+        raw_pre_demosaic_crop,
+    ) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let (source_path, _) = parse_virtual_path(&path_for_prep);
+        let path_str = source_path.to_string_lossy().to_string();
+        let file_bytes = crate::library::file_ops::read_file_mapped(&source_path)
+            .map_err(|e| e.to_string())?;
+        let dynamic_img =
+            load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
+                .map_err(|e| e.to_string())?;
 
-    let (w, h) = full_rgb.dimensions();
-    let size = crop_size.unwrap_or(512).clamp(128, 1024).min(w).min(h);
-    let cx = ((center_x.clamp(0.0, 1.0) * w as f32) as u32).min(w.saturating_sub(1));
-    let cy = ((center_y.clamp(0.0, 1.0) * h as f32) as u32).min(h.saturating_sub(1));
+        let is_raw = is_raw_file(&path_str);
+        let denoise_stripped_adj = adj_for_prep.map(|mut adj| {
+            if let Some(obj) = adj.as_object_mut() {
+                obj.insert("aiDenoiseEnabled".to_string(), serde_json::json!(false));
+                obj.insert("lumaNoiseReduction".to_string(), serde_json::json!(0));
+                obj.insert("colorNoiseReduction".to_string(), serde_json::json!(0));
+            }
+            adj
+        });
+        let full_rgb = if let Some(edited) = crate::export::render_image_with_edits(
+            &path_for_prep,
+            &dynamic_img,
+            denoise_stripped_adj.as_ref(),
+            &settings,
+            &app_for_prep,
+            false,
+        ) {
+            edited.to_rgb32f()
+        } else {
+            let mut raw_rgb = dynamic_img.to_rgb32f();
+            if is_raw {
+                let mut dyn_raw = DynamicImage::ImageRgb32F(raw_rgb);
+                apply_cpu_default_raw_processing(&mut dyn_raw);
+                raw_rgb = dyn_raw.to_rgb32f();
+            }
+            raw_rgb
+        };
 
-    let half = size / 2;
-    let x0 = cx.saturating_sub(half).min(w.saturating_sub(size));
-    let y0 = cy.saturating_sub(half).min(h.saturating_sub(size));
+        let (w, h) = full_rgb.dimensions();
+        let size = crop_size.unwrap_or(512).clamp(128, 1024).min(w).min(h);
+        let cx = ((center_x.clamp(0.0, 1.0) * w as f32) as u32).min(w.saturating_sub(1));
+        let cy = ((center_y.clamp(0.0, 1.0) * h as f32) as u32).min(h.saturating_sub(1));
 
-    let mut orig_crop = Rgb32FImage::new(size, size);
-    for dy in 0..size {
-        for dx in 0..size {
-            let px = full_rgb.get_pixel(x0 + dx, y0 + dy);
-            orig_crop.put_pixel(dx, dy, *px);
+        let half = size / 2;
+        let x0 = cx.saturating_sub(half).min(w.saturating_sub(size));
+        let y0 = cy.saturating_sub(half).min(h.saturating_sub(size));
+
+        let mut orig_crop = Rgb32FImage::new(size, size);
+        for dy in 0..size {
+            for dx in 0..size {
+                let px = full_rgb.get_pixel(x0 + dx, y0 + dy);
+                orig_crop.put_pixel(dx, dy, *px);
+            }
         }
-    }
 
-    let mut crop_for_denoiser = orig_crop.clone();
-    if deband.unwrap_or(false) {
-        remove_sensor_banding(&mut crop_for_denoiser);
-        remove_canon_adc_banding(&mut crop_for_denoiser);
-    }
+        let effective_method = resolve_effective_denoise_method(&method_for_prep, &path_str, &file_bytes);
 
-    let chroma = chroma_intensity.unwrap_or(1.0);
-    let grain = film_grain.unwrap_or(0.0);
-    if chroma > 0.0 || grain > 0.0 {
-        crop_for_denoiser = apply_chroma_luma_denoise(&crop_for_denoiser, intensity, chroma, grain);
-    }
+        let raw_pre_demosaic_crop = if effective_method == "raw_pre_demosaic" && is_raw {
+            let (make, model) =
+                crate::metadata::exif_processing::read_camera_make_model(&path_str, &file_bytes)
+                    .unwrap_or_default();
+            let iso = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes).unwrap_or(400);
+            let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+            let (read_noise, shot_noise) =
+                if let Some(bucket) = crate::enhanced::local_priors::lookup_iso_noise_profile(&cam_key, iso) {
+                    (bucket.read_noise, bucket.shot_noise)
+                } else {
+                    let prof = get_sensor_noise_profile(&make, &model);
+                    (prof.base_read_noise, prof.shot_noise_coeff)
+                };
+            let opts = crate::ai::raw_denoise::RawDenoiseOptions {
+                strength: intensity.clamp(0.05, 1.2),
+                read_noise,
+                shot_noise,
+                model_path: settings.raw_denoise_model_path.clone(),
+            };
+            if let Ok(full_raw_dn) =
+                crate::ai::raw_denoise::denoise_raw_bytes_pre_demosaic(&file_bytes, &opts, None)
+            {
+                let mut dn_dyn = DynamicImage::ImageRgb32F(full_raw_dn);
+                let rendered = if let Some(edited) = crate::export::render_image_with_edits(
+                    &path_for_prep,
+                    &dn_dyn,
+                    denoise_stripped_adj.as_ref(),
+                    &settings,
+                    &app_for_prep,
+                    false,
+                ) {
+                    edited.to_rgb32f()
+                } else {
+                    apply_cpu_default_raw_processing(&mut dn_dyn);
+                    dn_dyn.to_rgb32f()
+                };
+                let (rw, rh) = rendered.dimensions();
+                if rw == w && rh == h {
+                    let mut crop_dn = Rgb32FImage::new(size, size);
+                    for dy in 0..size {
+                        for dx in 0..size {
+                            crop_dn.put_pixel(dx, dy, *rendered.get_pixel(x0 + dx, y0 + dy));
+                        }
+                    }
+                    Some(crop_dn)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-    let effective_method = resolve_effective_denoise_method(&method, &path_str, &file_bytes);
+        let mut crop_for_denoiser = orig_crop.clone();
+        if raw_pre_demosaic_crop.is_none() {
+            if deband.unwrap_or(false) {
+                remove_sensor_banding(&mut crop_for_denoiser);
+                remove_canon_adc_banding(&mut crop_for_denoiser);
+            }
+            let chroma = chroma_intensity.unwrap_or(1.0);
+            let grain = film_grain.unwrap_or(0.0);
+            if chroma > 0.0 || grain > 0.0 {
+                crop_for_denoiser =
+                    apply_chroma_luma_denoise(&crop_for_denoiser, intensity, chroma, grain);
+            }
+        }
 
-    let mut denoised_crop = if effective_method == "ai" {
-        if let Ok(model_arc) = crate::ai::models::get_or_init_denoise_model(
+        Ok((
+            w,
+            h,
+            x0,
+            y0,
+            size,
+            orig_crop,
+            crop_for_denoiser,
+            effective_method.to_string(),
+            raw_pre_demosaic_crop,
+        ))
+    })
+    .await
+    .map_err(|e| format!("ROI prep failed: {}", e))??;
+
+    let ai_model = if effective_method == "ai" {
+        crate::ai::models::get_or_init_denoise_model(
             &app_handle,
-            &_state.ai_state,
-            &_state.ai_init_lock,
+            &state.ai_state,
+            &state.ai_init_lock,
         )
         .await
-        {
+        .ok()
+    } else {
+        None
+    };
+
+    tokio::task::spawn_blocking(move || -> Result<DenoiseRoiPreview, String> {
+        let mut denoised_crop = if let Some(pre_dn) = raw_pre_demosaic_crop {
+            DynamicImage::ImageRgb32F(pre_dn)
+        } else if let Some(model_arc) = ai_model {
             match crate::ai::tiling::run_ai_denoise(&crop_for_denoiser, &model_arc, &|_| {}) {
                 Ok(dyn_res) => dyn_res,
                 Err(_) => run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle),
             }
+        } else if effective_method == "fast_gpu" {
+            let chroma = chroma_intensity.unwrap_or(1.0);
+            let grain = film_grain.unwrap_or(0.0);
+            let fast = apply_chroma_luma_denoise(
+                &crop_for_denoiser,
+                (intensity * 0.85).max(0.12),
+                chroma.max(0.85),
+                grain,
+            );
+            DynamicImage::ImageRgb32F(fast)
         } else {
             run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle)
+        };
+
+        if protect_stars.unwrap_or(true) {
+            apply_star_point_protection(&mut denoised_crop, &orig_crop);
         }
-    } else if effective_method == "fast_gpu" {
-        let fast = apply_chroma_luma_denoise(
-            &crop_for_denoiser,
-            (intensity * 0.85).max(0.12),
-            chroma.max(0.85),
-            grain,
-        );
-        DynamicImage::ImageRgb32F(fast)
-    } else {
-        run_bm3d_fast_tile(&crop_for_denoiser, intensity, &app_handle)
-    };
 
-    if protect_stars.unwrap_or(true) {
-        apply_star_point_protection(&mut denoised_crop, &orig_crop);
-    }
+        let details = preserve_details.unwrap_or(0.25);
+        if details > 0.001 {
+            apply_edge_guided_texture_preservation(&mut denoised_crop, &orig_crop, details);
+        }
 
-    let details = preserve_details.unwrap_or(0.25);
-    if details > 0.001 {
-        apply_edge_guided_texture_preservation(&mut denoised_crop, &orig_crop, details);
-    }
+        let s_boost = shadow_boost.unwrap_or(0.0);
+        if s_boost > 0.001 {
+            apply_shadow_weighted_zoning(&mut denoised_crop, &orig_crop, s_boost);
+        }
 
-    let s_boost = shadow_boost.unwrap_or(0.0);
-    if s_boost > 0.001 {
-        apply_shadow_weighted_zoning(&mut denoised_crop, &orig_crop, s_boost);
-    }
+        let denoised_rgb = denoised_crop.to_rgb32f();
+        let (luma_orig, luma_dn, chroma_orig, chroma_dn, residual) =
+            decompose_roi_channels(&orig_crop, &denoised_rgb);
 
-    let orig_b64 = img_to_base64_jpeg(&orig_crop, 85)?;
-    let denoised_rgb = denoised_crop.to_rgb32f();
-    let denoised_b64 = img_to_base64_jpeg(&denoised_rgb, 85)?;
-
-    Ok(serde_json::json!({
-        "original_roi": orig_b64,
-        "denoised_roi": denoised_b64,
-        "x0": x0,
-        "y0": y0,
-        "size": size,
-        "full_width": w,
-        "full_height": h
-    }))
+        Ok(DenoiseRoiPreview {
+            original_base64: img_to_base64_jpeg(&orig_crop, 88)?,
+            denoised_base64: img_to_base64_jpeg(&denoised_rgb, 88)?,
+            luma_original_base64: img_to_base64_jpeg(&luma_orig, 88)?,
+            luma_denoised_base64: img_to_base64_jpeg(&luma_dn, 88)?,
+            chroma_original_base64: img_to_base64_jpeg(&chroma_orig, 88)?,
+            chroma_denoised_base64: img_to_base64_jpeg(&chroma_dn, 88)?,
+            residual_base64: img_to_base64_jpeg(&residual, 88)?,
+            x0,
+            y0,
+            size,
+            full_width: full_w,
+            full_height: full_h,
+            effective_method,
+        })
+    })
+    .await
+    .map_err(|e| format!("ROI denoise failed: {}", e))?
 }
 
 #[tauri::command]
@@ -552,6 +832,7 @@ pub async fn apply_denoising(
     shadow_boost: Option<f32>,
     deband: Option<bool>,
     film_grain: Option<f32>,
+    js_adjustments: Option<serde_json::Value>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -571,12 +852,18 @@ pub async fn apply_denoising(
     let needs_ai = if lower_method == "ai" {
         true
     } else if lower_method == "auto" {
-        fs::read(&source_path)
-            .ok()
-            .and_then(|b| crate::metadata::exif_processing::read_iso(&path_str, &b))
-            .is_some_and(|iso| {
-                select_smart_denoise_tier(iso, 0.0, None) == SmartDenoiseTier::MaxHighIsoNind
-            })
+        let probe_path = source_path.clone();
+        let probe_str = path_str.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::library::file_ops::read_file_mapped(&probe_path)
+                .ok()
+                .and_then(|b| crate::metadata::exif_processing::read_iso(&probe_str, &b))
+                .is_some_and(|iso| {
+                    select_smart_denoise_tier(iso, 0.0, None) == SmartDenoiseTier::MaxHighIsoNind
+                })
+        })
+        .await
+        .unwrap_or(false)
     } else {
         false
     };
@@ -588,14 +875,24 @@ pub async fn apply_denoising(
 
     let mut ai_session = None;
     if needs_ai {
-        let session = crate::ai::models::get_or_init_denoise_model(
+        let _ = app_handle.emit("denoise-progress", "Initializing AI Denoise model... 2%");
+        match crate::ai::models::get_or_init_denoise_model(
             &app_handle,
             &state.ai_state,
             &state.ai_init_lock,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        ai_session = Some(session);
+        {
+            Ok(session) => ai_session = Some(session),
+            Err(e) if lower_method == "auto" => {
+                log::warn!("Auto denoise AI model init failed ({}), falling back to Star-Safe BM3D", e);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        if cancel_token.load(AtomicOrdering::Relaxed) {
+            let _ = app_handle.emit("denoise-error", "Cancelled by user");
+            return Ok(());
+        }
     }
 
     let denoise_result_handle = state.denoise_result.clone();
@@ -603,7 +900,7 @@ pub async fn apply_denoising(
     tokio::task::spawn_blocking(move || {
         let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("apply_denoising");
         match denoise_image(
-            path_str,
+            path,
             intensity,
             method,
             should_heal,
@@ -614,12 +911,14 @@ pub async fn apply_denoising(
             s_boost,
             should_deband,
             grain,
+            js_adjustments,
             app_handle.clone(),
             ai_session,
             Some(cancel_token),
         ) {
-            Ok((image, _)) => {
-                *denoise_result_handle.lock().unwrap() = Some(image);
+            Ok((image, _, edits_baked)) => {
+                LAST_DENOISE_EDITS_BAKED.store(edits_baked, AtomicOrdering::SeqCst);
+                *denoise_result_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
             }
             Err(e) => {
                 let _ = app_handle.emit("denoise-error", e);
@@ -676,9 +975,12 @@ pub async fn batch_denoise_images(
     tokio::task::spawn_blocking(move || {
         let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("batch_denoise_images");
         let mut results = Vec::new();
+        let mut created_files: Vec<std::path::PathBuf> = Vec::new();
+        let mut cancelled = false;
 
         for (i, path_str) in paths.iter().enumerate() {
             if cancel_token.load(AtomicOrdering::Relaxed) {
+                cancelled = true;
                 break;
             }
             let _ = app_handle.emit(
@@ -695,7 +997,7 @@ pub async fn batch_denoise_images(
             let real_path = source_path.to_string_lossy().to_string();
 
             match crate::enhanced::denoising::denoise_image(
-                real_path.clone(),
+                path_str.clone(),
                 intensity,
                 method.clone(),
                 should_heal,
@@ -706,11 +1008,16 @@ pub async fn batch_denoise_images(
                 s_boost,
                 should_deband,
                 grain,
+                None,
                 app_handle.clone(),
                 ai_session.clone(),
                 Some(cancel_token.clone()),
             ) {
-                Ok((image, _)) => {
+                Ok((image, _, edits_baked)) => {
+                    if cancel_token.load(AtomicOrdering::Relaxed) {
+                        cancelled = true;
+                        break;
+                    }
                     let is_raw = crate::decode::formats::is_raw_file(&real_path);
                     let parent_dir = source_path.parent().unwrap_or(std::path::Path::new(""));
                     let stem = source_path
@@ -738,28 +1045,46 @@ pub async fn batch_denoise_images(
                         );
                         continue;
                     }
+                    created_files.push(output_path.clone());
 
-                    let _ = crate::metadata::exif_processing::write_rrexif_sidecar(&real_path, &output_path);
+                    let output_path_str = output_path.to_string_lossy().to_string();
+                    let (_, dest_sidecar_path) =
+                        crate::library::sidecars::parse_virtual_path(&output_path_str);
+                    let dest_sidecar_existed = dest_sidecar_path.exists();
 
-                    if source_sidecar_path.exists()
-                        && let Some(output_path_str) = output_path.to_str()
-                    {
-                        let (_, dest_sidecar_path) =
-                            crate::library::sidecars::parse_virtual_path(output_path_str);
+                    if !edits_baked && source_sidecar_path.exists() {
                         if let Err(e) = std::fs::copy(&source_sidecar_path, &dest_sidecar_path) {
                             log::warn!("Failed to copy sidecar file for denoised image: {}", e);
+                        } else if !dest_sidecar_existed {
+                            created_files.push(dest_sidecar_path.clone());
                         }
                     }
 
-                    results.push(output_path.to_string_lossy().to_string());
+                    let _ = crate::metadata::exif_processing::write_rrexif_sidecar(&real_path, &output_path);
+                    if !dest_sidecar_existed && dest_sidecar_path.exists() && !created_files.contains(&dest_sidecar_path) {
+                        created_files.push(dest_sidecar_path);
+                    }
+
+                    results.push(output_path_str);
                 }
                 Err(e) => {
+                    if cancel_token.load(AtomicOrdering::Relaxed) || e.to_lowercase().contains("cancel") {
+                        cancelled = true;
+                        break;
+                    }
                     let _ = app_handle.emit(
                         "denoise-error",
                         format!("Failed to denoise {}: {}", real_path, e),
                     );
                 }
             }
+        }
+
+        if cancelled {
+            for p in created_files.iter().rev() {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err("Batch denoising cancelled by user — partial files rolled back".to_string());
         }
 
         Ok(results)
@@ -774,7 +1099,7 @@ pub async fn save_denoised_image(
     export_format: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let denoised_image = state.denoise_result.lock().unwrap().take().ok_or_else(|| {
+    let denoised_image = state.denoise_result.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or_else(|| {
         "No denoised image found in memory. It might have already been saved or cleared."
             .to_string()
     })?;
@@ -814,6 +1139,17 @@ pub async fn save_denoised_image(
         out
     };
 
+    let edits_baked = LAST_DENOISE_EDITS_BAKED.swap(false, AtomicOrdering::SeqCst);
+    if !edits_baked
+        && source_sidecar_path.exists()
+        && let Some(output_path_str) = output_path.to_str()
+    {
+        let (_, dest_sidecar_path) = crate::library::sidecars::parse_virtual_path(output_path_str);
+        if let Err(e) = std::fs::copy(&source_sidecar_path, &dest_sidecar_path) {
+            log::warn!("Failed to copy sidecar file for denoised image: {}", e);
+        }
+    }
+
     let (real_path, _) = crate::library::sidecars::parse_virtual_path(&original_path_str);
     let real_path_str = real_path.to_string_lossy().to_string();
     let _ = crate::metadata::exif_processing::write_rrexif_sidecar(&real_path_str, &output_path);
@@ -827,15 +1163,6 @@ pub async fn save_denoised_image(
         crate::enhanced::local_priors::record_denoise_confirmation(&cam_key, iso, 100.0, 15.0, 0.0, 0.0);
     }
 
-    if source_sidecar_path.exists()
-        && let Some(output_path_str) = output_path.to_str()
-    {
-        let (_, dest_sidecar_path) = crate::library::sidecars::parse_virtual_path(output_path_str);
-        if let Err(e) = std::fs::copy(&source_sidecar_path, &dest_sidecar_path) {
-            log::warn!("Failed to copy sidecar file for denoised image: {}", e);
-        }
-    }
-
     Ok(output_path.to_string_lossy().to_string())
 }
 
@@ -843,7 +1170,9 @@ fn run_bm3d(
     rgb_img: &Rgb32FImage,
     intensity: f32,
     app_handle: &AppHandle,
+    cancel: Option<&AtomicBool>,
 ) -> Result<DynamicImage, String> {
+    check_denoise_cancelled(cancel)?;
     let (width, height) = rgb_img.dimensions();
     let params = Bm3dParams::from_intensity(intensity);
     let dct_tables = Arc::new(DctTables::new());
@@ -858,18 +1187,20 @@ fn run_bm3d(
     let total_work_units = (patches_x * patches_y) * 2;
     let progress_counter = Arc::new(AtomicUsize::new(0));
 
-    let _ = app_handle.emit("denoise-progress", "Processing (Step 1/2)...");
+    let _ = app_handle.emit("denoise-progress", "Processing (Step 1/2)... 5%");
 
     let progress = ProgressReporter {
         counter: &progress_counter,
         total_work: total_work_units,
         app_handle,
+        cancel,
     };
     let mut denoised_channels =
-        bm3d_process_joint(&channels, width, height, &params, &dct_tables, &progress);
+        bm3d_process_joint(&channels, width, height, &params, &dct_tables, &progress)?;
+    check_denoise_cancelled(cancel)?;
 
     {
-        let _ = app_handle.emit("denoise-progress", "Applying Guided Micro-Texture & Edge Recovery...");
+        let _ = app_handle.emit("denoise-progress", "Applying Guided Micro-Texture & Edge Recovery... 80%");
         let w_usize = width as usize;
         let h_usize = height as usize;
         let blurred_y = gaussian_blur_1ch(&original_y, w_usize, h_usize, 2.5);
@@ -1646,9 +1977,11 @@ fn run_bm3d_fast_tile(
         counter: &progress_counter,
         total_work: 1000000,
         app_handle,
+        cancel: None,
     };
     let denoised_channels =
-        bm3d_process_joint(&channels, width, height, &params, &dct_tables, &progress);
+        bm3d_process_joint(&channels, width, height, &params, &dct_tables, &progress)
+            .unwrap_or_else(|_| channels.clone());
 
     let (r, g, b) = ycbcr_to_rgb(
         &denoised_channels[0],
@@ -1675,7 +2008,7 @@ fn run_bm3d_fast_tile(
 
 #[allow(clippy::too_many_arguments)]
 fn denoise_image(
-    path_str: String,
+    virtual_path_str: String,
     intensity: f32,
     method: String,
     heal_dust: bool,
@@ -1686,25 +2019,124 @@ fn denoise_image(
     shadow_boost: f32,
     deband: bool,
     film_grain: f32,
+    js_adjustments: Option<serde_json::Value>,
     app_handle: AppHandle,
     ai_session: Option<Arc<Mutex<ort::session::Session>>>,
     cancel_token: Option<Arc<AtomicBool>>,
-) -> Result<(DynamicImage, String), String> {
+) -> Result<(DynamicImage, String, bool), String> {
     let cancel_ref = cancel_token.as_deref();
     check_denoise_cancelled(cancel_ref)?;
-    let path = Path::new(&path_str);
+    let (path, _) = parse_virtual_path(&virtual_path_str);
     if !path.exists() {
         return Err("File not found".to_string());
     }
+    let path_str = path.to_string_lossy().to_string();
 
     let is_raw = is_raw_file(&path_str);
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
 
-    let _ = app_handle.emit("denoise-progress", "Loading image...");
+    let _ = app_handle.emit("denoise-progress", "Loading image... 5%");
 
-    let file_bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let file_bytes = crate::library::file_ops::read_file_mapped(&path).map_err(|e| e.to_string())?;
     check_denoise_cancelled(cancel_ref)?;
     let effective_method = resolve_effective_denoise_method(&method, &path_str, &file_bytes);
+
+    if effective_method == "raw_pre_demosaic" && is_raw {
+        let (make, model) =
+            crate::metadata::exif_processing::read_camera_make_model(&path_str, &file_bytes)
+                .unwrap_or_default();
+        let iso = crate::metadata::exif_processing::read_iso(&path_str, &file_bytes).unwrap_or(400);
+        let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+        let (read_noise, shot_noise) =
+            if let Some(bucket) = crate::enhanced::local_priors::lookup_iso_noise_profile(&cam_key, iso) {
+                (bucket.read_noise, bucket.shot_noise)
+            } else {
+                let prof = get_sensor_noise_profile(&make, &model);
+                (prof.base_read_noise, prof.shot_noise_coeff)
+            };
+        let opts = crate::ai::raw_denoise::RawDenoiseOptions {
+            strength: intensity.clamp(0.05, 1.2),
+            read_noise,
+            shot_noise,
+            model_path: settings.raw_denoise_model_path.clone(),
+        };
+        let _ = app_handle.emit("denoise-progress", "Running Bayer 4-ch GAT pre-demosaic denoise... 35%");
+        if let Ok(raw_dn_img) =
+            crate::ai::raw_denoise::denoise_raw_bytes_pre_demosaic(&file_bytes, &opts, cancel_ref)
+        {
+            let dynamic_orig = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
+                .map_err(|e| e.to_string())?;
+            let orig_rgb = dynamic_orig.to_rgb32f();
+            let mut out_dynamic_final = DynamicImage::ImageRgb32F(raw_dn_img);
+            if protect_stars {
+                check_denoise_cancelled(cancel_ref)?;
+                apply_star_point_protection(&mut out_dynamic_final, &orig_rgb);
+            }
+            if preserve_details > 0.001 {
+                check_denoise_cancelled(cancel_ref)?;
+                apply_edge_guided_texture_preservation(&mut out_dynamic_final, &orig_rgb, preserve_details);
+            }
+            if shadow_boost > 0.001 {
+                check_denoise_cancelled(cancel_ref)?;
+                apply_shadow_weighted_zoning(&mut out_dynamic_final, &orig_rgb, shadow_boost);
+            }
+            if heal_dust {
+                check_denoise_cancelled(cancel_ref)?;
+                let _ = crate::enhanced::defect_repair::heal_sky_dust_spots(&mut out_dynamic_final);
+            }
+            let mut original_dynamic = DynamicImage::ImageRgb32F(orig_rgb);
+            let mut edits_baked = false;
+            let denoise_stripped_adj = js_adjustments.clone().map(|mut adj| {
+                if let Some(obj) = adj.as_object_mut() {
+                    obj.insert("aiDenoiseEnabled".to_string(), serde_json::json!(false));
+                    obj.insert("lumaNoiseReduction".to_string(), serde_json::json!(0));
+                    obj.insert("colorNoiseReduction".to_string(), serde_json::json!(0));
+                }
+                adj
+            });
+            if let Some(edited_denoised) = crate::export::render_image_with_edits(
+                &virtual_path_str,
+                &out_dynamic_final,
+                denoise_stripped_adj.as_ref(),
+                &settings,
+                &app_handle,
+                true,
+            ) {
+                out_dynamic_final = edited_denoised;
+                edits_baked = true;
+                if let Some(edited_orig) = crate::export::render_image_with_edits(
+                    &virtual_path_str,
+                    &original_dynamic,
+                    denoise_stripped_adj.as_ref(),
+                    &settings,
+                    &app_handle,
+                    false,
+                ) {
+                    original_dynamic = edited_orig;
+                } else {
+                    apply_cpu_default_raw_processing(&mut original_dynamic);
+                }
+            } else {
+                apply_cpu_default_raw_processing(&mut out_dynamic_final);
+                apply_cpu_default_raw_processing(&mut original_dynamic);
+            }
+            let _ = app_handle.emit("denoise-progress", "Done 100%");
+            let preview_b64 = img_to_base64_jpeg(&out_dynamic_final.to_rgb32f(), 90)?;
+            let orig_b64 = img_to_base64_jpeg(&original_dynamic.to_rgb32f(), 90)?;
+            let _ = app_handle.emit(
+                "denoise-complete",
+                serde_json::json!({
+                    "preview": preview_b64,
+                    "original": orig_b64,
+                    "dust_spots_healed": 0
+                }),
+            );
+            return Ok((out_dynamic_final, path_str, edits_baked));
+        } else if cancel_ref.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+            return Err("Denoise cancelled by user".to_string());
+        }
+    }
+
     let dynamic_img = load_base_image_from_bytes(&file_bytes, &path_str, false, &settings, None)
         .map_err(|e| e.to_string())?;
 
@@ -1712,74 +2144,78 @@ fn denoise_image(
 
     if deband {
         check_denoise_cancelled(cancel_ref)?;
-        let _ = app_handle.emit("denoise-progress", "Removing sensor readout banding stripes...");
+        let _ = app_handle.emit("denoise-progress", "Removing sensor readout banding stripes... 12%");
         remove_sensor_banding(&mut rgb_img_for_denoiser);
         remove_canon_adc_banding(&mut rgb_img_for_denoiser);
     }
 
     if chroma_intensity > 0.0 || film_grain > 0.0 {
         check_denoise_cancelled(cancel_ref)?;
+        let _ = app_handle.emit("denoise-progress", "Pre-filtering chroma noise... 18%");
         rgb_img_for_denoiser = apply_chroma_luma_denoise(&rgb_img_for_denoiser, intensity, chroma_intensity, film_grain);
     }
 
     let out_dynamic = if effective_method == "ai" {
-        let session_arc = ai_session.ok_or_else(|| "AI Session not provided".to_string())?;
-        let is_gpu = crate::ai::models::is_gpu_active();
-        let emit_progress = |tp: crate::ai::tiling::TileProgress| {
-            let eta = tp.eta_sec.map(|s| format!(" · ETA {}s", s)).unwrap_or_default();
-            let _ = app_handle.emit(
-                "denoise-progress",
-                format!(
-                    "{} [{}/{}] {:.0}% ({}){}",
-                    tp.stage,
-                    tp.tile_index,
-                    tp.total_tiles,
-                    tp.progress * 100.0,
-                    tp.provider,
-                    eta
-                ),
-            );
-        };
-        match crate::ai::tiling::run_ai_denoise_with_control(
-            &rgb_img_for_denoiser,
-            &session_arc,
-            cancel_ref,
-            is_gpu,
-            &emit_progress,
-        ) {
-            Ok(img) => img,
-            Err(err)
-                if is_gpu
-                    && !cancel_ref.is_some_and(|c| c.load(AtomicOrdering::Relaxed))
-                    && (err.to_string().contains("DIRECTML_FIRST_TILE_SLOW")
-                        || !crate::ai::models::is_gpu_active()) =>
-            {
+        if let Some(session_arc) = ai_session {
+            let is_gpu = crate::ai::models::is_gpu_active();
+            let emit_progress = |tp: crate::ai::tiling::TileProgress| {
+                let eta = tp.eta_sec.map(|s| format!(" · ETA {}s", s)).unwrap_or_default();
                 let _ = app_handle.emit(
                     "denoise-progress",
-                    "DirectML stalled — falling back to CPU ONNX...",
-                );
-                let state = app_handle.state::<AppState>();
-                let cpu_session = tauri::async_runtime::block_on(
-                    crate::ai::models::force_cpu_denoise_model(
-                        &app_handle,
-                        &state.ai_state,
-                        &state.ai_init_lock,
+                    format!(
+                        "{} [{}/{}] {:.0}% ({}){}",
+                        tp.stage,
+                        tp.tile_index,
+                        tp.total_tiles,
+                        tp.progress * 100.0,
+                        tp.provider,
+                        eta
                     ),
-                )
-                .map_err(|e| e.to_string())?;
-                crate::ai::tiling::run_ai_denoise_with_control(
-                    &rgb_img_for_denoiser,
-                    &cpu_session,
-                    cancel_ref,
-                    false,
-                    &emit_progress,
-                )
-                .map_err(|e| e.to_string())?
+                );
+            };
+            match crate::ai::tiling::run_ai_denoise_with_control(
+                &rgb_img_for_denoiser,
+                &session_arc,
+                cancel_ref,
+                is_gpu,
+                &emit_progress,
+            ) {
+                Ok(img) => img,
+                Err(err)
+                    if is_gpu
+                        && !cancel_ref.is_some_and(|c| c.load(AtomicOrdering::Relaxed))
+                        && (err.to_string().contains("DIRECTML_FIRST_TILE_SLOW")
+                            || !crate::ai::models::is_gpu_active()) =>
+                {
+                    let _ = app_handle.emit(
+                        "denoise-progress",
+                        "DirectML stalled — falling back to CPU ONNX...",
+                    );
+                    let state = app_handle.state::<AppState>();
+                    let cpu_session = tauri::async_runtime::block_on(
+                        crate::ai::models::force_cpu_denoise_model(
+                            &app_handle,
+                            &state.ai_state,
+                            &state.ai_init_lock,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    crate::ai::tiling::run_ai_denoise_with_control(
+                        &rgb_img_for_denoiser,
+                        &cpu_session,
+                        cancel_ref,
+                        false,
+                        &emit_progress,
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+                Err(e) => return Err(e.to_string()),
             }
-            Err(e) => return Err(e.to_string()),
+        } else {
+            run_bm3d(&rgb_img_for_denoiser, intensity, &app_handle, cancel_ref)?
         }
     } else if effective_method == "fast_gpu" {
-        let _ = app_handle.emit("denoise-progress", "Fast Edge-Safe Denoise...");
+        let _ = app_handle.emit("denoise-progress", "Fast Edge-Safe Denoise... 55%");
         let fast = apply_chroma_luma_denoise(
             &rgb_img_for_denoiser,
             (intensity * 0.90).max(0.15),
@@ -1788,55 +2224,98 @@ fn denoise_image(
         );
         DynamicImage::ImageRgb32F(fast)
     } else {
-        run_bm3d(&rgb_img_for_denoiser, intensity, &app_handle)?
+        run_bm3d(&rgb_img_for_denoiser, intensity, &app_handle, cancel_ref)?
     };
     check_denoise_cancelled(cancel_ref)?;
 
     let mut out_dynamic_final = out_dynamic;
 
     if protect_stars {
-        let _ = app_handle.emit("denoise-progress", "Protecting star fields & specular points...");
+        check_denoise_cancelled(cancel_ref)?;
+        let _ = app_handle.emit("denoise-progress", "Protecting star fields & specular points... 84%");
         apply_star_point_protection(&mut out_dynamic_final, &rgb_img_for_denoiser);
     }
 
     if preserve_details > 0.001 {
-        let _ = app_handle.emit("denoise-progress", "Preserving organic micro-textures & skin details...");
+        check_denoise_cancelled(cancel_ref)?;
+        let _ = app_handle.emit("denoise-progress", "Preserving organic micro-textures & skin details... 88%");
         apply_edge_guided_texture_preservation(&mut out_dynamic_final, &rgb_img_for_denoiser, preserve_details);
     }
 
     if shadow_boost > 0.001 {
-        let _ = app_handle.emit("denoise-progress", "Applying shadow-weighted zoning...");
+        check_denoise_cancelled(cancel_ref)?;
+        let _ = app_handle.emit("denoise-progress", "Applying shadow-weighted zoning... 91%");
         apply_shadow_weighted_zoning(&mut out_dynamic_final, &rgb_img_for_denoiser, shadow_boost);
     }
 
     let mut dust_healed_count = 0usize;
     if heal_dust {
-        let _ = app_handle.emit("denoise-progress", "Analyzing & healing sensor dust spots...");
+        check_denoise_cancelled(cancel_ref)?;
+        let _ = app_handle.emit("denoise-progress", "Analyzing & healing sensor dust spots... 94%");
         let dust_res = crate::enhanced::defect_repair::heal_sky_dust_spots(&mut out_dynamic_final);
         dust_healed_count = dust_res.spots_detected;
     }
 
-    let _ = app_handle.emit("denoise-progress", "Finalizing data...");
-    let _ = app_handle.emit("denoise-progress", "Generating previews...");
+    check_denoise_cancelled(cancel_ref)?;
+    let _ = app_handle.emit("denoise-progress", "Generating previews... 97%");
+
+    let mut original_dynamic = DynamicImage::ImageRgb32F(rgb_img_for_denoiser);
+    let mut edits_baked = false;
+    let denoise_stripped_adj = js_adjustments.map(|mut adj| {
+        if let Some(obj) = adj.as_object_mut() {
+            obj.insert("aiDenoiseEnabled".to_string(), serde_json::json!(false));
+            obj.insert("lumaNoiseReduction".to_string(), serde_json::json!(0));
+            obj.insert("colorNoiseReduction".to_string(), serde_json::json!(0));
+        }
+        adj
+    });
+
+    if let Some(edited_denoised) = crate::export::render_image_with_edits(
+        &virtual_path_str,
+        &out_dynamic_final,
+        denoise_stripped_adj.as_ref(),
+        &settings,
+        &app_handle,
+        true,
+    ) {
+        out_dynamic_final = edited_denoised;
+        edits_baked = true;
+        if let Some(edited_orig) = crate::export::render_image_with_edits(
+            &virtual_path_str,
+            &original_dynamic,
+            denoise_stripped_adj.as_ref(),
+            &settings,
+            &app_handle,
+            false,
+        ) {
+            original_dynamic = edited_orig;
+        } else if is_raw {
+            apply_cpu_default_raw_processing(&mut original_dynamic);
+        }
+    } else if is_raw {
+        apply_cpu_default_raw_processing(&mut out_dynamic_final);
+        apply_cpu_default_raw_processing(&mut original_dynamic);
+    }
 
     let (width, height) = out_dynamic_final.dimensions();
+    let max_preview_dim = 2048u32;
     let (new_width, new_height) = if width > height {
-        if width > 4000 {
-            (4000, (4000.0 * height as f32 / width as f32).round() as u32)
+        if width > max_preview_dim {
+            (
+                max_preview_dim,
+                (max_preview_dim as f32 * height as f32 / width as f32).round() as u32,
+            )
         } else {
             (width, height)
         }
+    } else if height > max_preview_dim {
+        (
+            (max_preview_dim as f32 * width as f32 / height as f32).round() as u32,
+            max_preview_dim,
+        )
     } else {
-        if height > 4000 {
-            ((4000.0 * width as f32 / height as f32).round() as u32, 4000)
-        } else {
-            (width, height)
-        }
+        (width, height)
     };
-
-    if is_raw {
-        apply_cpu_default_raw_processing(&mut out_dynamic_final);
-    }
 
     let denoised_preview = if new_width != width {
         out_dynamic_final.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
@@ -1844,32 +2323,15 @@ fn denoise_image(
         out_dynamic_final.clone()
     };
 
-    let mut buf_denoised = Cursor::new(Vec::new());
-    denoised_preview
-        .to_rgb8()
-        .write_to(&mut buf_denoised, ImageFormat::Png)
-        .map_err(|e| format!("Failed to encode preview: {}", e))?;
-    let base64_str_denoised = general_purpose::STANDARD.encode(buf_denoised.get_ref());
-    let data_url_denoised = format!("data:image/png;base64,{}", base64_str_denoised);
+    let data_url_denoised = img_to_base64_jpeg(&denoised_preview.to_rgb32f(), 92)?;
 
-    let mut original_dynamic = DynamicImage::ImageRgb32F(rgb_img_for_denoiser);
-
-    if is_raw {
-        apply_cpu_default_raw_processing(&mut original_dynamic);
-    }
     let original_preview = if new_width != width {
         original_dynamic.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
     } else {
         original_dynamic
     };
 
-    let mut buf_orig = Cursor::new(Vec::new());
-    original_preview
-        .to_rgb8()
-        .write_to(&mut buf_orig, ImageFormat::Png)
-        .map_err(|e| format!("Failed to encode original preview: {}", e))?;
-    let base64_str_orig = general_purpose::STANDARD.encode(buf_orig.get_ref());
-    let data_url_orig = format!("data:image/png;base64,{}", base64_str_orig);
+    let data_url_orig = img_to_base64_jpeg(&original_preview.to_rgb32f(), 92)?;
 
     let payload = serde_json::json!({
         "denoised": data_url_denoised,
@@ -1880,7 +2342,7 @@ fn denoise_image(
 
     let _ = app_handle.emit("denoise-complete", &payload);
 
-    Ok((out_dynamic_final, data_url_denoised))
+    Ok((out_dynamic_final, data_url_denoised, edits_baked))
 }
 
 fn rgb_to_ycbcr(r: &[f32], g: &[f32], b: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -1922,7 +2384,7 @@ fn bm3d_process_joint(
     params: &Bm3dParams,
     tables: &DctTables,
     progress: &ProgressReporter,
-) -> Vec<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>, String> {
     let basic_estimate = run_bm3d_step_joint(
         noisy_channels,
         noisy_channels,
@@ -1932,7 +2394,7 @@ fn bm3d_process_joint(
         true,
         tables,
         progress,
-    );
+    )?;
 
     run_bm3d_step_joint(
         noisy_channels,
@@ -1956,7 +2418,8 @@ fn run_bm3d_step_joint(
     is_step_1: bool,
     tables: &DctTables,
     progress: &ProgressReporter,
-) -> Vec<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>, String> {
+    check_denoise_cancelled(progress.cancel)?;
     let w = width as usize;
     let h = height as usize;
     let count = w * h;
@@ -1977,9 +2440,12 @@ fn run_bm3d_step_joint(
     }
 
     ref_patches.par_iter().for_each(|&(rx, ry)| {
+        if progress.cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+            return;
+        }
         let c = progress.counter.fetch_add(1, AtomicOrdering::Relaxed);
         if c.is_multiple_of(200) {
-            let pct = (c as f32 / progress.total_work as f32) * 100.0;
+            let pct = ((c as f32 / progress.total_work.max(1) as f32) * 75.0 + 5.0).clamp(5.0, 80.0);
             let step_str = if is_step_1 { "Step 1/2" } else { "Step 2/2" };
             let msg = format!("{} - {:.0}%", step_str, pct);
             let _ = progress.app_handle.emit("denoise-progress", msg);
@@ -2048,6 +2514,7 @@ fn run_bm3d_step_joint(
         }
     });
 
+    check_denoise_cancelled(progress.cancel)?;
     let mut results = Vec::new();
     for ch in 0..num_channels {
         let num_vec = numerators[ch].to_vec();
@@ -2060,7 +2527,7 @@ fn run_bm3d_step_joint(
             .collect();
         results.push(final_ch);
     }
-    results
+    Ok(results)
 }
 
 fn hard_threshold(stack: &mut [f32], th: f32) -> usize {
@@ -3137,6 +3604,176 @@ pub fn drizzle_reconstruct_frames(
         .expect("Drizzle output dimensions match pixel buffer size")
 }
 
+/// Pre-demosaic Bayer CFA Variable-Pixel Linear Reconstruction (Hubble Drizzle)
+/// Accumulates R, G, and B channels onto independent per-channel weight buffers
+/// so color channels never cross-contaminate prior to hole fill & working matrix transform.
+pub(crate) fn drizzle_bayer_cfa_frames(
+    frames: &[crate::decode::raw_processing::LinearBayerFrame],
+    transforms: &[RigidTransform2D],
+    scale: u32,
+    pixfrac: f32,
+) -> Result<Rgb32FImage, String> {
+    if frames.is_empty() || frames.len() != transforms.len() {
+        return Err("Invalid frame/transform pair for Bayer CFA drizzle".to_string());
+    }
+    let scale = scale.clamp(2, 4);
+    let p = pixfrac.clamp(0.4, 1.0);
+    let ref_f = &frames[0];
+    let orig_w = ref_f.width as u32;
+    let orig_h = ref_f.height as u32;
+    let dst_w = orig_w * scale;
+    let dst_h = orig_h * scale;
+    let total_pixels = (dst_w * dst_h) as usize;
+
+    let mut sum_r = vec![0.0f32; total_pixels];
+    let mut sum_g = vec![0.0f32; total_pixels];
+    let mut sum_b = vec![0.0f32; total_pixels];
+    let mut sum_wr = vec![0.0f32; total_pixels];
+    let mut sum_wg = vec![0.0f32; total_pixels];
+    let mut sum_wb = vec![0.0f32; total_pixels];
+
+    let d = (scale as f32) * p;
+    let half_d = d * 0.5;
+    let a_drop = d * d;
+    let cx = orig_w as f32 * 0.5;
+    let cy = orig_h as f32 * 0.5;
+
+    for (frame, transform) in frames.iter().zip(transforms.iter()) {
+        if frame.width != ref_f.width || frame.height != ref_f.height {
+            continue;
+        }
+        for y in 0..frame.height {
+            let row_off = y * frame.width;
+            for x in 0..frame.width {
+                let chan = frame.cfa[y & 1][x & 1] as usize;
+                let raw_val = frame.data[row_off + x];
+                // White-balance linear camera sample for cross-channel interpolation consistency
+                let wb_val = raw_val * frame.wb[chan.min(2)];
+
+                let (xr, yr) = transform.apply(x as f32, y as f32, cx, cy);
+                let target_xc = (xr + 0.5) * scale as f32;
+                let target_yc = (yr + 0.5) * scale as f32;
+
+                let x1 = target_xc - half_d;
+                let x2 = target_xc + half_d;
+                let y1 = target_yc - half_d;
+                let y2 = target_yc + half_d;
+
+                let min_gx = (x1.floor() as i32).max(0) as u32;
+                let max_gx = (x2.ceil() as i32).min(dst_w as i32 - 1) as u32;
+                let min_gy = (y1.floor() as i32).max(0) as u32;
+                let max_gy = (y2.ceil() as i32).min(dst_h as i32 - 1) as u32;
+
+                for gy in min_gy..=max_gy {
+                    let ovlp_y = (y2.min((gy + 1) as f32) - y1.max(gy as f32)).max(0.0);
+                    if ovlp_y <= 0.0 {
+                        continue;
+                    }
+                    let row_idx = (gy * dst_w) as usize;
+                    for gx in min_gx..=max_gx {
+                        let ovlp_x = (x2.min((gx + 1) as f32) - x1.max(gx as f32)).max(0.0);
+                        if ovlp_x <= 0.0 {
+                            continue;
+                        }
+                        let weight = (ovlp_x * ovlp_y) / a_drop;
+                        let idx = row_idx + gx as usize;
+                        match chan {
+                            0 => {
+                                sum_r[idx] += wb_val * weight;
+                                sum_wr[idx] += weight;
+                            }
+                            1 => {
+                                sum_g[idx] += wb_val * weight;
+                                sum_wg[idx] += weight;
+                            }
+                            _ => {
+                                sum_b[idx] += wb_val * weight;
+                                sum_wb[idx] += weight;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Normalize & harmonically fill sparse voids independently per channel
+    let mut planes = [
+        vec![0.0f32; total_pixels],
+        vec![0.0f32; total_pixels],
+        vec![0.0f32; total_pixels],
+    ];
+    let weight_refs = [&sum_wr, &sum_wg, &sum_wb];
+    let sum_refs = [&sum_r, &sum_g, &sum_b];
+
+    for c in 0..3 {
+        let mut holes = Vec::new();
+        let mut filled_sum = 0.0f32;
+        let mut filled_cnt = 0usize;
+        for idx in 0..total_pixels {
+            let w = weight_refs[c][idx];
+            if w > 1e-4 {
+                let v = sum_refs[c][idx] / w;
+                planes[c][idx] = v;
+                filled_sum += v;
+                filled_cnt += 1;
+            } else {
+                holes.push(idx);
+            }
+        }
+        let global_mean = if filled_cnt > 0 {
+            filled_sum / filled_cnt as f32
+        } else {
+            0.0
+        };
+        for &idx in &holes {
+            planes[c][idx] = global_mean;
+        }
+        if !holes.is_empty() {
+            let mut tmp = planes[c].clone();
+            for _ in 0..8 {
+                for &idx in &holes {
+                    let gx = (idx as u32) % dst_w;
+                    let gy = (idx as u32) / dst_w;
+                    let l = (gy * dst_w + gx.saturating_sub(1)) as usize;
+                    let r = (gy * dst_w + (gx + 1).min(dst_w - 1)) as usize;
+                    let u = (gy.saturating_sub(1) * dst_w + gx) as usize;
+                    let d = (((gy + 1).min(dst_h - 1)) * dst_w + gx) as usize;
+                    tmp[idx] = 0.25 * (planes[c][l] + planes[c][r] + planes[c][u] + planes[c][d]);
+                }
+                for &idx in &holes {
+                    planes[c][idx] = tmp[idx];
+                }
+            }
+        }
+    }
+
+    // Convert from WB-scaled camera space back to linear camera RGB and apply `cam_to_working`.
+    let wb = ref_f.wb;
+    let m = ref_f.cam_to_working;
+    let mut out_pixels = vec![0.0f32; total_pixels * 3];
+    for idx in 0..total_pixels {
+        let cr = planes[0][idx] / wb[0].max(1e-5);
+        let cg = planes[1][idx] / wb[1].max(1e-5);
+        let cb = planes[2][idx] / wb[2].max(1e-5);
+        let wr = (m[0][0] * cr + m[0][1] * cg + m[0][2] * cb).clamp(0.0, 1.0);
+        let wg = (m[1][0] * cr + m[1][1] * cg + m[1][2] * cb).clamp(0.0, 1.0);
+        let wb_out = (m[2][0] * cr + m[2][1] * cg + m[2][2] * cb).clamp(0.0, 1.0);
+        let out_idx = idx * 3;
+        out_pixels[out_idx] = wr;
+        out_pixels[out_idx + 1] = wg;
+        out_pixels[out_idx + 2] = wb_out;
+    }
+
+    let raw_buf = image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(dst_w, dst_h, out_pixels)
+        .ok_or_else(|| "Failed to allocate Bayer CFA Drizzle output".to_string())?;
+    Ok(crate::render::geometry::apply_orientation(
+        DynamicImage::ImageRgb32F(raw_buf),
+        ref_f.orientation,
+    )
+    .to_rgb32f())
+}
+
 /// Multi-Frame Sub-Pixel Drizzle Super-Resolution Integration
 /// Uses NASA Variable-Pixel Linear Reconstruction with sub-pixel phase jitter across burst frames
 /// to reconstruct true optical RGB data at 2x/3x/4x resolution, eliminating Bayer moiré and boosting SNR.
@@ -3146,7 +3783,31 @@ pub fn drizzle_super_resolution_burst(
     pixfrac: Option<f32>,
     app_handle: &tauri::AppHandle,
     settings: &crate::app::settings::AppSettings,
+    cancel_token: Option<&AtomicBool>,
 ) -> Result<DynamicImage, String> {
+    drizzle_super_resolution_burst_with_opts(
+        paths,
+        scale_factor,
+        pixfrac,
+        true,
+        "auto",
+        app_handle,
+        settings,
+        cancel_token,
+    )
+}
+
+pub fn drizzle_super_resolution_burst_with_opts(
+    paths: &[String],
+    scale_factor: u32,
+    pixfrac: Option<f32>,
+    bayer_cfa_mode: bool,
+    alignment_mode: &str,
+    app_handle: &tauri::AppHandle,
+    settings: &crate::app::settings::AppSettings,
+    cancel_token: Option<&AtomicBool>,
+) -> Result<DynamicImage, String> {
+    check_denoise_cancelled(cancel_token)?;
     if paths.len() < 2 {
         return Err("Drizzle Super-Resolution requires at least 2 burst frames".to_string());
     }
@@ -3164,9 +3825,69 @@ pub fn drizzle_super_resolution_burst(
         }),
     );
 
-    // 1. Load Reference Frame (memory-mapped / single file in RAM)
     let (ref_source, _) = parse_virtual_path(&paths[0]);
     let ref_bytes = fs::read(&ref_source).map_err(|e| e.to_string())?;
+
+    // Check if true Bayer CFA pre-demosaic Drizzle applies cleanly to all input frames
+    if bayer_cfa_mode && paths.iter().all(|p_str| crate::decode::formats::is_raw_file(p_str)) {
+        if let Ok(ref_bayer) = crate::decode::raw_processing::extract_linear_bayer_cfa(&ref_bytes) {
+            if let Ok(ref_dyn) = load_base_image_from_bytes(&ref_bytes, &ref_source.to_string_lossy(), true, settings, None) {
+                let ref_rgb = ref_dyn.to_rgb32f();
+                let mut bayer_frames = vec![ref_bayer];
+                let mut bayer_transforms = vec![RigidTransform2D::identity()];
+                let mut cfa_ok = true;
+
+                for (frame_idx, path_str) in paths.iter().enumerate().skip(1) {
+                    check_denoise_cancelled(cancel_token)?;
+                    let _ = app_handle.emit(
+                        "drizzle-progress",
+                        serde_json::json!({
+                            "current": frame_idx + 1,
+                            "total": total_frames,
+                            "message": format!("Aligning Bayer CFA frame {}/{}...", frame_idx + 1, total_frames)
+                        }),
+                    );
+                    let (src_path, _) = parse_virtual_path(path_str);
+                    if let Ok(bytes) = fs::read(&src_path) {
+                        if let (Ok(frame_cfa), Ok(target_dyn)) = (
+                            crate::decode::raw_processing::extract_linear_bayer_cfa(&bytes),
+                            load_base_image_from_bytes(&bytes, &src_path.to_string_lossy(), true, settings, None),
+                        ) {
+                            if frame_cfa.width == bayer_frames[0].width && frame_cfa.height == bayer_frames[0].height {
+                                let target_rgb = target_dyn.to_rgb32f();
+                                let t = if alignment_mode == "stars" {
+                                    let (dx, dy, dtheta) = crate::enhanced::astro_stacking::estimate_star_field_rigid_transform(&ref_rgb, &target_rgb);
+                                    RigidTransform2D { dx, dy, theta: dtheta }
+                                } else {
+                                    estimate_burst_frame_rigid_transform(&ref_rgb, &target_rgb)
+                                };
+                                bayer_frames.push(frame_cfa);
+                                bayer_transforms.push(t);
+                            }
+                        } else {
+                            cfa_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if cfa_ok && bayer_frames.len() >= 2 {
+                    let _ = app_handle.emit(
+                        "drizzle-progress",
+                        serde_json::json!({
+                            "current": total_frames,
+                            "total": total_frames,
+                            "message": "Drizzling raw Bayer CFA planes directly into linear Rec.2020..."
+                        }),
+                    );
+                    let cfa_out = drizzle_bayer_cfa_frames(&bayer_frames, &bayer_transforms, scale, p)?;
+                    return Ok(DynamicImage::ImageRgb32F(cfa_out));
+                }
+            }
+        }
+    }
+
+    // 1. Standard RGB Reference Frame (fallback for JPEGs, X-Trans, or non-CFA inputs)
     let ref_dyn = load_base_image_from_bytes(&ref_bytes, &ref_source.to_string_lossy(), false, settings, None)
         .map_err(|e| e.to_string())?;
     let ref_rgb = ref_dyn.to_rgb32f();
@@ -3238,6 +3959,7 @@ pub fn drizzle_super_resolution_burst(
 
     // 2. Stream, Align, and Deposit Target Burst Frames Sequentially (Memory Ceiling Guard <= 3.0GB)
     for (frame_idx, path_str) in paths.iter().enumerate().skip(1) {
+        check_denoise_cancelled(cancel_token)?;
         let _ = app_handle.emit(
             "drizzle-progress",
             serde_json::json!({
@@ -3252,7 +3974,12 @@ pub fn drizzle_super_resolution_burst(
             if let Ok(target_dyn) = load_base_image_from_bytes(&bytes, &src_path.to_string_lossy(), false, settings, None) {
                 let target_rgb = target_dyn.to_rgb32f();
                 if target_rgb.dimensions() == (orig_w, orig_h) {
-                    let transform = estimate_burst_frame_rigid_transform(&ref_rgb, &target_rgb);
+                    let transform = if alignment_mode == "stars" {
+                        let (dx, dy, dtheta) = crate::enhanced::astro_stacking::estimate_star_field_rigid_transform(&ref_rgb, &target_rgb);
+                        RigidTransform2D { dx, dy, theta: dtheta }
+                    } else {
+                        estimate_burst_frame_rigid_transform(&ref_rgb, &target_rgb)
+                    };
                     deposit_slice(&target_rgb, &transform, &mut sum_r, &mut sum_g, &mut sum_b, &mut sum_w);
                 }
             }
@@ -3375,25 +4102,48 @@ fn sample_bilinear_rgb(img: &Rgb32FImage, x: f32, y: f32) -> image::Rgb<f32> {
 }
 
 #[tauri::command]
+pub fn cancel_drizzle(state: tauri::State<'_, crate::app::state::AppState>) -> Result<(), String> {
+    state.drizzle_cancel.store(true, AtomicOrdering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn drizzle_super_resolution(
     paths: Vec<String>,
     scale_factor: Option<u32>,
     pixfrac: Option<f32>,
+    bayer_cfa_mode: Option<bool>,
+    alignment_mode: Option<String>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, crate::app::state::AppState>,
 ) -> Result<(), String> {
     let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
     let factor = scale_factor.unwrap_or(2).clamp(2, 4);
     let p_frac = pixfrac.unwrap_or(0.8).clamp(0.5, 1.0);
+    let cfa_mode = bayer_cfa_mode.unwrap_or(true);
+    let align_mode = alignment_mode.unwrap_or_else(|| "auto".to_string());
     let denoise_handle = state.denoise_result.clone();
+    state
+        .drizzle_cancel
+        .store(false, AtomicOrdering::SeqCst);
+    let cancel_token = state.drizzle_cancel.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("drizzle_super_resolution");
-        match drizzle_super_resolution_burst(&paths, factor, Some(p_frac), &app_handle, &settings) {
+        match drizzle_super_resolution_burst_with_opts(
+            &paths,
+            factor,
+            Some(p_frac),
+            cfa_mode,
+            &align_mode,
+            &app_handle,
+            &settings,
+            Some(&cancel_token),
+        ) {
             Ok(img) => {
                 let preview_base64 = encode_dynamic_image_preview_base64(&img, 1920);
                 let (w, h) = (img.width(), img.height());
-                *denoise_handle.lock().unwrap() = Some(img);
+                *denoise_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(img);
                 let frames_cnt = paths.len();
                 let snr_boost = format!("+{:.1} dB", 10.0 * (frames_cnt as f32).log10());
                 let _ = app_handle.emit(
@@ -3426,7 +4176,7 @@ pub async fn save_drizzle_image(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let factor = scale_factor.unwrap_or(2);
-    let drizzle_image = state.denoise_result.lock().unwrap().take().ok_or_else(|| {
+    let drizzle_image = state.denoise_result.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or_else(|| {
         "No Drizzle Super-Resolution image found in memory. It might have already been saved or cleared."
             .to_string()
     })?;
@@ -4091,6 +4841,116 @@ mod tests {
         assert!(check_denoise_cancelled(Some(&flag)).is_ok());
         flag.store(true, AtomicOrdering::SeqCst);
         assert!(check_denoise_cancelled(Some(&flag)).is_err());
+    }
+
+    #[test]
+    fn test_bayer_cfa_drizzle_per_channel_weights_produce_neutral_gray() {
+        use crate::decode::raw_processing::LinearBayerFrame;
+        let (w, h) = (32usize, 32usize);
+        let cfa = [[0u8, 1u8], [1u8, 2u8]]; // RGGB
+        let wb = [2.0f32, 1.0f32, 1.5f32];
+        // Neutral scene luminance 0.25 in WB space corresponds to raw [0.25/wb[0], 0.25/wb[1], 0.25/wb[2]]
+        let mut raw_data = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let c = cfa[y & 1][x & 1] as usize;
+                raw_data[y * w + x] = 0.25 / wb[c];
+            }
+        }
+        // Matrix normalized for D65 where neutral input [0.25/wb[0], 0.25/wb[1], 0.25/wb[2]] maps to [0.25, 0.25, 0.25]
+        let cam_to_working = [
+            [wb[0], 0.0, 0.0],
+            [0.0, wb[1], 0.0],
+            [0.0, 0.0, wb[2]],
+        ];
+
+        let mk_frame = || LinearBayerFrame {
+            data: raw_data.clone(),
+            width: w,
+            height: h,
+            cfa,
+            wb,
+            cam_to_working,
+            orientation: rawler::decoders::Orientation::Normal,
+        };
+        let frames = vec![mk_frame(), mk_frame(), mk_frame(), mk_frame()];
+        let transforms = vec![
+            RigidTransform2D { dx: 0.0, dy: 0.0, theta: 0.0 },
+            RigidTransform2D { dx: 0.5, dy: 0.0, theta: 0.0 },
+            RigidTransform2D { dx: 0.0, dy: 0.5, theta: 0.0 },
+            RigidTransform2D { dx: 0.5, dy: 0.5, theta: 0.0 },
+        ];
+
+        let out = drizzle_bayer_cfa_frames(&frames, &transforms, 2, 0.7).expect("CFA drizzle succeeds");
+        assert_eq!(out.dimensions(), ((w * 2) as u32, (h * 2) as u32));
+        for y in 4..(h as u32 * 2 - 4) {
+            for x in 4..(w as u32 * 2 - 4) {
+                let p = out.get_pixel(x, y);
+                assert!(
+                    (p[0] - 0.25).abs() < 0.01 && (p[1] - 0.25).abs() < 0.01 && (p[2] - 0.25).abs() < 0.01,
+                    "Neutral gray CFA burst should reconstruct uniform [0.25, 0.25, 0.25], got {:?} at ({},{})",
+                    p,
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_denoise_roi_channel_decomposition_separates_luma_and_chroma() {
+        let mut orig = Rgb32FImage::new(8, 8);
+        let mut dn = Rgb32FImage::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                if x < 4 {
+                    // Pure red-tinted chroma blotch on orig, neutralized in denoised
+                    orig.put_pixel(x, y, Rgb([0.75, 0.20, 0.20]));
+                    dn.put_pixel(x, y, Rgb([0.33, 0.33, 0.33]));
+                } else {
+                    // Pure achromatic neutral gray
+                    orig.put_pixel(x, y, Rgb([0.50, 0.50, 0.50]));
+                    dn.put_pixel(x, y, Rgb([0.50, 0.50, 0.50]));
+                }
+            }
+        }
+
+        let (luma_orig, _luma_dn, chroma_orig, chroma_dn, residual) =
+            decompose_roi_channels(&orig, &dn);
+
+        // Luma channel must be strictly neutral grayscale (R == G == B) everywhere
+        let l_red = luma_orig.get_pixel(1, 2);
+        assert!(
+            (l_red[0] - l_red[1]).abs() < 1e-6 && (l_red[1] - l_red[2]).abs() < 1e-6,
+            "Luma channel must remain achromatic grayscale, got {:?}",
+            l_red
+        );
+
+        // Chroma channel must show strong chromaticity separation for colored pixel vs [0.5, 0.5, 0.5] for neutral gray
+        let c_red = chroma_orig.get_pixel(1, 2);
+        let c_gray = chroma_orig.get_pixel(6, 2);
+        let c_dn_clean = chroma_dn.get_pixel(1, 2);
+        assert!(
+            (c_red[0] - c_red[1]).abs() > 0.35,
+            "Chroma channel must expose chromatic deviation on color blotch, got {:?}",
+            c_red
+        );
+        assert!(
+            (c_gray[0] - 0.5).abs() < 1e-5
+                && (c_gray[1] - 0.5).abs() < 1e-5
+                && (c_gray[2] - 0.5).abs() < 1e-5,
+            "Achromatic region must map to exact mid-gray 0.5 in chroma plane, got {:?}",
+            c_gray
+        );
+        assert!(
+            (c_dn_clean[0] - 0.5).abs() < 1e-5,
+            "Denoised neutral region must map to 0.5 in chroma plane, got {:?}",
+            c_dn_clean
+        );
+
+        // Residual must be strong where noise was removed and zero where identical
+        assert!(residual.get_pixel(1, 2)[0] > 0.5);
+        assert!(residual.get_pixel(6, 2)[0] < 1e-5);
     }
 }
 

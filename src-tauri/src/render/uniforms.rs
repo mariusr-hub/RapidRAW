@@ -193,7 +193,7 @@ pub struct GlobalAdjustments {
     pub skin_shield_strength: f32,
     pub orton_spread: f32,
     pub foliage_enhancer: f32,
-    pub _pad_phase1_end: f32,
+    pub hsl_mode: u32,
     pub lens_k1: f32,
     pub lens_k2: f32,
     pub lens_k3: f32,
@@ -209,7 +209,7 @@ pub struct GlobalAdjustments {
     pub clearview_strength: f32,
     pub clearview_t0: f32,
     pub micro_contrast: f32,
-    pub _pad_reserved: f32,
+    pub hsl_skin_lock: f32,
 
     pub monochrome: MonochromeSettings,
 }
@@ -957,22 +957,31 @@ fn get_global_adjustments_from_json(
             Some(15.0),
         ),
 
-        lights_brightness: get_scoped_val("lightsSubPipeline", &["lightsBrightness", "lights_brightness", "brightness"], 1.0, 0.0),
-        lights_contrast: get_scoped_val("lightsSubPipeline", &["lightsContrast", "lights_contrast", "contrast"], 1.0, 0.0),
-        lights_details: get_scoped_val("lightsSubPipeline", &["lightsDetails", "lights_details", "details"], 1.0, 0.0),
+        lights_brightness: get_scoped_val("lights", &["lightsBrightness", "lights_brightness", "brightness"], 1.0, 0.0),
+        lights_contrast: get_scoped_val("lights", &["lightsContrast", "lights_contrast", "contrast"], 1.0, 0.0),
+        lights_details: get_scoped_val("lights", &["lightsDetails", "lights_details", "details"], 1.0, 0.0),
         contrast_cleaner_strength: get_scoped_val("presence", &["contrastCleaner", "contrast_cleaner_strength"], 1.0, 1.0),
-        lights_wb_temp: get_scoped_val("lightsSubPipeline", &["lightsTemperature", "lights_wb_temp", "wbTemp"], 1.0, 0.0),
-        lights_wb_tint: get_scoped_val("lightsSubPipeline", &["lightsTint", "lights_wb_tint", "wbTint"], 1.0, 0.0),
-        lights_saturation: get_scoped_val("lightsSubPipeline", &["lightsSaturation", "lights_saturation", "saturation"], 1.0, 0.0),
-        lights_vibrance: get_scoped_val("lightsSubPipeline", &["lightsVibrance", "lights_vibrance", "vibrance"], 1.0, 0.0),
+        lights_wb_temp: get_scoped_val("lights", &["lightsTemperature", "lights_wb_temp", "wbTemp"], 1.0, 0.0),
+        lights_wb_tint: get_scoped_val("lights", &["lightsTint", "lights_wb_tint", "wbTint"], 1.0, 0.0),
+        lights_saturation: get_scoped_val("lights", &["lightsSaturation", "lights_saturation", "saturation"], 1.0, 0.0),
+        lights_vibrance: get_scoped_val("lights", &["lightsVibrance", "lights_vibrance", "vibrance"], 1.0, 0.0),
         supercontrast_shadows: get_scoped_val("supercontrast", &["supercontrastShadows", "supercontrast_shadows", "shadows"], 1.0, 0.0),
         supercontrast_midtones: get_scoped_val("supercontrast", &["supercontrastMidtones", "supercontrast_midtones", "midtones"], 1.0, 0.0),
         supercontrast_highlights: get_scoped_val("supercontrast", &["supercontrastHighlights", "supercontrast_highlights", "highlights"], 1.0, 0.0),
         supercontrast_pivots: get_scoped_val("supercontrast", &["supercontrastPivots", "supercontrast_pivots", "pivots"], 1.0, 0.0),
         skin_shield_strength: get_scoped_val("creative", &["skinShield", "skin_shield_strength"], 1.0, 0.85),
         orton_spread: get_scoped_val("creative", &["ortonSpread", "orton_spread"], 1.0, 0.0),
-        foliage_enhancer: get_scoped_val("creative", &["foliageEnhancer", "foliage_enhancer"], 1.0, 0.0),
-        _pad_phase1_end: 0.0,
+        foliage_enhancer: get_scoped_val("colorPresence", &["foliageEnhancer", "foliage_enhancer"], 1.0, 0.0),
+        hsl_mode: if is_visible("colorMixer")
+            && js_adjustments
+                .get("hslMode")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == "tetrahedral")
+        {
+            1
+        } else {
+            0
+        },
         lens_k1,
         lens_k2,
         lens_k3,
@@ -981,8 +990,8 @@ fn get_global_adjustments_from_json(
         lens_center_y: 0.5,
         lens_distortion_enabled: gpu_lens_enabled,
         _pad_lens: 0.0,
-        corner_sharpness_boost: get_scoped_val("details", &["cornerSharpnessBoost", "corner_sharpness_boost"], 1.0, 0.0),
-        bokeh_mask_protection: get_scoped_val("details", &["bokehMaskProtection", "bokeh_mask_protection"], 1.0, 0.0),
+        corner_sharpness_boost: get_scoped_val("sharpening", &["cornerSharpnessBoost", "corner_sharpness_boost"], 1.0, 0.0),
+        bokeh_mask_protection: get_scoped_val("sharpening", &["bokehMaskProtection", "bokeh_mask_protection"], 1.0, 0.0),
         hlr_enabled: if is_visible("hlr")
             && js_adjustments
                 .get("hlrEnabled")
@@ -997,7 +1006,7 @@ fn get_global_adjustments_from_json(
         clearview_strength: get_scoped_val("presence", &["clearView", "clearview_strength"], 1.0, 0.0),
         clearview_t0: 0.12,
         micro_contrast: get_scoped_val("presence", &["microContrast", "micro_contrast"], 1.0, 0.0),
-        _pad_reserved: 0.0,
+        hsl_skin_lock: (get_scoped_val("colorMixer", &["hslSkinLock", "hsl_skin_lock"], 100.0, 0.0)).clamp(0.0, 1.0),
 
         monochrome: if is_monochrome {
             parse_monochrome_settings(

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::decode::image_loader;
 
@@ -206,9 +206,16 @@ pub async fn cull_images(
         .hash_size(16, 16)
         .to_hasher();
 
+    let state = app_handle.state::<crate::app::state::AppState>();
+    state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+    let cancel_token = state.ai_denoise_cancel.clone();
+
     let analysis_results: Vec<Result<ImageAnalysisData, (String, String)>> = paths
         .par_iter()
         .map(|path| {
+            if cancel_token.load(Ordering::Relaxed) {
+                return Err((path.to_string(), "Cancelled by user".to_string()));
+            }
             let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = app_handle.emit(
                 "culling-progress",

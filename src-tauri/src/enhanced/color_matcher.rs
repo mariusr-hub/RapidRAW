@@ -677,36 +677,58 @@ pub async fn harmonize_photoshoot_series(
 
     // 2. Harmonize Target Frames
     for (idx, target_str) in target_paths.iter().enumerate() {
-        let (t_src, _) = crate::library::sidecars::parse_virtual_path(target_str);
-        if let Ok(bytes) = crate::library::file_ops::read_file_mapped(&t_src) {
-            if let Ok(dyn_img) = crate::decode::image_loader::load_base_image_from_bytes(&bytes, &t_src.to_string_lossy(), false, &settings, None) {
-                let t_stats = compute_color_stats(&dyn_img);
+        let (t_src, t_sidecar) = crate::library::sidecars::parse_virtual_path(target_str);
+        let rendered_target = crate::export::render_edited_image_for_batch(
+            target_str,
+            &settings,
+            &app_handle,
+        )
+        .or_else(|_| {
+            let bytes = crate::library::file_ops::read_file_mapped(&t_src)
+                .map_err(|e| e.to_string())?;
+            crate::decode::image_loader::load_base_image_from_bytes(
+                &bytes,
+                &t_src.to_string_lossy(),
+                false,
+                &settings,
+                None,
+            )
+            .map_err(|e| e.to_string())
+        });
 
-                let (exposure_ev, delta_temp, delta_tint, delta_contrast) =
-                    compute_harmonize_deltas(&hero_stats, &t_stats);
+        if let Ok(dyn_img) = rendered_target {
+            let t_stats = compute_color_stats(&dyn_img);
 
-                let adj_json = serde_json::json!({
-                    "exposure": exposure_ev,
-                    "temperature": delta_temp,
-                    "tint": delta_tint,
-                    "contrast": delta_contrast,
-                });
+            let (exposure_ev, delta_temp, delta_tint, delta_contrast) =
+                compute_harmonize_deltas(&hero_stats, &t_stats);
 
-                let _ = crate::library::sidecars::apply_adjustments_to_paths(
-                    vec![target_str.clone()],
-                    adj_json,
-                    app_handle.clone(),
-                ).await;
+            let existing = crate::metadata::sidecar::load_sidecar(&t_sidecar).adjustments;
+            let cur_exp = existing.get("exposure").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cur_temp = existing.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cur_tint = existing.get("tint").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cur_con = existing.get("contrast").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                let _ = app_handle.emit(
-                    "harmonize-progress",
-                    serde_json::json!({
-                        "current": idx + 1,
-                        "total": total,
-                        "message": format!("Harmonized shot {}/{} ({:+.2} EV, {:+.1}° warmth)", idx + 1, total, exposure_ev, delta_temp)
-                    }),
-                );
-            }
+            let adj_json = serde_json::json!({
+                "exposure": cur_exp + exposure_ev as f64,
+                "temperature": cur_temp + delta_temp as f64,
+                "tint": cur_tint + delta_tint as f64,
+                "contrast": cur_con + delta_contrast as f64,
+            });
+
+            let _ = crate::library::sidecars::apply_adjustments_to_paths(
+                vec![target_str.clone()],
+                adj_json,
+                app_handle.clone(),
+            ).await;
+
+            let _ = app_handle.emit(
+                "harmonize-progress",
+                serde_json::json!({
+                    "current": idx + 1,
+                    "total": total,
+                    "message": format!("Harmonized shot {}/{} ({:+.2} EV, {:+.1}° warmth)", idx + 1, total, exposure_ev, delta_temp)
+                }),
+            );
         }
     }
 

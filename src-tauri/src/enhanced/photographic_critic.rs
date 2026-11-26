@@ -337,15 +337,23 @@ pub async fn get_photographic_critic_report(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, crate::app::state::AppState>,
 ) -> Result<PhotographicQualityReport, String> {
-    let (source_path, _) = crate::library::sidecars::parse_virtual_path(&path);
+    let (source_path, sidecar_path) = crate::library::sidecars::parse_virtual_path(&path);
     let canonical = std::fs::canonicalize(&source_path).unwrap_or_else(|_| source_path.clone());
-    let cache_key = canonical.to_string_lossy().into_owned();
-    let mtime = std::fs::metadata(&source_path)
+    let vc_suffix = path.find("?vc=").map(|idx| &path[idx..]).unwrap_or("");
+    let cache_key = format!("{}{}", canonical.to_string_lossy(), vc_suffix);
+    let source_mtime = std::fs::metadata(&source_path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let sidecar_mtime = std::fs::metadata(&sidecar_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mtime = source_mtime.max(sidecar_mtime);
 
     if let Some((cached_mtime, cached_report)) = state
         .critic_cache
@@ -361,6 +369,8 @@ pub async fn get_photographic_critic_report(
 
     let critic_cache = state.critic_cache.clone();
     let path_str = source_path.to_string_lossy().into_owned();
+    let orig_path = path.clone();
+    let app_handle_clone = app_handle.clone();
     let settings = crate::app::settings::load_settings(app_handle).unwrap_or_default();
 
     tokio::task::spawn_blocking(move || -> Result<PhotographicQualityReport, String> {
@@ -369,6 +379,17 @@ pub async fn get_photographic_critic_report(
             &bytes, &path_str, true, &settings, None,
         )
         .or_else(|_| image::load_from_memory(&bytes).map_err(|e| e.to_string()))?;
+
+        if let Some(edited) = crate::export::render_image_with_edits(
+            &orig_path,
+            &img,
+            None,
+            &settings,
+            &app_handle_clone,
+            false,
+        ) {
+            img = edited;
+        }
 
         let w = img.width();
         let h = img.height();

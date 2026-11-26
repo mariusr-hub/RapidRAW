@@ -10,7 +10,9 @@ const ROTATION_STEP: f64 = 1e-6;
 const FOCAL_STEP: f64 = 1e-7;
 const DISTORTION_STEP: f64 = 1e-6;
 const MAX_DISTORTION: f64 = 0.4;
+const MAX_K2: f64 = 0.25;
 const DISTORTION_PRIOR_WEIGHT: f64 = 1.0;
+const K2_PRIOR_WEIGHT: f64 = 4.0;
 const DEGENERATE_SPREAD: f64 = 2e-3;
 
 #[derive(Clone, Debug)]
@@ -24,6 +26,7 @@ pub struct Camera {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Lens {
     pub k1: f64,
+    pub k2: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +46,7 @@ pub struct PairObservation {
 pub struct BundleOptions {
     pub shared_focal: bool,
     pub estimate_distortion: bool,
+    pub estimate_k2: bool,
     pub huber_threshold: f64,
 }
 
@@ -53,17 +57,17 @@ impl Camera {
 
     #[inline]
     pub fn undistort(&self, lens: &Lens, p: Vector2<f64>) -> Vector2<f64> {
-        if lens.k1 == 0.0 {
+        if lens.k1 == 0.0 && lens.k2 == 0.0 {
             return p;
         }
         let r_norm = self.radius_norm();
         let r2 = p.norm_squared() / (r_norm * r_norm);
-        p * (1.0 + lens.k1 * r2)
+        p * (1.0 + lens.k1 * r2 + lens.k2 * r2 * r2)
     }
 
     #[inline]
     pub fn distort(&self, lens: &Lens, p: Vector2<f64>) -> Option<Vector2<f64>> {
-        if lens.k1 == 0.0 {
+        if lens.k1 == 0.0 && lens.k2 == 0.0 {
             return Some(p);
         }
         let r_norm = self.radius_norm();
@@ -71,27 +75,57 @@ impl Camera {
         if ru < 1e-12 {
             return Some(p);
         }
-        let rd_max = if lens.k1 < 0.0 {
-            (-1.0 / (3.0 * lens.k1)).sqrt()
+        let u_crit = if lens.k2.abs() < 1e-12 {
+            if lens.k1 < 0.0 {
+                -1.0 / (3.0 * lens.k1)
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            let disc = 9.0 * lens.k1 * lens.k1 - 20.0 * lens.k2;
+            if disc >= 0.0 {
+                let s = disc.sqrt();
+                let denom = 10.0 * lens.k2;
+                let u1 = (-3.0 * lens.k1 - s) / denom;
+                let u2 = (-3.0 * lens.k1 + s) / denom;
+                let mut best = f64::INFINITY;
+                for u in [u1, u2] {
+                    if u > 0.0 {
+                        best = best.min(u);
+                    }
+                }
+                best
+            } else {
+                f64::INFINITY
+            }
+        };
+        let rd_max = if u_crit.is_finite() {
+            u_crit.sqrt()
         } else {
             f64::INFINITY
         };
-        if lens.k1 < 0.0 && ru >= rd_max * (1.0 + lens.k1 * rd_max * rd_max) {
-            return None;
+        if rd_max.is_finite() {
+            let r2_max = rd_max * rd_max;
+            let ru_max = rd_max * (1.0 + lens.k1 * r2_max + lens.k2 * r2_max * r2_max);
+            if ru >= ru_max {
+                return None;
+            }
         }
         let mut rd = ru.min(0.99 * rd_max);
-        for _ in 0..8 {
-            let g = rd + lens.k1 * rd * rd * rd - ru;
+        for _ in 0..12 {
+            let r2 = rd * rd;
+            let g = rd * (1.0 + lens.k1 * r2 + lens.k2 * r2 * r2) - ru;
             if g.abs() < 1e-9 * ru.max(1.0) {
                 break;
             }
-            let dg = 1.0 + 3.0 * lens.k1 * rd * rd;
-            if dg <= 1e-9 {
+            let dg = 1.0 + 3.0 * lens.k1 * r2 + 5.0 * lens.k2 * r2 * r2;
+            if dg <= 1e-6 {
                 return None;
             }
             rd = (rd - g / dg).clamp(0.0, 0.99 * rd_max);
         }
-        let residual = rd + lens.k1 * rd * rd * rd - ru;
+        let r2 = rd * rd;
+        let residual = rd * (1.0 + lens.k1 * r2 + lens.k2 * r2 * r2) - ru;
         (residual.abs() < 1e-6 * ru.max(1.0)).then(|| p * (rd / ru))
     }
 
@@ -293,7 +327,8 @@ fn tree_center(adjacency: &[Vec<usize>], pairs: &[PairObservation], n: usize) ->
 struct ParameterLayout {
     rotation: Vec<Option<usize>>,
     focal: Vec<usize>,
-    distortion: Option<usize>,
+    distortion_k1: Option<usize>,
+    distortion_k2: Option<usize>,
     count: usize,
 }
 
@@ -321,20 +356,25 @@ impl ParameterLayout {
                 })
                 .collect()
         };
-        let distortion = options.estimate_distortion.then(|| {
+        let distortion_k1 = options.estimate_distortion.then(|| {
+            count += 1;
+            count - 1
+        });
+        let distortion_k2 = (options.estimate_distortion && options.estimate_k2).then(|| {
             count += 1;
             count - 1
         });
         ParameterLayout {
             rotation,
             focal,
-            distortion,
+            distortion_k1,
+            distortion_k2,
             count,
         }
     }
 
     fn local_parameters(&self, a: usize, b: usize) -> Vec<usize> {
-        let mut params = Vec::with_capacity(9);
+        let mut params = Vec::with_capacity(10);
         for cam in [a, b] {
             if let Some(r) = self.rotation[cam] {
                 params.extend([r, r + 1, r + 2]);
@@ -343,8 +383,11 @@ impl ParameterLayout {
                 params.push(self.focal[cam]);
             }
         }
-        if let Some(d) = self.distortion {
-            params.push(d);
+        if let Some(d1) = self.distortion_k1 {
+            params.push(d1);
+        }
+        if let Some(d2) = self.distortion_k2 {
+            params.push(d2);
         }
         params
     }
@@ -363,8 +406,11 @@ fn apply_update(
         }
         camera.focal *= delta[layout.focal[i]].clamp(-0.5, 0.5).exp();
     }
-    if let Some(d) = layout.distortion {
-        lens.k1 = (lens.k1 + delta[d]).clamp(-MAX_DISTORTION, MAX_DISTORTION);
+    if let Some(d1) = layout.distortion_k1 {
+        lens.k1 = (lens.k1 + delta[d1]).clamp(-MAX_DISTORTION, MAX_DISTORTION);
+    }
+    if let Some(d2) = layout.distortion_k2 {
+        lens.k2 = (lens.k2 + delta[d2]).clamp(-MAX_K2, MAX_K2);
     }
 }
 
@@ -393,8 +439,11 @@ fn perturbed(
             cam.focal *= step.exp();
         }
     }
-    if layout.distortion == Some(param) {
+    if layout.distortion_k1 == Some(param) {
         l.k1 += step;
+    }
+    if layout.distortion_k2 == Some(param) {
+        l.k2 += step;
     }
     (ca, cb, l)
 }
@@ -446,11 +495,16 @@ fn distortion_prior(lens: &Lens, pairs: &[PairObservation], options: &BundleOpti
         return 0.0;
     }
     let count: usize = pairs.iter().map(|p| p.points.len()).sum();
-    0.5 * DISTORTION_PRIOR_WEIGHT * count as f64 * lens.k1 * lens.k1
+    let k2_term = if options.estimate_k2 {
+        K2_PRIOR_WEIGHT * lens.k2 * lens.k2
+    } else {
+        0.0
+    };
+    0.5 * count as f64 * (DISTORTION_PRIOR_WEIGHT * lens.k1 * lens.k1 + k2_term)
 }
 
 fn step_size(layout: &ParameterLayout, param: usize) -> f64 {
-    if layout.distortion == Some(param) {
+    if layout.distortion_k1 == Some(param) || layout.distortion_k2 == Some(param) {
         DISTORTION_STEP
     } else if layout.focal.contains(&param) {
         FOCAL_STEP
@@ -508,11 +562,17 @@ fn normal_equations(
             |(a1, b1), (a2, b2)| (a1 + a2, b1 + b2),
         );
 
-    if let Some(d) = layout.distortion {
+    if let Some(d1) = layout.distortion_k1 {
         let count: usize = pairs.iter().map(|p| p.points.len()).sum();
         let w = DISTORTION_PRIOR_WEIGHT * count as f64;
-        jtj[(d, d)] += w;
-        jtr[d] += w * lens.k1;
+        jtj[(d1, d1)] += w;
+        jtr[d1] += w * lens.k1;
+    }
+    if let Some(d2) = layout.distortion_k2 {
+        let count: usize = pairs.iter().map(|p| p.points.len()).sum();
+        let w = K2_PRIOR_WEIGHT * count as f64;
+        jtj[(d2, d2)] += w;
+        jtr[d2] += w * lens.k2;
     }
     (jtj, jtr)
 }
@@ -648,4 +708,154 @@ pub fn straighten(cameras: &mut [Camera]) -> Orientation {
         camera.rotation *= world_t;
     }
     orientation
+}
+
+pub fn apply_user_rotation(
+    cameras: &[Camera],
+    yaw_deg: f64,
+    pitch_deg: f64,
+    roll_deg: f64,
+) -> Vec<Camera> {
+    if yaw_deg.abs() < 1e-9 && pitch_deg.abs() < 1e-9 && roll_deg.abs() < 1e-9 {
+        return cameras.to_vec();
+    }
+    let r_y = Rotation3::from_axis_angle(&Vector3::y_axis(), yaw_deg.to_radians()).into_inner();
+    let r_x = Rotation3::from_axis_angle(&Vector3::x_axis(), pitch_deg.to_radians()).into_inner();
+    let r_z = Rotation3::from_axis_angle(&Vector3::z_axis(), roll_deg.to_radians()).into_inner();
+    let world_t = (r_z * r_x * r_y).transpose();
+    cameras
+        .iter()
+        .map(|cam| {
+            let mut next = cam.clone();
+            next.rotation *= world_t;
+            next
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lens_k1_k2_distort_undistort_roundtrip() {
+        let cam = Camera {
+            rotation: Matrix3::identity(),
+            focal: 1000.0,
+            width: 2000.0,
+            height: 1500.0,
+        };
+        let lenses = [
+            Lens { k1: -0.15, k2: 0.08 },
+            Lens { k1: 0.12, k2: -0.05 },
+        ];
+        let pts = [
+            Vector2::new(0.0, 0.0),
+            Vector2::new(300.0, 200.0),
+            Vector2::new(-800.0, 500.0),
+        ];
+        for lens in lenses {
+            for p in pts {
+                let u = cam.undistort(&lens, p);
+                let back = cam.distort(&lens, u).expect("distort must converge");
+                assert!(
+                    (back - p).norm() < 1e-5,
+                    "k1/k2 roundtrip mismatch for {:?}: p={:?} back={:?}",
+                    lens,
+                    p,
+                    back
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bundle_adjust_recovers_k1_and_k2_on_synthetic_correspondences() {
+        let true_lens = Lens { k1: -0.14, k2: 0.06 };
+        let angle = 18.0f64.to_radians();
+        let cam_a = Camera {
+            rotation: Matrix3::identity(),
+            focal: 700.0,
+            width: 1000.0,
+            height: 1000.0,
+        };
+        let cam_b = Camera {
+            rotation: Rotation3::from_axis_angle(&Vector3::y_axis(), angle).into_inner(),
+            focal: 700.0,
+            width: 1000.0,
+            height: 1000.0,
+        };
+        let mut points = Vec::new();
+        for gy in -4..=4 {
+            for gx in -4..=4 {
+                let ray = Vector3::new(
+                    0.18 + gx as f64 * 0.11,
+                    gy as f64 * 0.11,
+                    1.0,
+                )
+                .normalize();
+                if let (Some(pa), Some(pb)) = (
+                    cam_a.project(&true_lens, &ray),
+                    cam_b.project(&true_lens, &ray),
+                ) {
+                    if cam_a.contains(&pa) && cam_b.contains(&pb) {
+                        points.push((pa, pb));
+                    }
+                }
+            }
+        }
+        assert!(points.len() >= 40);
+
+        let mut cameras = vec![cam_a, cam_b];
+        let mut lens = Lens::default();
+        let pairs = vec![PairObservation {
+            a: 0,
+            b: 1,
+            points,
+            homography: Matrix3::identity(),
+            confidence: 1.0,
+        }];
+        let options = BundleOptions {
+            shared_focal: true,
+            estimate_distortion: true,
+            estimate_k2: true,
+            huber_threshold: 2.0,
+        };
+        bundle_adjust(&mut cameras, &mut lens, &pairs, 0, &options);
+        let errs = pair_errors(&cameras, &lens, &pairs);
+        assert!(
+            errs[0] < 0.5,
+            "Expected sub-0.5px residual after k1/k2 BA, got {}",
+            errs[0]
+        );
+        assert!(
+            lens.k1 < -0.05,
+            "Expected negative barrel k1 recovery, got k1={} k2={}",
+            lens.k1,
+            lens.k2
+        );
+    }
+
+    #[test]
+    fn test_user_euler_rotation_preserves_orthonormality_and_reverses_roll() {
+        let base = vec![Camera {
+            rotation: Rotation3::from_axis_angle(&Vector3::y_axis(), 0.3).into_inner(),
+            focal: 800.0,
+            width: 1600.0,
+            height: 1200.0,
+        }];
+        let tilted = apply_user_rotation(&base, 15.0, -7.5, 12.0);
+        let r = tilted[0].rotation;
+        let ortho_err = (r * r.transpose() - Matrix3::identity()).norm();
+        assert!(ortho_err < 1e-12, "Rotation not orthonormal: err={}", ortho_err);
+
+        let rolled = apply_user_rotation(&base, 0.0, 0.0, 12.0);
+        let unrolled = apply_user_rotation(&rolled, 0.0, 0.0, -12.0);
+        let restore_err = (unrolled[0].rotation - base[0].rotation).norm();
+        assert!(
+            restore_err < 1e-12,
+            "Reversing roll must restore rotation: err={}",
+            restore_err
+        );
+    }
 }

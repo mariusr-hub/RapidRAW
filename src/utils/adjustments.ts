@@ -436,6 +436,34 @@ export interface Adjustments extends EnhancedAdjustments {
   vignetteRoundness: number;
   whiteBalance: WhiteBalance | null;
   whites: number;
+  tiltShiftEnabled?: boolean;
+  tiltShiftCenterY?: number;
+  tiltShiftBandHeight?: number;
+  tiltShiftAngleDeg?: number;
+  tiltShiftBlurRadius?: number;
+  tiltShiftSpecularBoost?: number;
+  astroLpEnabled?: boolean;
+  astroLpPreservePedestal?: number;
+  astroLpMode?: 'poly' | 'rbf';
+  astroLpSmoothing?: number;
+  astroLpStrength?: number;
+  astroPccEnabled?: boolean;
+  astroPccGainR?: number;
+  astroPccGainG?: number;
+  astroPccGainB?: number;
+  astroPccBgNeutralize?: boolean;
+  astroAdcEnabled?: boolean;
+  astroAdcRedDx?: number;
+  astroAdcRedDy?: number;
+  astroAdcBlueDx?: number;
+  astroAdcBlueDy?: number;
+  astroStarlessEnabled?: boolean;
+  astroStarMix?: number;
+  astroStarReduction?: number;
+  astroNebulaBoost?: number;
+  cameraProfileId?: string;
+  hslMode?: 'classic' | 'tetrahedral';
+  hslSkinLock?: number;
 }
 
 export interface AiPatch {
@@ -447,6 +475,14 @@ export interface AiPatch {
   prompt: string;
   subMasks: Array<SubMask>;
   visible: boolean;
+  type?: string;
+  kind?: string;
+  x?: number;
+  y?: number;
+  radius?: number;
+  endX?: number;
+  endY?: number;
+  points?: [number, number][];
 }
 
 export interface Color {
@@ -931,20 +967,63 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
       label: 'modals.copyPaste.groups.curves',
       keys: ['curves', 'pointCurves', 'parametricCurve', 'curveMode'],
     },
+    {
+      label: 'adjustments.basic.highlights',
+      keys: [
+        'lightsBrightness',
+        'lightsContrast',
+        'lightsDetails',
+        'lightsTemperature',
+        'lightsTint',
+        'lightsSaturation',
+        'lightsVibrance',
+      ],
+    },
+    {
+      label: 'adjustments.basic.contrast',
+      keys: ['supercontrastShadows', 'supercontrastMidtones', 'supercontrastHighlights', 'supercontrastPivots'],
+    },
+    {
+      label: 'adjustments.basic.toneMapper',
+      keys: [
+        'astroLpEnabled',
+        'astroLpPreservePedestal',
+        'astroLpMode',
+        'astroLpSmoothing',
+        'astroLpStrength',
+        'astroPccEnabled',
+        'astroPccGainR',
+        'astroPccGainG',
+        'astroPccGainB',
+        'astroPccBgNeutralize',
+        'astroAdcEnabled',
+        'astroAdcRedDx',
+        'astroAdcRedDy',
+        'astroAdcBlueDx',
+        'astroAdcBlueDy',
+        'astroStarlessEnabled',
+        'astroStarMix',
+        'astroStarReduction',
+        'astroNebulaBoost',
+      ],
+    },
   ],
   color: [
     {
       label: 'modals.copyPaste.groups.whiteBalance',
       keys: [ColorAdjustment.Temperature, ColorAdjustment.Tint, ColorAdjustment.WhiteBalance],
     },
-    { label: 'modals.copyPaste.groups.presence', keys: [ColorAdjustment.Saturation, ColorAdjustment.Vibrance] },
+    {
+      label: 'modals.copyPaste.groups.presence',
+      keys: [ColorAdjustment.Saturation, ColorAdjustment.Vibrance, 'foliageEnhancer'],
+    },
     {
       label: 'modals.copyPaste.groups.hueShift',
       keys: [ColorAdjustment.Hue],
     },
     { label: 'modals.copyPaste.groups.colorGrading', keys: [ColorAdjustment.ColorGrading] },
-    { label: 'modals.copyPaste.groups.colorMixer', keys: [ColorAdjustment.Hsl] },
-    { label: 'modals.copyPaste.groups.colorCalibration', keys: ['colorCalibration'] },
+    { label: 'modals.copyPaste.groups.colorMixer', keys: [ColorAdjustment.Hsl, 'hslMode', 'hslSkinLock'] },
+    { label: 'modals.copyPaste.groups.colorCalibration', keys: ['colorCalibration', 'cameraProfileId'] },
     {
       label: 'modals.copyPaste.groups.blackWhite',
       keys: [...MONOCHROME_ADJUSTMENT_KEYS],
@@ -960,11 +1039,24 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
         DetailsAdjustment.Centré,
         DetailsAdjustment.CentréX,
         DetailsAdjustment.CentréY,
+        'contrastCleaner',
+        'skinShield',
+        'clearView',
+        'microContrast',
       ],
     },
     {
       label: 'modals.copyPaste.groups.sharpness',
-      keys: [DetailsAdjustment.Sharpness, DetailsAdjustment.SharpnessThreshold],
+      keys: [
+        DetailsAdjustment.Sharpness,
+        DetailsAdjustment.SharpnessThreshold,
+        'cornerSharpnessBoost',
+        'bokehMaskProtection',
+      ],
+    },
+    {
+      label: 'adjustments.details.sharpness',
+      keys: ['hlrEnabled', 'hlrClipCeiling'],
     },
     {
       label: 'modals.copyPaste.groups.noiseReduction',
@@ -985,7 +1077,14 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
     },
     {
       label: 'modals.copyPaste.groups.chromaticAberration',
-      keys: [DetailsAdjustment.ChromaticAberrationRedCyan, DetailsAdjustment.ChromaticAberrationBlueYellow],
+      keys: [
+        DetailsAdjustment.ChromaticAberrationRedCyan,
+        DetailsAdjustment.ChromaticAberrationBlueYellow,
+        'defringeEnabled',
+        'defringePurpleAmount',
+        'defringeGreenAmount',
+        'defringeEdgeThreshold',
+      ],
     },
     {
       label: 'modals.copyPaste.groups.negativeConversion',
@@ -1014,7 +1113,7 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
     { label: 'modals.copyPaste.groups.grain', keys: [Effect.GrainAmount, Effect.GrainRoughness, Effect.GrainSize] },
     {
       label: 'modals.copyPaste.groups.halationGlow',
-      keys: [CreativeAdjustment.GlowAmount, CreativeAdjustment.HalationAmount, CreativeAdjustment.FlareAmount],
+      keys: [CreativeAdjustment.GlowAmount, CreativeAdjustment.HalationAmount, CreativeAdjustment.FlareAmount, 'ortonSpread'],
     },
     {
       label: 'modals.copyPaste.groups.lut',
@@ -1078,6 +1177,17 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
         Effect.RelightShadowSoftness,
       ],
     },
+    {
+      label: 'adjustments.effects.spatial',
+      keys: [
+        'tiltShiftEnabled',
+        'tiltShiftCenterY',
+        'tiltShiftBandHeight',
+        'tiltShiftAngleDeg',
+        'tiltShiftBlurRadius',
+        'tiltShiftSpecularBoost',
+      ],
+    },
   ],
   geometry: [
     { label: 'modals.copyPaste.groups.cropAspectRatio', keys: ['crop', 'aspectRatio'] },
@@ -1110,6 +1220,7 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
         LensAdjustment.LensDistortionEnabled,
         LensAdjustment.LensTcaEnabled,
         LensAdjustment.LensVignetteEnabled,
+        'lensAutocropScale',
       ],
     },
     {
@@ -1176,6 +1287,25 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     'supercontrastMidtones',
     'supercontrastHighlights',
     'supercontrastPivots',
+    'astroLpEnabled',
+    'astroLpPreservePedestal',
+    'astroLpMode',
+    'astroLpSmoothing',
+    'astroLpStrength',
+    'astroPccEnabled',
+    'astroPccGainR',
+    'astroPccGainG',
+    'astroPccGainB',
+    'astroPccBgNeutralize',
+    'astroAdcEnabled',
+    'astroAdcRedDx',
+    'astroAdcRedDy',
+    'astroAdcBlueDx',
+    'astroAdcBlueDy',
+    'astroStarlessEnabled',
+    'astroStarMix',
+    'astroStarReduction',
+    'astroNebulaBoost',
   ],
   curves: ['curves', 'pointCurves', 'parametricCurve', 'curveMode'],
   color: [
@@ -1189,6 +1319,9 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     'colorCalibration',
     ColorAdjustment.Hue,
     'foliageEnhancer',
+    'cameraProfileId',
+    'hslMode',
+    'hslSkinLock',
     ...MONOCHROME_ADJUSTMENT_KEYS,
   ],
   details: [
@@ -1218,6 +1351,10 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     DetailsAdjustment.AiUpscaleDetail,
     DetailsAdjustment.ChromaticAberrationRedCyan,
     DetailsAdjustment.ChromaticAberrationBlueYellow,
+    'defringeEnabled',
+    'defringePurpleAmount',
+    'defringeGreenAmount',
+    'defringeEdgeThreshold',
     DetailsAdjustment.NegativeConversionEnabled,
     DetailsAdjustment.NegativeRedWeight,
     DetailsAdjustment.NegativeGreenWeight,
@@ -1278,6 +1415,12 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     Effect.MotionBlurHighlights,
     Effect.MotionBlurLayer,
     Effect.MotionBlurType,
+    'tiltShiftEnabled',
+    'tiltShiftCenterY',
+    'tiltShiftBandHeight',
+    'tiltShiftAngleDeg',
+    'tiltShiftBlurRadius',
+    'tiltShiftSpecularBoost',
   ],
 };
 

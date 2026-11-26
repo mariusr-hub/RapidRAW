@@ -53,6 +53,13 @@ import {
   ScanLine,
   MonitorUp,
   AppWindow,
+  Sparkles,
+  Wand2,
+  Trophy,
+  Package,
+  Download,
+  Zap,
+  Telescope,
 } from 'lucide-react';
 import { toast } from 'react-toastify';
 import { useTranslation } from 'react-i18next';
@@ -834,6 +841,26 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
                   icon: X,
                   onClick: () => handleEnableAdjustments(finalSelection, { aiDenoiseEnabled: false }),
                 },
+                { type: OPTION_SEPARATOR },
+                {
+                  label: t('contextMenus.thumbnail.openDenoiseStudio', 'Open Denoise Studio...'),
+                  icon: Sparkles,
+                  onClick: () => {
+                    const targetObj = imageList.find((img) => img.path === finalSelection[0]);
+                    setUI({
+                      denoiseModalState: {
+                        isOpen: true,
+                        isProcessing: false,
+                        previewBase64: null,
+                        originalBase64: null,
+                        error: null,
+                        targetPaths: finalSelection,
+                        progressMessage: null,
+                        isRaw: targetObj?.is_raw || false,
+                      },
+                    });
+                  },
+                },
               ],
             },
             ...(useSettingsStore.getState().appSettings?.aiProvider === 'ai-free'
@@ -889,6 +916,12 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
                   icon: X,
                   onClick: () => handleEnableAdjustments(finalSelection, { negativeConversionEnabled: false }),
                 },
+                { type: OPTION_SEPARATOR },
+                {
+                  label: t('contextMenus.thumbnail.openNegativeLab', 'Open Negative Film Lab...'),
+                  icon: Film,
+                  onClick: () => setUI({ negativeModalState: { isOpen: true, targetPaths: finalSelection } }),
+                },
               ],
             },
           ],
@@ -915,6 +948,80 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               label: t('contextMenus.merge.focusStack'),
               onClick: () => openMergeModal('focusStack', finalSelection),
             },
+            {
+              disabled: selectionCount < 2,
+              icon: Sparkles,
+              label: t('contextMenus.merge.astroStack', 'Astro Stack (Kappa-Sigma)'),
+              onClick: () => {
+                const toastId = toast.info('Aligning stars & stacking frames...', { autoClose: false });
+                invoke(Invokes.StackAstroFrames, {
+                  options: {
+                    paths: finalSelection,
+                    sigma_clip: 2.5,
+                    stack_mode: 'kappa_sigma',
+                    auto_dark_subtract: true,
+                  },
+                })
+                  .then(() => {
+                    toast.dismiss(toastId);
+                    toast.success('Astro stack complete!');
+                    props.refreshImageList();
+                  })
+                  .catch((err) => {
+                    toast.dismiss(toastId);
+                    toast.error(`Astro stack failed: ${String(err)}`);
+                  });
+              },
+            },
+            {
+              disabled: selectionCount < 2,
+              icon: Telescope,
+              label: t('contextMenus.merge.drizzle', 'Hubble Drizzle Super-Resolution (2x/3x/4x)...'),
+              onClick: () =>
+                setUI((s) => ({
+                  drizzleModalState: {
+                    ...s.drizzleModalState,
+                    isOpen: true,
+                    error: null,
+                    finalImageBase64: null,
+                    originalBase64: null,
+                    progressMessage: null,
+                    sourcePaths: finalSelection,
+                  },
+                })),
+            },
+            {
+              disabled: imageList.length < 2,
+              icon: Wand2,
+              label: t('contextMenus.merge.detectPanoSequences', 'Auto-Detect Panorama Sequence'),
+              onClick: () => {
+                const folderPaths = imageList.map((img) => img.path);
+                const toastId = toast.info('Scanning folder EXIF for panorama sequences...', {
+                  autoClose: false,
+                });
+                invoke<Array<{ id: string; paths: string[]; isHdr: boolean; count: number }>>(
+                  Invokes.DetectPanoramaSequences,
+                  { imagePaths: folderPaths },
+                )
+                  .then((groups) => {
+                    toast.dismiss(toastId);
+                    const matched =
+                      groups.find((g) => g.paths.includes(path)) || groups[0];
+                    if (matched && matched.paths.length >= 2) {
+                      toast.info(
+                        `Detected ${matched.isHdr ? 'HDR Panorama' : 'Panorama'} sequence (${matched.count} frames)`,
+                      );
+                      openMergeModal('panorama', matched.paths);
+                    } else {
+                      toast.info('No consecutive panorama sequences detected in this folder.');
+                    }
+                  })
+                  .catch((err) => {
+                    toast.dismiss(toastId);
+                    toast.error(`Sequence detection failed: ${String(err)}`);
+                  });
+              },
+            },
             { type: OPTION_SEPARATOR },
             {
               icon: LayoutTemplate,
@@ -924,6 +1031,181 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
                 setUI({ collageModalState: { isOpen: true, sourceImages: imagesForCollage } });
               },
               disabled: selectionCount === 0 || selectionCount > 9,
+            },
+          ],
+        },
+        {
+          label: 'Culling & Selection',
+          icon: Users,
+          submenu: [
+            {
+              icon: Zap,
+              label: 'Speed Culler & Face Loupe (C)',
+              onClick: () => {
+                const initialIdx = Math.max(
+                  0,
+                  imageList.findIndex((img) => img.path === (finalSelection[0] ?? path)),
+                );
+                setUI({
+                  speedCullerModalState: {
+                    isOpen: true,
+                    selectedPaths: finalSelection.length > 1 ? finalSelection : [],
+                    initialIndex: initialIdx,
+                  },
+                });
+              },
+            },
+            {
+              icon: Trophy,
+              label: 'AI Hero-Shot Curator...',
+              disabled: selectionCount < 2,
+              onClick: () =>
+                setUI({
+                  heroCuratorModalState: {
+                    isOpen: true,
+                    selectedPaths: finalSelection,
+                  },
+                }),
+            },
+          ],
+        },
+        {
+          label: 'AI Studio & Color',
+          icon: Wand2,
+          submenu: [
+            {
+              icon: Wand2,
+              label: 'Universal AI Shoot Polish...',
+              disabled: selectionCount === 0,
+              onClick: () =>
+                setUI({
+                  batchPolishModalState: {
+                    isOpen: true,
+                    selectedPaths: finalSelection,
+                  },
+                }),
+            },
+            {
+              icon: Palette,
+              label: '"Steal the Look" Color Matcher...',
+              disabled: selectionCount === 0,
+              onClick: () =>
+                setUI({
+                  colorMatcherModalState: {
+                    isOpen: true,
+                    heroPath: finalSelection[0] || null,
+                    targetPaths: finalSelection.slice(1),
+                    initialMode: 'matcher',
+                  },
+                }),
+            },
+            {
+              icon: Wand2,
+              label: 'Harmonize Series to Hero Photo...',
+              disabled: selectionCount < 2,
+              onClick: () =>
+                setUI({
+                  colorMatcherModalState: {
+                    isOpen: true,
+                    heroPath: finalSelection[0] || null,
+                    targetPaths: finalSelection.slice(1),
+                    initialMode: 'harmonize',
+                  },
+                }),
+            },
+            {
+              icon: Aperture,
+              label: 'Optical AI Bokeh & Tilt-Shift...',
+              onClick: () => {
+                if (activeView !== 'editor' || selectedImage?.path !== finalSelection[0]) {
+                  props.handleImageSelect(finalSelection[0]);
+                }
+                setUI({ bokehModalState: { isOpen: true } });
+              },
+            },
+            {
+              icon: Sparkles,
+              label: 'Batch Heal Sensor Dust Spots',
+              disabled: selectionCount === 0,
+              onClick: () => {
+                const toastId = toast.info(`Healing sensor dust on ${selectionCount} image(s)...`, {
+                  autoClose: false,
+                });
+                invoke(Invokes.BatchHealSensorDust, { paths: finalSelection })
+                  .then(async () => {
+                    toast.dismiss(toastId);
+                    await reloadAdjustmentsForPaths(finalSelection);
+                    await props.refreshImageList();
+                    toast.success('Sensor dust spots healed!');
+                  })
+                  .catch((err) => {
+                    toast.dismiss(toastId);
+                    toast.error(`Batch dust heal failed: ${String(err)}`);
+                  });
+              },
+            },
+            {
+              icon: Sparkles,
+              label: 'Build & Sync Shoot Sensor-Dust Map',
+              disabled: selectionCount < 2,
+              onClick: () => {
+                const toastId = toast.info(`Mapping persistent sensor dust across ${selectionCount} frames...`, {
+                  autoClose: false,
+                });
+                invoke<{ spots: any[]; message: string }>(Invokes.BuildShootSensorDustMap, {
+                  paths: finalSelection,
+                  minFrameFraction: 0.4,
+                })
+                  .then(async (report) => {
+                    if (!report.spots || report.spots.length === 0) {
+                      toast.dismiss(toastId);
+                      toast.info('No persistent sensor dust spots found across selected frames.');
+                      return;
+                    }
+                    await invoke(Invokes.ApplySensorDustMapToShoot, {
+                      paths: finalSelection,
+                      spots: report.spots,
+                    });
+                    toast.dismiss(toastId);
+                    await reloadAdjustmentsForPaths(finalSelection);
+                    await props.refreshImageList();
+                    toast.success(`Synced ${report.spots.length} sensor dust spot(s) across ${selectionCount} frames!`);
+                  })
+                  .catch((err) => {
+                    toast.dismiss(toastId);
+                    toast.error(`Shoot dust map failed: ${String(err)}`);
+                  });
+              },
+            },
+          ],
+        },
+        {
+          label: 'Studio & Delivery',
+          icon: Package,
+          submenu: [
+            {
+              icon: Download,
+              label: 'Advanced Multi-Export & Watermark...',
+              disabled: selectionCount === 0,
+              onClick: () =>
+                setUI({
+                  advancedExportModalState: {
+                    isOpen: true,
+                    selectedPaths: finalSelection,
+                  },
+                }),
+            },
+            {
+              icon: Package,
+              label: 'Export Client Delivery Pack...',
+              disabled: selectionCount === 0,
+              onClick: () =>
+                setUI({
+                  clientDeliveryModalState: {
+                    isOpen: true,
+                    selectedPaths: finalSelection,
+                  },
+                }),
             },
           ],
         },

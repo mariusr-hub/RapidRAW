@@ -194,13 +194,110 @@ const evaluateCurveY = (curve: Array<{ x: number; y: number }>, targetX: number)
   return targetX;
 };
 
+const clampSigned = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
 const applyPresetAdjustments = (adjustments: Adjustments, preset: Preset): Adjustments => {
-  const presetMasks = preset.adjustments.masks || [];
-  return {
+  const presetAdj = preset.adjustments;
+  const presetMasks = presetAdj.masks || [];
+  const isMonochromePreset = (presetAdj.saturation ?? 0) <= -90 || presetAdj.monochromeEnabled === true;
+  const hasBaseTonalEdits =
+    Math.abs(adjustments.exposure || 0) > 0.05 ||
+    Math.abs(adjustments.contrast || 0) > 2 ||
+    Math.abs(adjustments.highlights || 0) > 5 ||
+    Math.abs(adjustments.shadows || 0) > 5 ||
+    Math.abs(adjustments.vibrance || 0) > 5 ||
+    Math.abs(adjustments.temperature || 0) > 2;
+  const isStyleStack = !isMonochromePreset && presetAdj.exposure === undefined && hasBaseTonalEdits;
+
+  const mergedColorGrading = presetAdj.colorGrading
+    ? {
+        ...INITIAL_ADJUSTMENTS.colorGrading,
+        ...(adjustments.colorGrading || {}),
+        ...presetAdj.colorGrading,
+        shadows: {
+          ...INITIAL_ADJUSTMENTS.colorGrading.shadows,
+          ...(presetAdj.colorGrading.shadows || {}),
+        },
+        midtones: {
+          ...INITIAL_ADJUSTMENTS.colorGrading.midtones,
+          ...(presetAdj.colorGrading.midtones || {}),
+        },
+        highlights: {
+          ...INITIAL_ADJUSTMENTS.colorGrading.highlights,
+          ...(presetAdj.colorGrading.highlights || {}),
+        },
+        global: {
+          ...INITIAL_ADJUSTMENTS.colorGrading.global,
+          ...(presetAdj.colorGrading.global || {}),
+        },
+      }
+    : adjustments.colorGrading;
+
+  const mergedColorCalibration = presetAdj.colorCalibration
+    ? {
+        ...INITIAL_ADJUSTMENTS.colorCalibration,
+        ...(adjustments.colorCalibration || {}),
+        ...presetAdj.colorCalibration,
+      }
+    : adjustments.colorCalibration;
+
+  const mergedActiveTools = {
+    ...(adjustments.activeTools || {}),
+    ...(presetAdj.activeTools || {}),
+    ...(presetAdj.colorGrading ? { colorGrading: true } : {}),
+    ...(presetAdj.colorCalibration ? { colorCalibration: true } : {}),
+  };
+
+  const baseResult: Adjustments = {
     ...adjustments,
-    ...preset.adjustments,
+    ...presetAdj,
+    colorGrading: mergedColorGrading,
+    colorCalibration: mergedColorCalibration,
+    activeTools: mergedActiveTools,
     ...(hasAiSubMasks(presetMasks) ? { masks: stripAiMaskResults(presetMasks) } : {}),
   };
+
+  if (!isStyleStack) {
+    return baseResult;
+  }
+
+  // When stacking a color/film style preset onto an already Smart-Toned image,
+  // blend WB, tonal recovery, and saturation/contrast so Rec.2020 colors stay filmic.
+  if (typeof presetAdj.temperature === 'number') {
+    baseResult.temperature = Math.round(clampSigned((adjustments.temperature || 0) + presetAdj.temperature * 0.65, -100, 100));
+  }
+  if (typeof presetAdj.tint === 'number') {
+    baseResult.tint = Math.round(clampSigned((adjustments.tint || 0) + presetAdj.tint * 0.65, -100, 100));
+  }
+  if (typeof presetAdj.highlights === 'number') {
+    baseResult.highlights = Math.round(clampSigned((adjustments.highlights || 0) * 0.65 + presetAdj.highlights * 0.55, -100, 100));
+  }
+  if (typeof presetAdj.shadows === 'number') {
+    baseResult.shadows = Math.round(clampSigned((adjustments.shadows || 0) * 0.65 + presetAdj.shadows * 0.55, -100, 100));
+  }
+  if (typeof presetAdj.whites === 'number') {
+    baseResult.whites = Math.round(clampSigned((adjustments.whites || 0) * 0.65 + presetAdj.whites * 0.55, -100, 100));
+  }
+  if (typeof presetAdj.blacks === 'number') {
+    baseResult.blacks = Math.round(clampSigned((adjustments.blacks || 0) * 0.65 + presetAdj.blacks * 0.55, -100, 100));
+  }
+  if (typeof presetAdj.contrast === 'number') {
+    baseResult.contrast = Math.round(clampSigned((adjustments.contrast || 0) * 0.5 + presetAdj.contrast * 0.7, -45, 45));
+  }
+  if (typeof presetAdj.saturation === 'number') {
+    baseResult.saturation = Math.round(clampSigned((adjustments.saturation || 0) * 0.4 + presetAdj.saturation * 0.75, -100, 22));
+  }
+  if (typeof presetAdj.vibrance === 'number') {
+    baseResult.vibrance = Math.round(clampSigned((adjustments.vibrance || 0) * 0.45 + presetAdj.vibrance * 0.7, -100, 28));
+  }
+  if (typeof presetAdj.clarity === 'number') {
+    baseResult.clarity = Math.round(clampSigned((adjustments.clarity || 0) * 0.5 + presetAdj.clarity * 0.7, -35, 35));
+  }
+  if (typeof presetAdj.dehaze === 'number') {
+    baseResult.dehaze = Math.round(clampSigned((adjustments.dehaze || 0) * 0.5 + presetAdj.dehaze * 0.65, -35, 30));
+  }
+
+  return baseResult;
 };
 
 const mixAdjustments = (presetObj: any, intensity: number, initialObj: any = INITIAL_ADJUSTMENTS): any => {

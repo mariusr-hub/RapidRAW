@@ -16,15 +16,89 @@ const STRIP_MIN_ROWS: usize = 1024;
 const STRIP_MARGIN_FACTOR: usize = 4;
 const MAX_OUTPUT_PIXELS: f64 = 200.0e6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanKey {
+    pub projection: ProjectionMode,
+    pub boundary_warp_bits: u64,
+    pub auto_crop: bool,
+    pub exposure_compensation: bool,
+    pub yaw_bits: u64,
+    pub pitch_bits: u64,
+    pub roll_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct StitchSettings {
     pub projection: ProjectionMode,
     pub boundary_warp: f64,
     pub auto_crop: bool,
     pub exposure_compensation: bool,
-    #[serde(default, alias = "halfSize")]
+    #[serde(default)]
+    pub yaw_deg: f64,
+    #[serde(default)]
+    pub pitch_deg: f64,
+    #[serde(default)]
+    pub roll_deg: f64,
+    #[serde(default)]
     pub fast_draft: bool,
+    #[serde(default)]
+    pub half_size: bool,
+    #[serde(default = "default_true")]
+    pub apply_edits: bool,
+    #[serde(default)]
+    pub hdr_panorama: Option<bool>,
+    #[serde(default = "default_hdr_profile")]
+    pub hdr_profile: String,
+    #[serde(default = "default_hdr_strength")]
+    pub hdr_strength: f32,
+    #[serde(default)]
+    pub exposure_bias: f32,
+    #[serde(default = "default_highlight_recovery")]
+    pub highlight_recovery: f32,
+    #[serde(default = "default_shadow_lift")]
+    pub shadow_lift: f32,
+    #[serde(default = "default_detail_boost")]
+    pub detail_boost: f32,
+}
+
+impl StitchSettings {
+    pub fn plan_key(&self) -> PlanKey {
+        let norm_bits = |v: f64| if v == 0.0 { 0.0f64.to_bits() } else { v.to_bits() };
+        PlanKey {
+            projection: self.projection,
+            boundary_warp_bits: norm_bits(self.boundary_warp),
+            auto_crop: self.auto_crop,
+            exposure_compensation: self.exposure_compensation,
+            yaw_bits: norm_bits(self.yaw_deg),
+            pitch_bits: norm_bits(self.pitch_deg),
+            roll_bits: norm_bits(self.roll_deg),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_hdr_profile() -> String {
+    "natural".to_string()
+}
+
+fn default_hdr_strength() -> f32 {
+    100.0
+}
+
+fn default_highlight_recovery() -> f32 {
+    50.0
+}
+
+fn default_shadow_lift() -> f32 {
+    30.0
+}
+
+fn default_detail_boost() -> f32 {
+    1.05
 }
 
 impl Default for StitchSettings {
@@ -34,7 +108,19 @@ impl Default for StitchSettings {
             boundary_warp: 0.0,
             auto_crop: true,
             exposure_compensation: true,
+            yaw_deg: 0.0,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
             fast_draft: false,
+            half_size: false,
+            apply_edits: true,
+            hdr_panorama: None,
+            hdr_profile: default_hdr_profile(),
+            hdr_strength: default_hdr_strength(),
+            exposure_bias: 0.0,
+            highlight_recovery: default_highlight_recovery(),
+            shadow_lift: default_shadow_lift(),
+            detail_boost: default_detail_boost(),
         }
     }
 }
@@ -71,6 +157,10 @@ pub struct CompositionPlan {
 impl CompositionPlan {
     pub fn projection(&self) -> Projection {
         self.layout.canvas.projection
+    }
+
+    pub fn wraps(&self) -> bool {
+        self.layout.canvas.wraps
     }
 
     pub fn full_scale(&self) -> f64 {
@@ -123,6 +213,7 @@ fn warp_layer(
     rect: Rect,
     scale: f64,
     interpolation: Interpolation,
+    wrap_info: Option<(usize, usize)>,
 ) -> WarpedLayer {
     let camera = &scene.cameras[image];
     let source = scene.sources[image];
@@ -142,7 +233,12 @@ fn warp_layer(
             let y = (rect.y + ly) as f64 + 0.5;
             let mut sample = [0.0f32; 3];
             for lx in 0..rect.width {
-                let x = (rect.x + lx) as f64 + 0.5;
+                let gx = rect.x + lx;
+                let x = if let Some((orig_w, halo)) = wrap_info {
+                    ((gx as isize - halo as isize).rem_euclid(orig_w as isize)) as f64 + 0.5
+                } else {
+                    gx as f64 + 0.5
+                };
                 let Some(ray) = layout.ray(x / scale, y / scale) else {
                     continue;
                 };
@@ -290,6 +386,7 @@ pub fn plan_composition(
                 layer.roi,
                 seam_scale,
                 Interpolation::Bilinear,
+                None,
             );
             SeamLayer {
                 roi: layer.roi,
@@ -299,7 +396,8 @@ pub fn plan_composition(
         })
         .collect();
 
-    let labels = find_seams(seam_width, seam_height, &seam_layers);
+    let wraps = layout.canvas.wraps;
+    let labels = find_seams(seam_width, seam_height, &seam_layers, wraps);
 
     Ok(CompositionPlan {
         layout,
@@ -321,11 +419,17 @@ fn label_weight(plan: &CompositionPlan, layer: u16, x: f64, y: f64) -> f32 {
     let y0 = gy.floor();
     let fx = (gx - x0) as f32;
     let fy = (gy - y0) as f32;
+    let target_image = plan.layers[layer as usize].image;
+    let wraps = plan.layout.canvas.wraps;
     let at = |xi: f64, yi: f64| -> f32 {
-        let cx = (xi.max(0.0) as usize).min(plan.seam_width - 1);
+        let cx = if wraps {
+            (xi as isize).rem_euclid(plan.seam_width as isize) as usize
+        } else {
+            (xi.max(0.0) as usize).min(plan.seam_width - 1)
+        };
         let cy = (yi.max(0.0) as usize).min(plan.seam_height - 1);
         let label = plan.labels[cy * plan.seam_width + cx];
-        if label == layer && label != NO_LABEL {
+        if label != NO_LABEL && plan.layers[label as usize].image == target_image {
             1.0
         } else {
             0.0
@@ -345,14 +449,28 @@ pub fn render_composition(
 ) -> Raster {
     let width = ((plan.layout.crop.width * scale).round() as usize).max(1);
     let height = ((plan.layout.crop.height * scale).round() as usize).max(1);
-    let bands = band_count(width, height);
+    let wraps = plan.layout.canvas.wraps;
+    let mut bands = band_count(width, height);
+    if wraps {
+        while bands > 1 && 2 * MultiBandBlender::alignment(bands) >= width {
+            bands -= 1;
+        }
+    }
     let align = MultiBandBlender::alignment(bands);
+    let halo = if wraps && 4 * align < width {
+        2 * align
+    } else if wraps && 2 * align < width {
+        align
+    } else {
+        0
+    };
+    let ext_width = width + 2 * halo;
     let margin = (STRIP_MARGIN_FACTOR * align).max(32).div_ceil(align) * align;
     let core = STRIP_MIN_ROWS.max(2 * margin).div_ceil(align) * align;
     let ratio = scale / plan.seam_scale;
     let pad = (2.0 * ratio).ceil() as usize + 2;
 
-    let layer_rects: Vec<Rect> = plan
+    let layer_rects: Vec<Vec<Rect>> = plan
         .layers
         .iter()
         .map(|layer| {
@@ -360,17 +478,44 @@ pub fn render_composition(
             let y0 = ((layer.roi.y as f64 * ratio).floor() as usize).saturating_sub(pad);
             let x1 = ((layer.roi.right() as f64 * ratio).ceil() as usize + pad).min(width);
             let y1 = ((layer.roi.bottom() as f64 * ratio).ceil() as usize + pad).min(height);
-            Rect {
-                x: x0 - x0 % align,
-                y: y0,
-                width: x1 - (x0 - x0 % align),
-                height: y1 - y0,
+
+            let mut spans = vec![(x0 + halo, (x1 + halo).min(ext_width))];
+            if halo > 0 {
+                if x0 < halo {
+                    let rx0 = (x0 + halo + width).max(halo + width);
+                    let rx1 = (x1 + halo + width).min(ext_width);
+                    if rx0 < rx1 {
+                        spans.push((rx0, rx1));
+                    }
+                }
+                if x1 > width.saturating_sub(halo) {
+                    let lx0 = ((x0 as isize + halo as isize) - width as isize).max(0) as usize;
+                    let lx1 = ((x1 as isize + halo as isize) - width as isize).clamp(0, ext_width as isize) as usize;
+                    if lx0 < lx1 {
+                        spans.push((lx0, lx1));
+                    }
+                }
             }
+
+            spans
+                .into_iter()
+                .filter(|&(a, b)| a < b)
+                .map(|(a, b)| {
+                    let ax0 = a - a % align;
+                    Rect {
+                        x: ax0,
+                        y: y0,
+                        width: b - ax0,
+                        height: y1 - y0,
+                    }
+                })
+                .collect()
         })
         .collect();
 
     let mut output = Raster::new(width, height, 3);
     let strip_count = height.div_ceil(core);
+    let wrap_info = (halo > 0).then_some((width, halo));
     for strip in 0..strip_count {
         if strip_count > 1 {
             progress(format!("Blending region {} of {}", strip + 1, strip_count));
@@ -382,7 +527,7 @@ pub fn render_composition(
         let region = Rect {
             x: 0,
             y: region_y0,
-            width,
+            width: ext_width,
             height: region_y1 - region_y0,
         };
 
@@ -390,57 +535,66 @@ pub fn render_composition(
         let mut coverage = vec![false; width * (y_end - y_start)];
 
         for (index, layer) in plan.layers.iter().enumerate() {
-            let Some(mut rect) = layer_rects[index].intersect(&region) else {
-                continue;
-            };
-            let local_y = rect.y - region.y;
-            let aligned_y = local_y - local_y % align;
-            rect.height += local_y - aligned_y;
-            rect.y = region.y + aligned_y;
+            for base_rect in &layer_rects[index] {
+                let Some(mut rect) = base_rect.intersect(&region) else {
+                    continue;
+                };
+                let local_y = rect.y - region.y;
+                let aligned_y = local_y - local_y % align;
+                rect.height += local_y - aligned_y;
+                rect.y = region.y + aligned_y;
 
-            let mut warp = warp_layer(
-                scene,
-                &plan.photometric,
-                &plan.layout,
-                layer.image,
-                rect,
-                scale,
-                interpolation,
-            );
-            if !warp.valid.iter().any(|&v| v > 0.0) {
-                continue;
-            }
-
-            let weights: Vec<f32> = warp
-                .valid
-                .par_chunks(rect.width)
-                .enumerate()
-                .flat_map_iter(|(ly, row)| {
-                    let y = ((rect.y + ly) as f64 + 0.5) / ratio;
-                    row.iter().enumerate().map(move |(lx, &v)| {
-                        if v <= 0.0 {
-                            return 0.0;
-                        }
-                        let x = ((rect.x + lx) as f64 + 0.5) / ratio;
-                        v * (label_weight(plan, index as u16, x, y) + LABEL_WEIGHT_FLOOR)
-                    })
-                })
-                .collect();
-
-            for ly in 0..rect.height {
-                let gy = rect.y + ly;
-                if gy < y_start || gy >= y_end {
+                let mut warp = warp_layer(
+                    scene,
+                    &plan.photometric,
+                    &plan.layout,
+                    layer.image,
+                    rect,
+                    scale,
+                    interpolation,
+                    wrap_info,
+                );
+                if !warp.valid.iter().any(|&v| v > 0.0) {
                     continue;
                 }
-                for lx in 0..rect.width {
-                    if warp.valid[ly * rect.width + lx] > 0.0 {
-                        coverage[(gy - y_start) * width + rect.x + lx] = true;
+
+                let weights: Vec<f32> = warp
+                    .valid
+                    .par_chunks(rect.width)
+                    .enumerate()
+                    .flat_map_iter(|(ly, row)| {
+                        let y = ((rect.y + ly) as f64 + 0.5) / ratio;
+                        row.iter().enumerate().map(move |(lx, &v)| {
+                            if v <= 0.0 {
+                                return 0.0;
+                            }
+                            let gx = rect.x + lx;
+                            let x = if halo > 0 {
+                                (((gx as isize - halo as isize).rem_euclid(width as isize)) as f64 + 0.5) / ratio
+                            } else {
+                                (gx as f64 + 0.5) / ratio
+                            };
+                            v * (label_weight(plan, index as u16, x, y) + LABEL_WEIGHT_FLOOR)
+                        })
+                    })
+                    .collect();
+
+                for ly in 0..rect.height {
+                    let gy = rect.y + ly;
+                    if gy < y_start || gy >= y_end {
+                        continue;
+                    }
+                    for lx in 0..rect.width {
+                        let gx = rect.x + lx;
+                        if gx >= halo && gx < halo + width && warp.valid[ly * rect.width + lx] > 0.0 {
+                            coverage[(gy - y_start) * width + (gx - halo)] = true;
+                        }
                     }
                 }
-            }
 
-            push_pull_fill(&mut warp.color, &warp.valid, bands + 2);
-            blender.feed(&warp.color, &weights, rect.x, rect.y - region.y);
+                push_pull_fill(&mut warp.color, &warp.valid, bands + 2);
+                blender.feed(&warp.color, &weights, rect.x, rect.y - region.y);
+            }
         }
 
         let blended = blender.finish();
@@ -452,7 +606,7 @@ pub fn render_composition(
                 let by = y_start - region.y + ly;
                 for x in 0..width {
                     if coverage[ly * width + x] {
-                        let src = blended.pixel(x, by);
+                        let src = blended.pixel(x + halo, by);
                         row[x * 3] = src[0].max(0.0);
                         row[x * 3 + 1] = src[1].max(0.0);
                         row[x * 3 + 2] = src[2].max(0.0);

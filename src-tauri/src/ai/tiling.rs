@@ -400,3 +400,20 @@ pub fn run_ai_upscale(
 ) -> Result<Rgb32FImage> {
     run_tiled(rgb_img, session, UPSCALE_TILE, scale, on_progress)
 }
+
+pub fn run_ai_upscale_with_cancel(
+    rgb_img: &Rgb32FImage,
+    session: &Mutex<Session>,
+    scale: u32,
+    cancel: Option<&AtomicBool>,
+    on_progress: &dyn Fn(f32),
+) -> Result<Rgb32FImage> {
+    run_tiled_with_control(img_ref(rgb_img), session, None, UPSCALE_TILE, scale, cancel, false, &|tp| {
+        on_progress(tp.progress)
+    })
+}
+
+#[inline]
+fn img_ref(img: &Rgb32FImage) -> &Rgb32FImage {
+    img
+}

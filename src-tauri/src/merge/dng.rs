@@ -119,7 +119,7 @@ fn encode_tile(raster: &Raster, tile_x: usize, tile_y: usize) -> Result<Vec<u8>,
             let pixel = raster.pixel(x, y);
             for c in 0..CHANNELS {
                 let value = if pixel[c].is_finite() {
-                    pixel[c].max(0.0)
+                    pixel[c].clamp(0.0, f16::MAX.to_f32())
                 } else {
                     0.0
                 };
@@ -241,4 +241,26 @@ pub fn encode_linear_dng(raster: &Raster, description: &DngDescription) -> Resul
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&extra);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_linear_dng_clamps_f16_overflow_and_nan() {
+        let raster = Raster::from_data(2, 2, 3, vec![
+            100000.0, f32::INFINITY, f32::NAN,
+            -5.0, 0.5, 2.0,
+            1.0, 1.0, 1.0,
+            0.0, 0.0, 0.0,
+        ]);
+        let desc = DngDescription {
+            make: "TestCam",
+            model: "M1",
+            baseline_exposure: 1.5,
+        };
+        let bytes = encode_linear_dng(&raster, &desc).unwrap();
+        assert!(bytes.starts_with(b"II*\0"));
+    }
 }

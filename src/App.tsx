@@ -1061,6 +1061,8 @@ function App() {
                     handleContinueSession={handleContinueSession}
                     handleGoHome={handleGoHome}
                     handleOpenFolder={handleOpenFolder}
+                    handleHistoryBack={handleNavBack}
+                    handleHistoryForward={handleNavForward}
                     handleNavigateToFolder={(path) => handleSelectSubfolder(path, false, undefined, true)}
                     handleImportClick={handleImportClick}
                     handleLibraryRefresh={handleLibraryRefresh}

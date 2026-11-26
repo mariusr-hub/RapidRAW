@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
+import { Invokes } from '../types/invokes';
 import { ImageFile, ImageFlag } from '../types/library';
 import { Panel } from '../types/ui';
 import { ExifOverlay, LibraryViewMode } from '../types/settings';
@@ -74,6 +76,9 @@ export const useKeyboardShortcuts = ({
     }
   }, []);
 
+  const keybinds = useSettingsStore((s) => s.appSettings?.keybinds);
+  const osPlatform = useSettingsStore((s) => s.osPlatform);
+
   useEffect(() => {
     const getStoreState = () => ({
       editor: useEditorStore.getState(),
@@ -84,14 +89,15 @@ export const useKeyboardShortcuts = ({
     });
     type ShortcutState = ReturnType<typeof getStoreState>;
 
-    const comboMap = new Map<string, string>();
-    const { appSettings, osPlatform } = useSettingsStore.getState();
-    const keybinds = appSettings?.keybinds;
+    const comboMap = new Map<string, string[]>();
 
     for (const def of KEYBIND_DEFINITIONS) {
       const combo = getEffectiveCombo(def, keybinds, osPlatform);
       if (combo.length > 0) {
-        comboMap.set(combo.join('+'), def.action);
+        const key = combo.join('+');
+        const list = comboMap.get(key) ?? [];
+        list.push(def.action);
+        comboMap.set(key, list);
       }
     }
 
@@ -333,6 +339,54 @@ export const useKeyboardShortcuts = ({
         execute: (e: any) => {
           e.preventDefault();
           toggleCompare();
+        },
+      },
+      cycle_compare_mode: {
+        shouldFire: (s: any) => s.ui.activeView === 'editor' && !!s.editor.selectedImage,
+        execute: (e: KeyboardEvent, s: any) => {
+          e.preventDefault();
+          const current = s.editor.compareMode;
+          const nextMode =
+            current === 'none'
+              ? 'vertical_split'
+              : current === 'vertical_split'
+                ? 'horizontal_split'
+                : current === 'horizontal_split'
+                  ? 'matrix_4way'
+                  : 'none';
+          s.editor.setEditor(
+            nextMode === 'none'
+              ? { compareMode: 'none' }
+              : { compareMode: nextMode, compareView: 'off', showOriginal: false, previewOverride: null },
+          );
+        },
+      },
+      toggle_soft_proof: {
+        shouldFire: (s: any) => s.ui.activeView === 'editor' && !!s.editor.selectedImage,
+        execute: (e: KeyboardEvent, s: any) => {
+          e.preventDefault();
+          const next = { ...s.ui.softProofState, enabled: !s.ui.softProofState.enabled };
+          s.ui.setUI({ softProofState: next });
+          invoke(Invokes.SetSoftProofConfig, { config: next }).catch((err) =>
+            console.warn('SetSoftProofConfig failed:', err),
+          );
+        },
+      },
+      open_speed_culler: {
+        shouldFire: (s: any) => s.ui.activeView === 'library' && sortedListRef.current.length > 0,
+        execute: (e: KeyboardEvent, s: any) => {
+          e.preventDefault();
+          const activePath = s.library.libraryActivePath;
+          const multiSelected = s.library.multiSelectedPaths;
+          const list = sortedListRef.current;
+          const initialIdx = activePath ? Math.max(0, list.findIndex((img: any) => img.path === activePath)) : 0;
+          s.ui.setUI({
+            speedCullerModalState: {
+              isOpen: true,
+              selectedPaths: multiSelected.length > 1 ? multiSelected : [],
+              initialIndex: initialIdx,
+            },
+          });
         },
       },
       toggle_adjustments: {
@@ -782,13 +836,15 @@ export const useKeyboardShortcuts = ({
       }
 
       const normalized = normalizeCombo(event, state.settings.osPlatform);
-      const action = comboMap.get(normalized.join('+'));
+      const matchedActions = comboMap.get(normalized.join('+'));
 
-      if (action) {
-        const handler = actions[action];
-        if (handler && (!handler.shouldFire || handler.shouldFire(state))) {
-          handler.execute(event, state);
-          return;
+      if (matchedActions) {
+        for (const action of matchedActions) {
+          const handler = actions[action];
+          if (handler && (!handler.shouldFire || handler.shouldFire(state))) {
+            handler.execute(event, state);
+            return;
+          }
         }
       }
     };
@@ -818,5 +874,7 @@ export const useKeyboardShortcuts = ({
     setAdjustments,
     handleClearSelection,
     toggleCompare,
+    keybinds,
+    osPlatform,
   ]);
 };

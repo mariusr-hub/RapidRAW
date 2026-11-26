@@ -5,16 +5,12 @@ import { toast } from 'react-toastify';
 import { Status } from '../types/export';
 import { Invokes } from '../types/invokes';
 import { Progress } from '../types/library';
-import { ImageDefaults, WaveformData } from '../types/editor';
+import { WaveformData } from '../types/editor';
 import { Adjustments, MaskContainer } from '../utils/adjustments';
 import { AiJobsStatus, JobKind, JobStatus, useProcessStore } from '../store/useProcessStore';
 import { useEditorStore } from '../store/useEditorStore';
 import { useUIStore } from '../store/useUIStore';
 import { useLibraryStore } from '../store/useLibraryStore';
-import { adjustmentsFromMetadata, fetchImageDefaults } from '../utils/developDefaults';
-import { globalImageCache } from '../utils/ImageLRUCache';
-
-const THUMBNAIL_REFRESH_LIMIT = 500;
 
 const normalizeFolderPath = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 
@@ -83,35 +79,13 @@ export function useTauriListeners({
   handleSelectSubfolder,
   refreshImageList,
   markGenerated,
-  prevAdjustmentsRef,
+  prevAdjustmentsRef: _prevAdjustmentsRef,
 }: TauriListenerProps) {
   const refs = useRef({ refreshAllFolderTrees, handleSelectSubfolder, refreshImageList, markGenerated });
 
   useEffect(() => {
     refs.current = { refreshAllFolderTrees, handleSelectSubfolder, refreshImageList, markGenerated };
   });
-
-  const refreshOpenUneditedImage = async () => {
-    const { selectedImage } = useEditorStore.getState();
-    if (!selectedImage) return;
-    const path = selectedImage.path;
-    const [metadata, imageDefaults]: [{ adjustments: unknown }, ImageDefaults] = await Promise.all([
-      invoke<{ adjustments: unknown }>(Invokes.LoadMetadata, { path }),
-      fetchImageDefaults(path),
-    ]);
-    if (useEditorStore.getState().selectedImage?.path !== path) return;
-    useEditorStore.getState().setEditor({ imageDefaults });
-    if (!selectedImage.isReady) return;
-    const { selectedImage: current, history, adjustments, setEditor, resetHistory } = useEditorStore.getState();
-    if (current?.path !== path || history.length !== 1 || adjustments !== history[0]) return;
-    const fresh = adjustmentsFromMetadata(metadata.adjustments);
-    if (JSON.stringify(fresh) === JSON.stringify(adjustments)) return;
-    if (prevAdjustmentsRef.current) prevAdjustmentsRef.current = { path, adjustments: fresh };
-    setEditor({ adjustments: fresh });
-    resetHistory(fresh);
-  };
-  const refreshOpenUneditedImageRef = useRef(refreshOpenUneditedImage);
-  refreshOpenUneditedImageRef.current = refreshOpenUneditedImage;
 
   const thumbnailBuffer = useRef<Record<string, string>>({});
   const mediumThumbnailBuffer = useRef<Record<string, string>>({});
@@ -224,9 +198,6 @@ export function useTauriListeners({
     };
 
     const listeners = [
-      listen('preview-update-uncropped', (event: any) => {
-        if (isEffectActive) useEditorStore.getState().setEditor({ uncroppedAdjustedPreviewUrl: event.payload });
-      }),
       listen('open-with-file', (event: any) => {
         if (isEffectActive) useProcessStore.getState().setProcess({ initialFileToOpen: event.payload as string });
       }),
@@ -266,30 +237,6 @@ export function useTauriListeners({
           scheduleFlush();
         }
       }),
-      listen('develop-defaults-changed', () => {
-        if (!isEffectActive) return;
-        const { imageList, libraryActivePath } = useLibraryStore.getState();
-        const focusPath = useEditorStore.getState().selectedImage?.path ?? libraryActivePath;
-        const focusIndex = Math.max(
-          0,
-          imageList.findIndex((image) => image.path === focusPath),
-        );
-        const start = Math.max(0, focusIndex - THUMBNAIL_REFRESH_LIMIT / 2);
-        const paths = imageList
-          .slice(start, start + THUMBNAIL_REFRESH_LIMIT)
-          .map((image, offset) => ({ path: image.path, distance: Math.abs(start + offset - focusIndex) }))
-          .sort((a, b) => b.distance - a.distance)
-          .map(({ path }) => path);
-        globalImageCache.clear();
-        if (paths.length > 0) {
-          invoke('update_thumbnail_queue', { paths }).catch((err) =>
-            console.error('Failed to refresh thumbnails after default adjustments changed:', err),
-          );
-        }
-        refreshOpenUneditedImageRef
-          .current()
-          .catch((err) => console.error('Failed to apply new default adjustments to the open image:', err));
-      }),
       listen('image-metadata-loaded', (event: any) => {
         if (!isEffectActive) return;
         const { path, rating, flag, is_edited, tags, needs_ai } = event.payload;
@@ -300,10 +247,15 @@ export function useTauriListeners({
         scheduleFlush();
       }),
       listen<string>('ai-model-download-start', (event) => {
-        if (isEffectActive)
+        if (isEffectActive) {
           modelDownloadJobIds[event.payload] = useProcessStore
             .getState()
             .startJob(JobKind.ModelDownload, { detail: event.payload });
+          toast.info(`Downloading AI model: ${event.payload}...`, {
+            toastId: `model-dl-${event.payload}`,
+            autoClose: false,
+          });
+        }
       }),
       listen<{ name: string; current: number; total: number }>('ai-model-download-progress', (event) => {
         const { name, current, total } = event.payload;
@@ -315,6 +267,10 @@ export function useTauriListeners({
         const { name, error } = event.payload;
         const jobId = modelDownloadJobIds[name];
         delete modelDownloadJobIds[name];
+        toast.dismiss(`model-dl-${name}`);
+        if (error) {
+          toast.error(`AI model download failed (${name}): ${error}`);
+        }
         if (jobId)
           useProcessStore
             .getState()
@@ -431,67 +387,6 @@ export function useTauriListeners({
           },
         }));
       }),
-      listen<string>('ai-denoise-ready', (event) => {
-        if (!isEffectActive) return;
-        useEditorStore.getState().setEditor((state) => {
-          const { [event.payload]: _, ...aiDenoiseProgress } = state.aiDenoiseProgress;
-          const { [event.payload]: _meta, ...aiDenoiseMeta } = state.aiDenoiseMeta;
-          return {
-            aiDenoiseProgress,
-            aiDenoiseMeta,
-            ...(state.selectedImage?.path === event.payload ? { adjustments: { ...state.adjustments } } : {}),
-          };
-        });
-      }),
-      listen<{ path: string; error: string }>('ai-denoise-error', (event) => {
-        if (!isEffectActive) return;
-        const { path, error } = event.payload;
-        if (!error.toLowerCase().includes('cancelled')) {
-          toast.error(`AI denoise failed: ${error}`);
-        }
-        useEditorStore.getState().setEditor((state) => {
-          const { [path]: _, ...aiDenoiseProgress } = state.aiDenoiseProgress;
-          const { [path]: _meta, ...aiDenoiseMeta } = state.aiDenoiseMeta;
-          return {
-            aiDenoiseProgress,
-            aiDenoiseMeta,
-            ...(state.selectedImage?.path === path
-              ? { adjustments: { ...state.adjustments, aiDenoiseEnabled: false } }
-              : {}),
-          };
-        });
-      }),
-      listen<{ path: string; progress: number }>('ai-upscale-progress', (event) => {
-        if (!isEffectActive) return;
-        const { path, progress } = event.payload;
-        useEditorStore
-          .getState()
-          .setEditor((state) => ({ aiUpscaleProgress: { ...state.aiUpscaleProgress, [path]: progress } }));
-      }),
-      listen<string>('ai-upscale-ready', (event) => {
-        if (!isEffectActive) return;
-        useEditorStore.getState().setEditor((state) => {
-          const { [event.payload]: _, ...aiUpscaleProgress } = state.aiUpscaleProgress;
-          return {
-            aiUpscaleProgress,
-            ...(state.selectedImage?.path === event.payload ? { adjustments: { ...state.adjustments } } : {}),
-          };
-        });
-      }),
-      listen<{ path: string; error: string }>('ai-upscale-error', (event) => {
-        if (!isEffectActive) return;
-        const { path, error } = event.payload;
-        toast.error(`RapidRes failed: ${error}`);
-        useEditorStore.getState().setEditor((state) => {
-          const { [path]: _, ...aiUpscaleProgress } = state.aiUpscaleProgress;
-          return {
-            aiUpscaleProgress,
-            ...(state.selectedImage?.path === path
-              ? { adjustments: { ...state.adjustments, aiUpscaleEnabled: false } }
-              : {}),
-          };
-        });
-      }),
       listen<AiJobsStatus>('ai-jobs-status', (event) => {
         if (!isEffectActive) return;
         const { aiJobs, setProcess } = useProcessStore.getState();
@@ -573,6 +468,186 @@ export function useTauriListeners({
           });
         }
       }),
+      listen<string>('denoise-progress', (event) => {
+        if (isEffectActive) {
+          const msg = String(event.payload ?? '');
+          const pctMatch = msg.match(/(\d+(?:\.\d+)?)%/);
+          const pct = pctMatch ? Math.round(parseFloat(pctMatch[1])) : 0;
+          const proc = useProcessStore.getState();
+          const existing = Object.values(proc.jobs).find(
+            (j) => j.kind === JobKind.AiTagging && j.detail?.startsWith('Denoise:') && j.status === JobStatus.Running,
+          );
+          if (existing) {
+            proc.updateJob(existing.id, { detail: `Denoise: ${msg}`, progress: { current: pct, total: 100 } });
+          } else {
+            proc.startJob(JobKind.AiTagging, { detail: `Denoise: ${msg}`, progress: { current: pct, total: 100 } });
+          }
+          useUIStore.getState().setUI((state) => {
+            if (!state.denoiseModalState.isOpen) return state;
+            return { denoiseModalState: { ...state.denoiseModalState, progressMessage: event.payload } };
+          });
+        }
+      }),
+      listen<{ denoised: string; original: string; dust_spots_healed?: number }>('denoise-complete', (event) => {
+        if (isEffectActive) {
+          const proc = useProcessStore.getState();
+          const existing = Object.values(proc.jobs).find(
+            (j) => j.kind === JobKind.AiTagging && j.detail?.startsWith('Denoise:') && j.status === JobStatus.Running,
+          );
+          if (existing) proc.updateJob(existing.id, { status: JobStatus.Success, progress: { current: 100, total: 100 } });
+          useUIStore.getState().setUI((state) => ({
+            denoiseModalState: {
+              ...state.denoiseModalState,
+              isProcessing: false,
+              previewBase64: event.payload.denoised,
+              originalBase64: event.payload.original,
+              progressMessage: null,
+              error: null,
+            },
+          }));
+          toast.success('Denoising complete — review & save');
+        }
+      }),
+      listen<string>('denoise-error', (event) => {
+        if (isEffectActive) {
+          const msg = String(event.payload ?? 'Denoise failed');
+          const isCancelled = msg.toLowerCase().includes('cancel');
+          const proc = useProcessStore.getState();
+          const existing = Object.values(proc.jobs).find(
+            (j) => j.kind === JobKind.AiTagging && j.detail?.startsWith('Denoise:') && j.status === JobStatus.Running,
+          );
+          if (existing) {
+            proc.updateJob(existing.id, isCancelled ? { status: JobStatus.Cancelled } : { status: JobStatus.Error, error: msg });
+          }
+          useUIStore.getState().setUI((state) => ({
+            denoiseModalState: {
+              ...state.denoiseModalState,
+              isProcessing: false,
+              progressMessage: null,
+              error: isCancelled ? null : msg,
+            },
+          }));
+        }
+      }),
+      listen<{ current?: number; total?: number; message?: string } | string>('drizzle-progress', (event) => {
+        if (isEffectActive) {
+          const msg =
+            typeof event.payload === 'string'
+              ? event.payload
+              : event.payload?.message || 'Processing Drizzle Super-Resolution...';
+          useUIStore.getState().setUI((state) => {
+            if (!state.drizzleModalState.isOpen) return state;
+            return { drizzleModalState: { ...state.drizzleModalState, progressMessage: msg } };
+          });
+        }
+      }),
+      listen<{
+        base64: string;
+        width: number;
+        height: number;
+        scale: number;
+        frames_stacked: number;
+        snr_boost: string;
+      }>('drizzle-complete', (event) => {
+        if (isEffectActive) {
+          useUIStore.getState().setUI((state) => ({
+            drizzleModalState: {
+              ...state.drizzleModalState,
+              isProcessing: false,
+              finalImageBase64: event.payload.base64,
+              progressMessage: null,
+              error: null,
+              meta: {
+                width: event.payload.width,
+                height: event.payload.height,
+                scale: event.payload.scale,
+                frames_stacked: event.payload.frames_stacked,
+                snr_boost: event.payload.snr_boost,
+              },
+            },
+          }));
+        }
+      }),
+      listen<string>('drizzle-error', (event) => {
+        if (isEffectActive) {
+          const msg = String(event.payload ?? 'Drizzle failed');
+          const isCancelled = msg.toLowerCase().includes('cancel');
+          useUIStore.getState().setUI((state) => ({
+            drizzleModalState: {
+              ...state.drizzleModalState,
+              isProcessing: false,
+              progressMessage: null,
+              error: isCancelled ? null : msg,
+            },
+          }));
+        }
+      }),
+      listen<string>('astro-progress', (event) => {
+        if (isEffectActive) {
+          useUIStore.getState().setUI((state) => ({
+            nightSkyState: { ...state.nightSkyState, progressMessage: event.payload },
+          }));
+        }
+      }),
+      listen<string>('astro-error', (event) => {
+        if (isEffectActive) {
+          const msg = String(event.payload ?? 'Astro stacking failed');
+          const isCancelled = msg.toLowerCase().includes('cancel');
+          useUIStore.getState().setUI((state) => ({
+            nightSkyState: {
+              ...state.nightSkyState,
+              isProcessing: false,
+              progressMessage: null,
+              error: isCancelled ? null : msg,
+            },
+          }));
+        }
+      }),
+      listen<string>('hdr-progress', (event) => {
+        if (isEffectActive) {
+          useUIStore.getState().setUI((state) => {
+            if (!state.mergeModalState.isOpen) return state;
+            return { mergeModalState: { ...state.mergeModalState, progressMessage: event.payload } };
+          });
+        }
+      }),
+      listen('hdr-complete', () => {
+        if (isEffectActive) {
+          useUIStore.getState().setUI((state) => ({
+            nightSkyState: { ...state.nightSkyState, isProcessing: false, progressMessage: null },
+          }));
+        }
+      }),
+      listen<string>('panorama-progress', (event) => {
+        if (isEffectActive) {
+          useUIStore.getState().setUI((state) => {
+            if (!state.mergeModalState.isOpen) return state;
+            return { mergeModalState: { ...state.mergeModalState, progressMessage: event.payload } };
+          });
+        }
+      }),
+      listen<string>('panorama-error', (event) => {
+        if (isEffectActive) {
+          const msg = String(event.payload ?? 'Panorama failed');
+          const isCancelled = msg.toLowerCase().includes('cancel');
+          useUIStore.getState().setUI((state) => {
+            if (!state.mergeModalState.isOpen) return state;
+            return {
+              mergeModalState: {
+                ...state.mergeModalState,
+                isProcessing: false,
+                progressMessage: null,
+                error: isCancelled ? null : msg,
+              },
+            };
+          });
+        }
+      }),
+      listen('batch-dust-complete', () => {
+        if (isEffectActive) {
+          toast.success('Batch dust repair complete');
+        }
+      }),
       listen('culling-start', (event: any) => {
         if (isEffectActive) {
           useUIStore.getState().setUI((state) => ({
@@ -600,11 +675,48 @@ export function useTauriListeners({
           }));
         }
       }),
-      listen('culling-error', (event: any) => {
+      listen('stock-upload-progress', (event: any) => {
+        if (isEffectActive && event.payload?.message) {
+          toast.info(String(event.payload.message), { toastId: 'stock-upload-progress', autoClose: 2500 });
+        }
+      }),
+      listen('indexing-error', (event: any) => {
         if (isEffectActive) {
-          useUIStore.getState().setUI((state) => ({
-            cullingModalState: { ...state.cullingModalState, progress: null, error: String(event.payload) },
-          }));
+          console.warn('Background indexing error:', event.payload);
+          toast.warn(`Library indexing warning: ${String(event.payload)}`, { toastId: 'indexing-error' });
+        }
+      }),
+      listen('thumbnail-generation-error', (event: any) => {
+        if (isEffectActive) {
+          console.warn('Thumbnail generation error:', event.payload);
+        }
+      }),
+      listen('batch-dust-progress', (event: any) => {
+        if (isEffectActive && event.payload?.current && event.payload?.total) {
+          toast.info(`Healing sensor dust: ${event.payload.current}/${event.payload.total}`, {
+            toastId: 'batch-dust-progress',
+            autoClose: 1500,
+          });
+        }
+      }),
+      listen('panorama-complete', () => {
+        if (isEffectActive) {
+          toast.success('Panorama stitch complete', { toastId: 'panorama-complete' });
+        }
+      }),
+      listen('astro-adjustments-updated', (event: any) => {
+        if (isEffectActive && event.payload && typeof event.payload === 'object') {
+          const store = useEditorStore.getState();
+          const next = { ...store.adjustments, ...event.payload };
+          store.setEditor({ adjustments: next });
+          store.pushHistory(
+            next,
+            event.payload.astroAdcEnabled
+              ? 'Atmospheric Dispersion Correction'
+              : event.payload.astroPccEnabled
+                ? 'Photometric G2V Calibration'
+                : 'Remove Light Pollution',
+          );
         }
       }),
     ];

@@ -9,7 +9,6 @@
 
 use crate::library::sidecars::parse_virtual_path;
 use crate::library::file_ops::{read_file_mapped};
-use crate::decode::image_loader::load_base_image_from_bytes;
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -17,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientDeliveryConfig {
@@ -92,7 +91,8 @@ pub fn export_client_delivery_pack(
     crate::ai::jobs::reserve(&config.paths);
     let start_time = std::time::Instant::now();
     let root_dir = PathBuf::from(&config.output_dir);
-    if !root_dir.exists() {
+    let root_existed = root_dir.exists();
+    if !root_existed {
         let _ = fs::create_dir_all(&root_dir);
     }
 
@@ -103,16 +103,27 @@ pub fn export_client_delivery_pack(
     let dir_proofs = root_dir.join("04_Client_Watermarked_Proofs");
     let dir_webp = root_dir.join("05_Fast_WebP_Gallery");
 
-    if config.export_master_print { let _ = fs::create_dir_all(&dir_print); }
-    if config.export_instagram_4x5 { let _ = fs::create_dir_all(&dir_insta); }
-    if config.export_stories_9x16 { let _ = fs::create_dir_all(&dir_stories); }
-    if config.export_watermarked_proofs { let _ = fs::create_dir_all(&dir_proofs); }
-    if config.export_webp_gallery { let _ = fs::create_dir_all(&dir_webp); }
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let mut ensure_dir = |flag: bool, dir: &PathBuf| {
+        if flag {
+            let existed = dir.exists();
+            let _ = fs::create_dir_all(dir);
+            if !existed {
+                created_dirs.push(dir.clone());
+            }
+        }
+    };
+    ensure_dir(config.export_master_print, &dir_print);
+    ensure_dir(config.export_instagram_4x5, &dir_insta);
+    ensure_dir(config.export_stories_9x16, &dir_stories);
+    ensure_dir(config.export_watermarked_proofs, &dir_proofs);
+    ensure_dir(config.export_webp_gallery, &dir_webp);
 
     let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
     let total_photos = config.paths.len();
     let generated_count = Arc::new(AtomicUsize::new(0));
     let progress_counter = Arc::new(AtomicUsize::new(0));
+    let created_files: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let _ = app_handle.emit(
         "delivery-pack-progress",
@@ -126,8 +137,14 @@ pub fn export_client_delivery_pack(
 
     let config_arc = Arc::new(config.clone());
     let generated_clone = generated_count.clone();
+    let app_state = app_handle.state::<crate::app::state::AppState>();
+    app_state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+    let cancel_token = app_state.ai_denoise_cancel.clone();
 
     config.paths.par_iter().for_each(|path_str| {
+        if cancel_token.load(Ordering::Relaxed) {
+            return;
+        }
         let stem = Path::new(path_str)
             .file_stem()
             .unwrap_or_default()
@@ -140,7 +157,7 @@ pub fn export_client_delivery_pack(
         ) {
             let (bw, bh) = base_image.dimensions();
             // 1. Master Print
-            if config_arc.export_master_print {
+            if config_arc.export_master_print && !cancel_token.load(Ordering::Relaxed) {
                 let out_path = dir_print.join(format!("{}_Print.jpg", stem));
                 if crate::export::save_jpeg_high_quality_with_metadata(
                     &out_path,
@@ -149,12 +166,13 @@ pub fn export_client_delivery_pack(
                 )
                 .is_ok()
                 {
+                    if let Ok(mut g) = created_files.lock() { g.push(out_path); }
                     generated_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }
 
             // 2. Instagram 4:5
-            if config_arc.export_instagram_4x5 {
+            if config_arc.export_instagram_4x5 && !cancel_token.load(Ordering::Relaxed) {
                 let cropped = smart_crop_to_aspect(&base_image, 4.0 / 5.0);
                 let resized = crate::export::resize_in_linear_space(&cropped, 1080, 1350);
                 let out_path = dir_insta.join(format!("{}_Instagram_4x5.jpg", stem));
@@ -165,12 +183,13 @@ pub fn export_client_delivery_pack(
                 )
                 .is_ok()
                 {
+                    if let Ok(mut g) = created_files.lock() { g.push(out_path); }
                     generated_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }
 
             // 3. Stories / Reels 9:16
-            if config_arc.export_stories_9x16 {
+            if config_arc.export_stories_9x16 && !cancel_token.load(Ordering::Relaxed) {
                 let cropped = smart_crop_to_aspect(&base_image, 9.0 / 16.0);
                 let resized = crate::export::resize_in_linear_space(&cropped, 1080, 1920);
                 let out_path = dir_stories.join(format!("{}_Story_9x16.jpg", stem));
@@ -181,12 +200,13 @@ pub fn export_client_delivery_pack(
                 )
                 .is_ok()
                 {
+                    if let Ok(mut g) = created_files.lock() { g.push(out_path); }
                     generated_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }
 
             // 4. Watermarked Web Proofs
-            if config_arc.export_watermarked_proofs {
+            if config_arc.export_watermarked_proofs && !cancel_token.load(Ordering::Relaxed) {
                 let (tw, th) = if bw.max(bh) > 2048 {
                     let s = 2048.0 / bw.max(bh) as f32;
                     (((bw as f32 * s).round() as u32).max(1), ((bh as f32 * s).round() as u32).max(1))
@@ -203,12 +223,13 @@ pub fn export_client_delivery_pack(
                 )
                 .is_ok()
                 {
+                    if let Ok(mut g) = created_files.lock() { g.push(out_path); }
                     generated_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }
 
             // 5. Optimized WebP Gallery
-            if config_arc.export_webp_gallery {
+            if config_arc.export_webp_gallery && !cancel_token.load(Ordering::Relaxed) {
                 let (tw, th) = if bw.max(bh) > 2560 {
                     let s = 2560.0 / bw.max(bh) as f32;
                     (((bw as f32 * s).round() as u32).max(1), ((bh as f32 * s).round() as u32).max(1))
@@ -218,6 +239,7 @@ pub fn export_client_delivery_pack(
                 let webp_img = crate::export::resize_in_linear_space(&base_image, tw, th);
                 let out_path = dir_webp.join(format!("{}_Web.webp", stem));
                 if webp_img.to_rgb8().save_with_format(&out_path, image::ImageFormat::WebP).is_ok() {
+                    if let Ok(mut g) = created_files.lock() { g.push(out_path); }
                     generated_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -236,6 +258,22 @@ pub fn export_client_delivery_pack(
             }),
         );
     });
+
+    if cancel_token.load(Ordering::Relaxed) {
+        if let Ok(files) = created_files.lock() {
+            for f in files.iter() {
+                let _ = fs::remove_file(f);
+            }
+        }
+        for d in created_dirs.iter().rev() {
+            let _ = fs::remove_dir(d);
+        }
+        if !root_existed {
+            let _ = fs::remove_dir(&root_dir);
+        }
+        crate::ai::jobs::release(&config.paths);
+        return Err("Client delivery export cancelled by user — partial files rolled back".to_string());
+    }
 
     // Write interactive self-contained HTML client proofing portal
     let portal_html = format!(r#"<!DOCTYPE html>
@@ -674,7 +712,7 @@ pub fn generate_contact_sheet(
         return Err("No photos provided for contact sheet".to_string());
     }
 
-    let settings = crate::app::settings::load_settings(app_handle).unwrap_or_default();
+    let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
     let picked_set: std::collections::HashSet<String> = config
         .picked_paths
         .unwrap_or_default()
@@ -704,11 +742,9 @@ pub fn generate_contact_sheet(
                     String::new()
                 };
 
-                let img = if let Ok(base) = load_base_image_from_bytes(&file_bytes, &src_path.to_string_lossy(), false, &settings, None) {
-                    Some(base.resize(box_w, box_h, FilterType::Triangle).to_rgb8())
-                } else {
-                    None
-                };
+                let img = crate::export::render_edited_image_for_batch(path_str, &settings, &app_handle)
+                    .ok()
+                    .map(|base| base.resize(box_w, box_h, FilterType::Triangle).to_rgb8());
 
                 (img, badge)
             } else {

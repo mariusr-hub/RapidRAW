@@ -515,6 +515,14 @@ fn is_deprecated_preset_json(val: &Value) -> bool {
 /// - Deprecated adjustment keys inside matching curated presets are upgraded to canonical keys.
 /// - Migrates legacy `folder-sns-hdr` name to "HDRish styles".
 /// - Missing curated folders or curated child presets are appended cleanly.
+fn needs_analog_preset_refresh(id: &str, adj: &Value) -> bool {
+    (id == "kodak-ektar-100" || id == "kodak-ebx-100")
+        && adj
+            .get("saturation")
+            .and_then(|v| v.as_f64())
+            .is_some_and(|s| s >= 18.0)
+}
+
 pub fn merge_curated_presets(
     existing: Vec<PresetItem>,
     curated: Vec<PresetItem>,
@@ -542,7 +550,8 @@ pub fn merge_curated_presets(
         match item {
             PresetItem::Preset(p) => {
                 if let Some(fresh) = curated_by_id.get(&p.id)
-                    && is_deprecated_preset_json(&p.adjustments)
+                    && (is_deprecated_preset_json(&p.adjustments)
+                        || needs_analog_preset_refresh(&p.id, &p.adjustments))
                 {
                     p.adjustments = fresh.adjustments.clone();
                     modified = true;
@@ -555,7 +564,9 @@ pub fn merge_curated_presets(
                 }
                 for p in &mut f.children {
                     if let Some(fresh) = curated_by_id.get(&p.id) {
-                        if is_deprecated_preset_json(&p.adjustments) {
+                        if is_deprecated_preset_json(&p.adjustments)
+                            || needs_analog_preset_refresh(&p.id, &p.adjustments)
+                        {
                             p.adjustments = fresh.adjustments.clone();
                             modified = true;
                         }
@@ -645,9 +656,19 @@ pub fn load_presets(app_handle: AppHandle) -> Result<Vec<PresetItem>, String> {
             }
             _ => false,
         });
+        let needs_analog_refresh = parsed.iter().any(|item| match item {
+            PresetItem::Preset(p) => needs_analog_preset_refresh(&p.id, &p.adjustments),
+            PresetItem::Folder(f) => f
+                .children
+                .iter()
+                .any(|c| needs_analog_preset_refresh(&c.id, &c.adjustments)),
+        });
         if parsed.is_empty() {
             get_default_curated_presets()
-        } else if !settings.curated_presets_seeded_v1.unwrap_or(false) || needs_hdrish_rename {
+        } else if !settings.curated_presets_seeded_v1.unwrap_or(false)
+            || needs_hdrish_rename
+            || needs_analog_refresh
+        {
             let (merged, modified) = merge_curated_presets(parsed, get_default_curated_presets());
             if modified && let Ok(json_string) = serde_json::to_string_pretty(&merged) {
                 let _ = write_file_atomic(&path, json_string.as_bytes());

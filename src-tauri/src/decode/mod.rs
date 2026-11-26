@@ -2,6 +2,7 @@ pub mod apple_raw;
 pub mod as_shot;
 pub mod avif;
 pub mod baseline_exposure;
+pub mod camera_profile;
 pub mod demosaic;
 pub mod develop;
 pub mod formats;

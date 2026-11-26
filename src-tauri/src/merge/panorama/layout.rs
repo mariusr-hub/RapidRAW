@@ -14,14 +14,23 @@ pub struct EdgeCurves {
     step: f64,
     target_start: f64,
     target_end: f64,
+    wraps: bool,
 }
 
 impl EdgeCurves {
     fn eval(&self, position: f64) -> (f64, f64) {
-        let t = (position / self.step - 0.5).clamp(0.0, (self.start.len() - 1) as f64);
-        let i = (t.floor() as usize).min(self.start.len() - 1);
-        let j = (i + 1).min(self.start.len() - 1);
-        let f = t - i as f64;
+        let n = self.start.len();
+        let (i, j, f) = if self.wraps && n > 1 {
+            let t = (position / self.step - 0.5).rem_euclid(n as f64);
+            let i = (t.floor() as usize) % n;
+            let j = (i + 1) % n;
+            (i, j, t - t.floor())
+        } else {
+            let t = (position / self.step - 0.5).clamp(0.0, (n - 1) as f64);
+            let i = (t.floor() as usize).min(n - 1);
+            let j = (i + 1).min(n - 1);
+            (i, j, t - i as f64)
+        };
         (
             self.start[i] + (self.start[j] - self.start[i]) * f,
             self.end[i] + (self.end[j] - self.end[i]) * f,
@@ -123,7 +132,7 @@ pub fn covered_by_any(cameras: &[Camera], lens: &Lens, ray: &Vector3<f64>) -> bo
     })
 }
 
-fn smooth_envelope(raw: &[Option<f64>], take_max: bool) -> Option<Vec<f64>> {
+fn smooth_envelope(raw: &[Option<f64>], take_max: bool, wraps: bool) -> Option<Vec<f64>> {
     let n = raw.len();
     let first_valid = raw.iter().position(|v| v.is_some())?;
     let mut filled = vec![0.0; n];
@@ -137,13 +146,22 @@ fn smooth_envelope(raw: &[Option<f64>], take_max: bool) -> Option<Vec<f64>> {
     let radius = ((n as f64 * ENVELOPE_FRACTION).round() as usize).max(2);
     let envelope: Vec<f64> = (0..n)
         .map(|i| {
-            let lo = i.saturating_sub(radius);
-            let hi = (i + radius + 1).min(n);
-            let window = filled[lo..hi].iter().copied();
-            if take_max {
-                window.fold(f64::MIN, f64::max)
+            if wraps {
+                let mut acc = if take_max { f64::MIN } else { f64::MAX };
+                for d in -(radius as isize)..=(radius as isize) {
+                    let v = filled[(i as isize + d).rem_euclid(n as isize) as usize];
+                    acc = if take_max { acc.max(v) } else { acc.min(v) };
+                }
+                acc
             } else {
-                window.fold(f64::MAX, f64::min)
+                let lo = i.saturating_sub(radius);
+                let hi = (i + radius + 1).min(n);
+                let window = filled[lo..hi].iter().copied();
+                if take_max {
+                    window.fold(f64::MIN, f64::max)
+                } else {
+                    window.fold(f64::MAX, f64::min)
+                }
             }
         })
         .collect();
@@ -159,7 +177,11 @@ fn smooth_envelope(raw: &[Option<f64>], take_max: bool) -> Option<Vec<f64>> {
                 let mut sum = 0.0;
                 let mut weight = 0.0;
                 for (j, w) in (-k..=k).zip(weights.iter()) {
-                    let idx = (i + j).clamp(0, n as isize - 1) as usize;
+                    let idx = if wraps {
+                        (i + j).rem_euclid(n as isize) as usize
+                    } else {
+                        (i + j).clamp(0, n as isize - 1) as usize
+                    };
                     sum += envelope[idx] * w;
                     weight += w;
                 }
@@ -174,14 +196,14 @@ fn smooth_envelope(raw: &[Option<f64>], take_max: bool) -> Option<Vec<f64>> {
     )
 }
 
-fn column_curves(mask: &Mask) -> Option<EdgeCurves> {
-    edge_curves(mask.width, mask.height, mask.scale, |x, y| {
+fn column_curves(mask: &Mask, wraps: bool) -> Option<EdgeCurves> {
+    edge_curves(mask.width, mask.height, mask.scale, wraps, |x, y| {
         mask.data[y * mask.width + x]
     })
 }
 
 fn row_curves(mask: &Mask) -> Option<EdgeCurves> {
-    edge_curves(mask.height, mask.width, mask.scale, |y, x| {
+    edge_curves(mask.height, mask.width, mask.scale, false, |y, x| {
         mask.data[y * mask.width + x]
     })
 }
@@ -190,6 +212,7 @@ fn edge_curves(
     lines: usize,
     length: usize,
     scale: f64,
+    wraps: bool,
     covered: impl Fn(usize, usize) -> bool,
 ) -> Option<EdgeCurves> {
     let starts: Vec<Option<f64>> = (0..lines)
@@ -203,10 +226,15 @@ fn edge_curves(
                 .map(|i| i as f64 + 1.0)
         })
         .collect();
-    build_curves(&starts, &ends, scale)
+    build_curves(&starts, &ends, scale, wraps)
 }
 
-fn build_curves(starts: &[Option<f64>], ends: &[Option<f64>], scale: f64) -> Option<EdgeCurves> {
+fn build_curves(
+    starts: &[Option<f64>],
+    ends: &[Option<f64>],
+    scale: f64,
+    wraps: bool,
+) -> Option<EdgeCurves> {
     let mut spans: Vec<f64> = starts
         .iter()
         .zip(ends)
@@ -237,8 +265,8 @@ fn build_curves(starts: &[Option<f64>], ends: &[Option<f64>], scale: f64) -> Opt
     };
     let starts = inner(starts);
     let ends = inner(ends);
-    let start = smooth_envelope(&starts, true)?;
-    let end = smooth_envelope(&ends, false)?;
+    let start = smooth_envelope(&starts, true, wraps)?;
+    let end = smooth_envelope(&ends, false, wraps)?;
     let target_start = starts.iter().flatten().fold(f64::MAX, |a, &b| a.min(b));
     let target_end = ends.iter().flatten().fold(f64::MIN, |a, &b| a.max(b));
     Some(EdgeCurves {
@@ -247,6 +275,7 @@ fn build_curves(starts: &[Option<f64>], ends: &[Option<f64>], scale: f64) -> Opt
         step: 1.0 / scale,
         target_start: target_start / scale,
         target_end: target_end / scale,
+        wraps,
     })
 }
 
@@ -323,7 +352,7 @@ pub fn plan_layout(
     };
 
     if layout.amount > 0.0 {
-        layout.vertical = column_curves(&union);
+        layout.vertical = column_curves(&union, layout.canvas.wraps);
         if !layout.canvas.wraps {
             let partially_warped = Mask::from_fn(gw, gh, grid_scale, |x, y| {
                 let (cx, cy) = layout.canvas_point(x, y);

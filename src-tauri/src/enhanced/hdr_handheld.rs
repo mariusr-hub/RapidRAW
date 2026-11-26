@@ -1458,21 +1458,29 @@ pub fn tone_map_virtual_exposure_pyramid_with_progress<R: tauri::Runtime>(
     if profile != HdrToneProfile::Natural {
         apply_stock_grade_tone_profile(&mut out_img, profile);
     } else {
-        // Measure post-fusion 0.2% black and 99.8% white points so the dynamic range uses the full [0, 1] display span
+        // Measure post-fusion 0.2% black and 99.85% max-channel white points so the dynamic range
+        // uses the full [0, 1] display span without clipping saturated skies/highlights.
         let raw_out = out_img.as_raw();
         let mut post_luma: Vec<f32> = Vec::with_capacity(num_px / step + 1);
+        let mut post_max: Vec<f32> = Vec::with_capacity(num_px / step + 1);
         for i in (0..num_px).step_by(step) {
             let idx = i * 3;
-            let yl = 0.2126 * raw_out[idx] + 0.7152 * raw_out[idx + 1] + 0.0722 * raw_out[idx + 2];
-            if yl.is_finite() {
+            let r = raw_out[idx];
+            let g = raw_out[idx + 1];
+            let b = raw_out[idx + 2];
+            let yl = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let mx = r.max(g).max(b);
+            if yl.is_finite() && mx.is_finite() {
                 post_luma.push(yl);
+                post_max.push(mx);
             }
         }
         post_luma.sort_unstable_by(|a, b| a.total_cmp(b));
+        post_max.sort_unstable_by(|a, b| a.total_cmp(b));
         let (bp, wp) = if !post_luma.is_empty() {
             let n_pl = post_luma.len();
             let b = (post_luma[(n_pl as f32 * 0.002) as usize] * 0.75).min(0.05);
-            let w_pt = post_luma[((n_pl as f32 * 0.9985) as usize).min(n_pl - 1)].max(0.82);
+            let w_pt = post_max[((n_pl as f32 * 0.9985) as usize).min(n_pl - 1)].max(0.82);
             (b, w_pt)
         } else {
             (0.0, 1.0)

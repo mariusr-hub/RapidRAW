@@ -1,19 +1,28 @@
 mod exposure_fusion;
+mod local_laplacian;
 mod radiance;
 
 use crate::decode::formats::is_raw_file;
+use crate::enhanced::hdr_fusion::{DeghostSensitivity, HdrMergeOptions, HdrToneProfile};
+use crate::enhanced::hdr_handheld::tone_map_virtual_exposure_pyramid;
 use crate::merge::align::{
     AlignmentFeatures, downscaled, estimate_transform, max_displacement, warp,
 };
-use crate::merge::output::{MergeOutput, MergePreview, Rendition, encode_jpeg_base64};
+use crate::merge::output::{
+    MergeOutput, MergePreview, Rendition, compute_hdr_peak_nits, encode_hdr10_pq_png_base64,
+    encode_hdr_headroom_heatmap_base64, encode_jpeg_base64,
+};
 use crate::merge::raster::{Raster, Rect, crop, crop_rects, fit_size, map_pixels, resize_area};
 use crate::merge::source::{SourceLoader, ensure_same_size, file_name};
 use crate::merge::{MergeContext, MergeSession, parse_settings};
-use crate::metadata::exif_processing::{read_exposure_time_secs, read_iso};
-use crate::render::color_space::{luminance, srgb_encode};
+use crate::metadata::exif_processing::{read_exposure_time_secs, read_f_number, read_iso, read_rrexif_sidecar};
+use crate::render::color_space::{OutputTransform, fit_gamut, luminance, srgb_encode, working_to_srgb};
 use exposure_fusion::ExposureFusion;
+use glam::Vec3;
+use image::Rgb32FImage;
+use local_laplacian::{LocalLaplacianOptions, fast_local_laplacian_tonemap};
 use nalgebra::Matrix3;
-use radiance::{Accumulator, FrameRole, PreviewFrame, exposure_ratio, ghost_masks};
+use radiance::{Accumulator, FrameRole, PreviewFrame, exposure_ratio, ghost_masks, ghost_masks_optical_flow};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,16 +34,162 @@ const IDENTITY_DISPLACEMENT: f64 = 0.3;
 const CLIP_PERCENTILE: f64 = 0.999;
 const MAX_RATIO_CORRECTION: f64 = 2.0;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeghostMode {
+    Fast,
+    #[default]
+    OpticalFlow,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HdrSettings {
     pub auto_crop: bool,
+    pub half_size: bool,
+    pub apply_edits: bool,
+    pub profile: String,
+    pub hdr_strength: f32,
+    pub deghost_sensitivity: DeghostSensitivity,
+    pub deghost_mode: DeghostMode,
+    #[serde(default)]
+    pub preview_mode: String,
+    pub exposure_bias: f32,
+    pub highlight_recovery: f32,
+    pub shadow_lift: f32,
+    pub detail_boost: f32,
 }
 
 impl Default for HdrSettings {
     fn default() -> Self {
-        HdrSettings { auto_crop: true }
+        HdrSettings {
+            auto_crop: true,
+            half_size: false,
+            apply_edits: true,
+            profile: "natural".to_string(),
+            hdr_strength: 100.0,
+            deghost_sensitivity: DeghostSensitivity::Medium,
+            deghost_mode: DeghostMode::OpticalFlow,
+            preview_mode: "sdr".to_string(),
+            exposure_bias: 0.0,
+            highlight_recovery: 50.0,
+            shadow_lift: 30.0,
+            detail_boost: 1.05,
+        }
     }
+}
+
+fn parse_tone_profile(profile: &str) -> Option<HdrToneProfile> {
+    match profile.to_lowercase().as_str() {
+        "agxscene" | "agx_scene" | "agx" => None,
+        "interior" => Some(HdrToneProfile::Interior),
+        "dramatic" => Some(HdrToneProfile::Dramatic),
+        "vivid" => Some(HdrToneProfile::Vivid),
+        _ => Some(HdrToneProfile::Natural),
+    }
+}
+
+pub(crate) fn tonemap_hdr_raster(
+    linear_working: &Raster,
+    base_exposure: f32,
+    profile: &str,
+    hdr_strength: f32,
+    exposure_bias: f32,
+    highlight_recovery: f32,
+    shadow_lift: f32,
+    detail_boost: f32,
+) -> (Raster, Rendition) {
+    let use_local_laplacian = matches!(
+        profile.to_lowercase().as_str(),
+        "locallaplacian" | "local_laplacian" | "laplacian"
+    );
+    let tone_profile = if use_local_laplacian {
+        HdrToneProfile::Natural
+    } else {
+        match parse_tone_profile(profile) {
+            Some(p) => p,
+            None => {
+                return (
+                    linear_working.clone(),
+                    Rendition::Scene {
+                        exposure: base_exposure + exposure_bias,
+                        agx: true,
+                    },
+                );
+            }
+        }
+    };
+
+    let (w, h) = (linear_working.width, linear_working.height);
+    let gain = base_exposure.exp2();
+    let to_srgb = working_to_srgb();
+    let srgb_out = OutputTransform::srgb(true);
+    let srgb_lin_raw: Vec<f32> = linear_working
+        .data
+        .par_chunks_exact(3)
+        .flat_map_iter(|p| {
+            let clean = Vec3::from_array([
+                if p[0].is_finite() { p[0].max(0.0) } else { 0.0 },
+                if p[1].is_finite() { p[1].max(0.0) } else { 0.0 },
+                if p[2].is_finite() { p[2].max(0.0) } else { 0.0 },
+            ]);
+            let v = fit_gamut((to_srgb * (clean * gain)).to_array(), &srgb_out.compression);
+            [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)]
+        })
+        .collect();
+    let srgb_lin_img = Rgb32FImage::from_raw(w as u32, h as u32, srgb_lin_raw)
+        .expect("HDR sRGB buffer matches dimensions");
+
+    let tm_img = if use_local_laplacian {
+        let ll_opts = LocalLaplacianOptions {
+            sigma_r: 0.16,
+            alpha: (1.0 - (detail_boost - 1.0) * 0.65).clamp(0.35, 1.4),
+            beta: 0.45,
+            exposure_bias,
+            shadow_lift,
+            highlight_recovery,
+        };
+        fast_local_laplacian_tonemap(&srgb_lin_img, &ll_opts)
+    } else {
+        let opts = HdrMergeOptions {
+            profile: Some(tone_profile),
+            exposure_bias: Some(exposure_bias),
+            highlight_recovery: Some(highlight_recovery),
+            shadow_lift: Some(shadow_lift),
+            detail_boost: Some(detail_boost),
+            ..Default::default()
+        };
+        tone_map_virtual_exposure_pyramid(&srgb_lin_img, &opts)
+    };
+    let t = (hdr_strength / 100.0).clamp(0.0, 1.0);
+    if t >= 0.999 {
+        return (
+            Raster::from_data(w, h, 3, tm_img.into_raw()),
+            Rendition::SrgbDisplay,
+        );
+    }
+
+    // Baseline scene-referred AgX sRGB rendition (for hdr_strength < 100%)
+    let agx_tm = crate::render::agx::agx();
+    let agx_out = OutputTransform::srgb(false);
+    let total_gain = (base_exposure + exposure_bias).exp2();
+    let mut blended = tm_img.into_raw();
+    blended
+        .par_chunks_exact_mut(3)
+        .zip(linear_working.data.par_chunks_exact(3))
+        .for_each(|(tm, lin)| {
+            let clean = Vec3::from_array([
+                if lin[0].is_finite() { lin[0].max(0.0) } else { 0.0 },
+                if lin[1].is_finite() { lin[1].max(0.0) } else { 0.0 },
+                if lin[2].is_finite() { lin[2].max(0.0) } else { 0.0 },
+            ]);
+            let neutral = agx_out.apply_srgb_encoded(agx_tm.tonemap(clean * total_gain).to_array());
+            for c in 0..3 {
+                tm[c] = (neutral[c] + (tm[c] - neutral[c]) * t).clamp(0.0, 1.0);
+            }
+        });
+
+    (Raster::from_data(w, h, 3, blended), Rendition::SrgbDisplay)
 }
 
 struct Frame {
@@ -61,8 +216,13 @@ pub struct HdrSession {
     width: usize,
     height: usize,
     unaligned: usize,
+    half_size: bool,
+    apply_edits: bool,
     name_source: String,
     merged_preview: Raster,
+    deghost_sensitivity: DeghostSensitivity,
+    deghost_mode: DeghostMode,
+    reference_base64: Option<String>,
 }
 
 struct Loaded {
@@ -77,7 +237,8 @@ struct Loaded {
 fn exif_exposure(path: &str, bytes: &[u8]) -> Option<f64> {
     let time = read_exposure_time_secs(path, bytes)? as f64;
     let iso = read_iso(path, bytes).unwrap_or(100) as f64;
-    (time > 0.0 && iso > 0.0).then_some(time * iso)
+    let f_number = read_f_number(path, bytes).unwrap_or(5.6).max(0.5) as f64;
+    (time > 0.0 && iso > 0.0).then_some((time * iso) / (f_number * f_number))
 }
 
 fn median(mut values: Vec<f32>) -> f32 {
@@ -122,8 +283,10 @@ fn load_frames(
     context: &MergeContext,
 ) -> Result<Vec<Loaded>, String> {
     let loaded = loader.load_all(paths, |_, path| {
+        context.check_cancelled()?;
         context.report(format!("Processing '{}'", file_name(path)));
         let decoded = loader.decode(path)?;
+        context.check_cancelled()?;
         let exif_exposure = exif_exposure(path, &decoded.file_bytes);
         let image = decoded.image;
         let (width, height) = (image.width, image.height);
@@ -247,7 +410,12 @@ fn refine_exposures(clip: f32, frames: &mut [Frame], reference: usize) {
     }
 }
 
-fn merge_radiance(frames: &mut [Frame], reference: usize) -> (Merge, Raster) {
+fn merge_radiance(
+    frames: &mut [Frame],
+    reference: usize,
+    sensitivity: DeghostSensitivity,
+    deghost_mode: DeghostMode,
+) -> (Merge, Raster) {
     let clip = frames
         .iter()
         .map(|f| {
@@ -264,6 +432,16 @@ fn merge_radiance(frames: &mut [Frame], reference: usize) -> (Merge, Raster) {
         .fold(0.0f32, f32::max)
         .max(1e-3);
     refine_exposures(clip, frames, reference);
+    recompute_radiance_preview(clip, frames, reference, sensitivity, deghost_mode)
+}
+
+fn recompute_radiance_preview(
+    clip: f32,
+    frames: &[Frame],
+    reference: usize,
+    sensitivity: DeghostSensitivity,
+    deghost_mode: DeghostMode,
+) -> (Merge, Raster) {
     let previews: Vec<PreviewFrame> = (0..frames.len())
         .map(|i| PreviewFrame {
             image: &frames[i].preview,
@@ -271,13 +449,52 @@ fn merge_radiance(frames: &mut [Frame], reference: usize) -> (Merge, Raster) {
             role: frame_role(frames, reference, i),
         })
         .collect();
-    let masks = ghost_masks(clip, &previews, reference);
+    let masks = match (sensitivity, deghost_mode) {
+        (DeghostSensitivity::Off, _) => (0..frames.len()).map(|_| None).collect(),
+        (_, DeghostMode::Fast) => ghost_masks(clip, &previews, reference, sensitivity),
+        (_, DeghostMode::OpticalFlow) => {
+            ghost_masks_optical_flow(clip, &previews, reference, sensitivity)
+        }
+    };
     let (pw, ph) = (frames[0].preview.width, frames[0].preview.height);
     let mut accumulator = Accumulator::new(pw, ph);
     for (frame, mask) in previews.iter().zip(&masks) {
         accumulator.add(clip, frame.role, frame.image, frame.valid, mask.as_ref());
     }
     (Merge::Radiance { clip, masks }, accumulator.finish())
+}
+
+fn physical_exif_exposure(path: &str) -> Option<f64> {
+    let (source_path, _) = crate::library::sidecars::parse_virtual_path(path);
+    let path_str = source_path.to_string_lossy();
+    let mut exp_t = None;
+    let mut iso = None;
+    let mut f_num = None;
+
+    if let Some(map) = read_rrexif_sidecar(&source_path) {
+        exp_t = read_exposure_time_secs(&path_str, &[]);
+        iso = read_iso(&path_str, &[]);
+        f_num = map
+            .get("FNumber")
+            .and_then(|s| s.trim_start_matches("f/").trim().parse::<f32>().ok());
+    }
+    if exp_t.is_none() || iso.is_none() || f_num.is_none() {
+        if let Ok(mapped) = crate::library::file_ops::read_file_mapped(&source_path) {
+            if exp_t.is_none() {
+                exp_t = read_exposure_time_secs(&path_str, &mapped);
+            }
+            if iso.is_none() {
+                iso = read_iso(&path_str, &mapped);
+            }
+            if f_num.is_none() {
+                f_num = read_f_number(&path_str, &mapped);
+            }
+        }
+    }
+    let t = exp_t? as f64;
+    let i = iso.unwrap_or(100) as f64;
+    let f = f_num.unwrap_or(5.6).max(0.5) as f64;
+    (t > 0.0 && i > 0.0).then_some((t * i) / (f * f))
 }
 
 fn fuse_previews(frames: &[Frame]) -> Raster {
@@ -309,9 +526,18 @@ fn add_into(total: &mut [f32], map: &[f32]) {
         .for_each(|(t, &v)| *t += v);
 }
 
-pub fn build_session(paths: &[String], context: &MergeContext) -> Result<HdrSession, String> {
+pub fn build_session(
+    paths: &[String],
+    half_size: bool,
+    apply_edits: bool,
+    context: &MergeContext,
+) -> Result<HdrSession, String> {
     let scene = paths.iter().all(is_raw_file);
-    let loader = context.loader(scene);
+    let loader = if scene && paths.len() >= 2 {
+        context.loader_for_hdr_brackets(true, half_size, apply_edits)
+    } else {
+        context.loader_with_options(scene, half_size, apply_edits)
+    };
     context.report("Loading images...");
     let loaded = load_frames(&loader, paths, context)?;
     let exposures: Vec<f64> = if loaded.iter().all(|l| l.exif_exposure.is_some()) {
@@ -324,17 +550,22 @@ pub fn build_session(paths: &[String], context: &MergeContext) -> Result<HdrSess
     };
     let (width, height) = (loaded[0].width, loaded[0].height);
 
+    context.check_cancelled()?;
     context.report("Aligning images...");
     let (mut frames, reference, unaligned) = align_frames(loaded, exposures);
 
+    context.check_cancelled()?;
     context.report("Merging exposures...");
+    let default_deghost = DeghostSensitivity::Medium;
+    let default_deghost_mode = DeghostMode::OpticalFlow;
     let (merge, merged_preview) = if scene {
-        merge_radiance(&mut frames, reference)
+        merge_radiance(&mut frames, reference, default_deghost, default_deghost_mode)
     } else {
         (Merge::Fusion, fuse_previews(&frames))
     };
     let rendition = Rendition::for_sources(scene, &frames[reference].path, context.settings)
         .with_agx(context.settings);
+    let reference_base64 = encode_jpeg_base64(&rendition.to_srgb8(&frames[reference].preview)).ok();
 
     Ok(HdrSession {
         frames,
@@ -344,9 +575,92 @@ pub fn build_session(paths: &[String], context: &MergeContext) -> Result<HdrSess
         width,
         height,
         unaligned,
+        half_size,
+        apply_edits,
         name_source: paths[0].clone(),
         merged_preview,
+        deghost_sensitivity: default_deghost,
+        deghost_mode: default_deghost_mode,
+        reference_base64,
     })
+}
+
+pub(crate) struct PreviewHdrPanel {
+    pub preview: Raster,
+    pub full_width: usize,
+    pub full_height: usize,
+    pub ref_exif_exposure: Option<f64>,
+    pub metadata_source: String,
+}
+
+pub(crate) fn build_preview_hdr_panel(
+    paths: &[String],
+    half_size: bool,
+    apply_edits: bool,
+    context: &MergeContext,
+) -> Result<PreviewHdrPanel, String> {
+    if paths.len() == 1 {
+        let scene = is_raw_file(&paths[0]);
+        let loader = context.loader_with_options(scene, half_size, apply_edits);
+        let decoded = loader.decode(&paths[0])?;
+        let (full_width, full_height) = (decoded.image.width, decoded.image.height);
+        let (pw, ph) = fit_size(full_width, full_height, PREVIEW_MAX_DIMENSION);
+        let preview = resize_area(&decoded.image, pw, ph);
+        return Ok(PreviewHdrPanel {
+            preview,
+            full_width,
+            full_height,
+            ref_exif_exposure: physical_exif_exposure(&paths[0]),
+            metadata_source: paths[0].clone(),
+        });
+    }
+    let session = build_session(paths, half_size, apply_edits, context)?;
+    let metadata_source = session.frames[session.reference].path.clone();
+    Ok(PreviewHdrPanel {
+        preview: session.merged_preview,
+        full_width: session.width,
+        full_height: session.height,
+        ref_exif_exposure: physical_exif_exposure(&metadata_source),
+        metadata_source,
+    })
+}
+
+pub(crate) fn build_linear_hdr_panel(
+    paths: &[String],
+    half_size: bool,
+    apply_edits: bool,
+    gain_scale: f32,
+    context: &MergeContext,
+) -> Result<(Raster, Rendition, String), String> {
+    if paths.len() == 1 {
+        let scene = is_raw_file(&paths[0]);
+        let loader = context.loader_with_options(scene, half_size, apply_edits);
+        let mut decoded = loader.decode(&paths[0])?;
+        if (gain_scale - 1.0).abs() > 1e-4 {
+            decoded.image.data.par_iter_mut().for_each(|v| *v *= gain_scale);
+        }
+        let rendition = Rendition::for_sources(scene, &paths[0], context.settings)
+            .with_agx(context.settings);
+        return Ok((decoded.image, rendition, paths[0].clone()));
+    }
+    let session = build_session(paths, half_size, apply_edits, context)?;
+    let mut merged = match &session.merge {
+        Merge::Radiance { clip, masks } => session.render_radiance(
+            *clip,
+            masks,
+            &context.loader_for_hdr_brackets(true, session.half_size, session.apply_edits),
+            context,
+        )?,
+        Merge::Fusion => session.render_fusion(
+            &context.loader_with_options(false, session.half_size, session.apply_edits),
+            context,
+        )?,
+    };
+    if (gain_scale - 1.0).abs() > 1e-4 {
+        merged.data.par_iter_mut().for_each(|v| *v *= gain_scale);
+    }
+    let metadata_source = session.frames[session.reference].path.clone();
+    Ok((merged, session.rendition, metadata_source))
 }
 
 impl HdrSession {
@@ -385,6 +699,7 @@ impl HdrSession {
         let accumulator = Mutex::new(Accumulator::new(self.width, self.height));
         let paths: Vec<String> = self.frames.iter().map(|f| f.path.clone()).collect();
         loader.load_all(&paths, |index, path| {
+            context.check_cancelled()?;
             context.report(format!("Merging '{}'", file_name(path)));
             let (aligned, valid) = self.load_aligned(loader, index)?;
             accumulator.lock().unwrap().add(
@@ -407,40 +722,183 @@ impl HdrSession {
         loader: &SourceLoader,
         context: &MergeContext,
     ) -> Result<Raster, String> {
+        const SINGLE_PASS_FUSION_BUDGET_BYTES: usize = 1_500_000_000;
         let paths: Vec<String> = self.frames.iter().map(|f| f.path.clone()).collect();
-        let total = Mutex::new(vec![0.0f32; self.width * self.height]);
-        loader.load_all(&paths, |index, path| {
-            context.report(format!("Weighting '{}'", file_name(path)));
-            let (aligned, valid) = self.load_aligned(loader, index)?;
-            let weights = exposure_fusion::weights(&aligned, &valid);
-            add_into(&mut total.lock().unwrap(), &weights);
-            Ok(())
-        })?;
-        let total = total
-            .into_inner()
-            .map_err(|_| "Merging the images failed unexpectedly.".to_string())?;
-        let fusion = Mutex::new(ExposureFusion::new(self.width, self.height));
-        loader.load_all(&paths, |index, path| {
-            context.report(format!("Blending '{}'", file_name(path)));
-            let (aligned, valid) = self.load_aligned(loader, index)?;
-            let weights = exposure_fusion::weights(&aligned, &valid);
-            fusion.lock().unwrap().add(&aligned, &weights, &total);
-            Ok(())
-        })?;
-        Ok(fusion
-            .into_inner()
-            .map_err(|_| "Merging the images failed unexpectedly.".to_string())?
-            .finish())
+        let estimated_bytes = paths
+            .len()
+            .saturating_mul(self.width)
+            .saturating_mul(self.height)
+            .saturating_mul(16);
+
+        if estimated_bytes <= SINGLE_PASS_FUSION_BUDGET_BYTES {
+            let aligned_frames = Mutex::new(Vec::with_capacity(paths.len()));
+            let total = Mutex::new(vec![0.0f32; self.width * self.height]);
+            loader.load_all(&paths, |index, path| {
+                context.check_cancelled()?;
+                context.report(format!("Aligning & Weighting '{}'", file_name(path)));
+                let (aligned, valid) = self.load_aligned(loader, index)?;
+                let weights = exposure_fusion::weights(&aligned, &valid);
+                add_into(&mut total.lock().unwrap(), &weights);
+                aligned_frames.lock().unwrap().push((aligned, weights));
+                Ok(())
+            })?;
+            let total = total
+                .into_inner()
+                .map_err(|_| "Merging the images failed unexpectedly.".to_string())?;
+            let mut fusion = ExposureFusion::new(self.width, self.height);
+            for (aligned, weights) in aligned_frames
+                .into_inner()
+                .map_err(|_| "Merging the images failed unexpectedly.".to_string())?
+            {
+                context.check_cancelled()?;
+                fusion.add(&aligned, &weights, &total);
+            }
+            Ok(fusion.finish())
+        } else {
+            // Streaming 2-pass fallback for huge multi-frame TIFF stacks (keeps only 1 frame in RAM).
+            let total = Mutex::new(vec![0.0f32; self.width * self.height]);
+            loader.load_all(&paths, |index, path| {
+                context.check_cancelled()?;
+                context.report(format!("Weighting '{}'", file_name(path)));
+                let (aligned, valid) = self.load_aligned(loader, index)?;
+                let weights = exposure_fusion::weights(&aligned, &valid);
+                add_into(&mut total.lock().unwrap(), &weights);
+                Ok(())
+            })?;
+            let total = total
+                .into_inner()
+                .map_err(|_| "Merging the images failed unexpectedly.".to_string())?;
+            let fusion = Mutex::new(ExposureFusion::new(self.width, self.height));
+            loader.load_all(&paths, |index, path| {
+                context.check_cancelled()?;
+                context.report(format!("Blending '{}'", file_name(path)));
+                let (aligned, valid) = self.load_aligned(loader, index)?;
+                let weights = exposure_fusion::weights(&aligned, &valid);
+                fusion.lock().unwrap().add(&aligned, &weights, &total);
+                Ok(())
+            })?;
+            Ok(fusion
+                .into_inner()
+                .map_err(|_| "Merging the images failed unexpectedly.".to_string())?
+                .finish())
+        }
     }
+}
+
+impl HdrSession {
+    fn sync_radiance_deghost(&mut self, settings: &HdrSettings) {
+        if let Merge::Radiance { clip, .. } = self.merge
+            && (settings.deghost_sensitivity != self.deghost_sensitivity
+                || settings.deghost_mode != self.deghost_mode)
+        {
+            let (merge, preview_raster) = recompute_radiance_preview(
+                clip,
+                &self.frames,
+                self.reference,
+                settings.deghost_sensitivity,
+                settings.deghost_mode,
+            );
+            self.merge = merge;
+            self.merged_preview = preview_raster;
+            self.deghost_sensitivity = settings.deghost_sensitivity;
+            self.deghost_mode = settings.deghost_mode;
+        }
+    }
+}
+
+fn build_ghost_overlay_base64(
+    masks: &[Option<Raster>],
+    display: &image::RgbImage,
+    rect: &Rect,
+) -> Option<String> {
+    let cropped_masks: Vec<Raster> = masks
+        .iter()
+        .filter_map(|m| m.as_ref().map(|r| crop(r, rect)))
+        .collect();
+    if cropped_masks.is_empty() {
+        return None;
+    }
+    let w = display.width() as usize;
+    let h = display.height() as usize;
+    let mut out = display.clone();
+    let raw = out.as_mut();
+    for y in 0..h {
+        for x in 0..w {
+            let mut max_mask = 0.0f32;
+            for m in &cropped_masks {
+                if x < m.width && y < m.height {
+                    max_mask = max_mask.max(m.get(x, y, 0));
+                }
+            }
+            let alpha = (max_mask * 0.65).clamp(0.0, 0.72);
+            if alpha > 0.01 {
+                let idx = (y * w + x) * 3;
+                let inv = 1.0 - alpha;
+                raw[idx] = (raw[idx] as f32 * inv + 245.0 * alpha).round() as u8;
+                raw[idx + 1] = (raw[idx + 1] as f32 * inv + 55.0 * alpha).round() as u8;
+                raw[idx + 2] = (raw[idx + 2] as f32 * inv + 70.0 * alpha).round() as u8;
+            }
+        }
+    }
+    encode_jpeg_base64(&out).ok()
 }
 
 impl MergeSession for HdrSession {
     fn preview(&mut self, settings: &Value) -> Result<MergePreview, String> {
         let settings: HdrSettings = parse_settings(settings)?;
+        self.sync_radiance_deghost(&settings);
+        let is_scene = matches!(self.merge, Merge::Radiance { .. });
         let (rect, full) = self.crop_rects(&settings);
-        let display = self.rendition.to_srgb8(&crop(&self.merged_preview, &rect));
+        let cropped_preview = crop(&self.merged_preview, &rect);
+        let (tm_raster, tm_rendition) = tonemap_hdr_raster(
+            &cropped_preview,
+            self.rendition.scene_exposure(),
+            &settings.profile,
+            settings.hdr_strength,
+            settings.exposure_bias,
+            settings.highlight_recovery,
+            settings.shadow_lift,
+            settings.detail_boost,
+        );
+        let display = tm_rendition.to_srgb8(&tm_raster);
+        let overlay_base64 = match &self.merge {
+            Merge::Radiance { masks, .. } => build_ghost_overlay_base64(masks, &display, &rect),
+            Merge::Fusion => None,
+        };
+        let (hdr_preview_base64, headroom_map_base64, hdr_peak_nits) = if is_scene {
+            let pq_exp = self.rendition.scene_exposure() + settings.exposure_bias;
+            let peak = compute_hdr_peak_nits(&cropped_preview, pq_exp);
+            let mode = settings.preview_mode.trim().to_ascii_lowercase();
+            let hdr_b64 = if mode == "hdr10" {
+                encode_hdr10_pq_png_base64(&cropped_preview, pq_exp)
+                    .ok()
+                    .map(|(b64, _)| b64)
+            } else {
+                None
+            };
+            let headroom = if mode == "headroom" {
+                encode_hdr_headroom_heatmap_base64(&cropped_preview, pq_exp).ok()
+            } else {
+                None
+            };
+            (hdr_b64, headroom, Some(peak))
+        } else {
+            (None, None, None)
+        };
+        let ref_cropped = if self.reference_base64.is_some() {
+            let ref_crop = crop(&self.frames[self.reference].preview, &rect);
+            encode_jpeg_base64(&self.rendition.to_srgb8(&ref_crop)).ok()
+        } else {
+            None
+        };
         Ok(MergePreview {
             base64: encode_jpeg_base64(&display)?,
+            overlay_base64,
+            reference_base64: ref_cropped,
+            hdr_preview_base64,
+            headroom_map_base64,
+            hdr_peak_nits,
+            is_scene_referred: is_scene,
             width: full.width,
             height: full.height,
             image_count: self.frames.len(),
@@ -451,21 +909,137 @@ impl MergeSession for HdrSession {
 
     fn render(&mut self, settings: &Value, context: &MergeContext) -> Result<MergeOutput, String> {
         let settings: HdrSettings = parse_settings(settings)?;
+        self.sync_radiance_deghost(&settings);
+        let is_scene = matches!(self.merge, Merge::Radiance { .. });
         let merged = match &self.merge {
-            Merge::Radiance { clip, masks } => {
-                self.render_radiance(*clip, masks, &context.loader(true), context)?
-            }
-            Merge::Fusion => self.render_fusion(&context.loader(false), context)?,
+            Merge::Radiance { clip, masks } => self.render_radiance(
+                *clip,
+                masks,
+                &context.loader_for_hdr_brackets(true, self.half_size, settings.apply_edits),
+                context,
+            )?,
+            Merge::Fusion => self.render_fusion(
+                &context.loader_with_options(false, self.half_size, settings.apply_edits),
+                context,
+            )?,
         };
         let (_, rect) = self.crop_rects(&settings);
+        let mut final_image = crop(&merged, &rect);
+        if settings.half_size && !self.half_size {
+            final_image = resize_area(
+                &final_image,
+                (final_image.width / 2).max(1),
+                (final_image.height / 2).max(1),
+            );
+        }
+        let base_exposure = self.rendition.scene_exposure();
+        let (output_image, output_rendition, linear_scene) = {
+            let (tm_raster, tm_rendition) = tonemap_hdr_raster(
+                &final_image,
+                base_exposure,
+                &settings.profile,
+                settings.hdr_strength,
+                settings.exposure_bias,
+                settings.highlight_recovery,
+                settings.shadow_lift,
+                settings.detail_boost,
+            );
+            (tm_raster, tm_rendition, is_scene.then_some(final_image))
+        };
         Ok(MergeOutput {
-            image: crop(&merged, &rect),
-            rendition: self.rendition,
+            image: output_image,
+            linear_scene,
+            scene_exposure: base_exposure,
+            hdr_exposure_bias: settings.exposure_bias,
+            rendition: output_rendition,
             suffix: "HDR",
             name_source: self.name_source.clone(),
             metadata_source: self.frames[self.reference].path.clone(),
             keeps_lens_geometry: true,
-            tone_mapper: matches!(self.merge, Merge::Radiance { .. }).then_some("agx"),
+            is_scene_referred: is_scene,
+            is_360_equirectangular: false,
+            tone_mapper: is_scene.then_some("agx"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tonemap_hdr_raster_no_highlight_washout_at_partial_strength() {
+        let (w, h) = (32usize, 32usize);
+        let build_scene = |sky_rgb: [f32; 3]| -> Raster {
+            let mut data = Vec::with_capacity(w * h * 3);
+            for y in 0..h {
+                for x in 0..w {
+                    if y < 2 && x < 6 {
+                        // Small specular glint (~1.2% of pixels) to anchor the 99.85th percentile white point
+                        data.extend_from_slice(&[8.0, 8.0, 8.0]);
+                    } else if y < h / 4 {
+                        data.extend_from_slice(&sky_rgb);
+                    } else if y < (3 * h) / 4 {
+                        // Neutral 18% gray midtone
+                        data.extend_from_slice(&[0.18, 0.18, 0.18]);
+                    } else {
+                        // Shadow
+                        data.extend_from_slice(&[0.02, 0.02, 0.02]);
+                    }
+                }
+            }
+            Raster::from_data(w, h, 3, data)
+        };
+
+        // Bright blue sky within AgX white point where blue (> 1.333) previously hard-clipped
+        let raster = build_scene([0.85, 1.00, 1.38]);
+        for strength in [0.0f32, 65.0f32, 100.0f32] {
+            let (tm, rendition) = tonemap_hdr_raster(
+                &raster,
+                0.0,
+                "natural",
+                strength,
+                0.0,
+                50.0,
+                30.0,
+                1.05,
+            );
+            assert_eq!(rendition, Rendition::SrgbDisplay);
+            for (i, c) in tm.data.iter().enumerate() {
+                assert!(c.is_finite() && *c >= 0.0 && *c <= 1.0, "channel {} out of range: {}", i, c);
+            }
+            let sky = tm.pixel(w / 2, h / 8);
+            assert!(
+                sky[2] > sky[0] + 0.05 && sky[0] < 0.95 && sky[1] < 0.99 && sky[2] < 0.998,
+                "Sky should retain blue hue without blowing out at strength {}: {:?}",
+                strength,
+                sky
+            );
+        }
+
+        // Brighter HDR sky ([1.6, 1.8, 2.2]) where the previous x / (1 + 0.25 * x) baseline clipped all 3 channels to 1.0
+        let bright_raster = build_scene([1.6, 1.8, 2.2]);
+        for strength in [65.0f32, 100.0f32] {
+            let (tm, rendition) = tonemap_hdr_raster(
+                &bright_raster,
+                0.0,
+                "natural",
+                strength,
+                0.0,
+                50.0,
+                30.0,
+                1.05,
+            );
+            assert_eq!(rendition, Rendition::SrgbDisplay);
+            let sky = tm.pixel(w / 2, h / 8);
+            let sky_luma = 0.2126 * sky[0] + 0.7152 * sky[1] + 0.0722 * sky[2];
+            assert!(
+                sky[2] > sky[0] + 0.03 && sky_luma < 0.98,
+                "Bright sky washed out at strength {}: {:?} (luma={})",
+                strength,
+                sky,
+                sky_luma
+            );
+        }
     }
 }

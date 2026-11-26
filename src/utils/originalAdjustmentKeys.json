@@ -14,11 +14,7 @@
     "lensDistortionParams",
     "lensAutocropScale",
     "lensTcaEnabled",
-    "lensVignetteEnabled",
-    "defringeEnabled",
-    "defringePurpleAmount",
-    "defringeGreenAmount",
-    "defringeEdgeThreshold"
+    "lensVignetteEnabled"
   ],
   "crop": [
     "crop",

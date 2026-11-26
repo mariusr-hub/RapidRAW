@@ -2,6 +2,7 @@ import { useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
 import { MergeModalState, useUIStore } from '../store/useUIStore';
+import { useEditorStore } from '../store/useEditorStore';
 import { Invokes } from '../types/invokes';
 import { MergeKind, MergePreview, MergeSettings } from '../types/library';
 import type { DenoiseMethod } from '../enhanced/modals/DenoiseModal';
@@ -21,8 +22,13 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
     async (kindOverride?: MergeKind, pathsOverride?: string[]) => {
       const request = ++mergeRequest.current;
       const { kind, settings, sourcePaths } = useUIStore.getState().mergeModalState;
-      const targetKind = kindOverride ?? kind;
-      const targetPaths = pathsOverride ?? sourcePaths;
+      const validKind =
+        typeof kindOverride === 'string' && ['panorama', 'hdr', 'focusStack'].includes(kindOverride)
+          ? (kindOverride as MergeKind)
+          : undefined;
+      const validPaths = Array.isArray(pathsOverride) ? pathsOverride : undefined;
+      const targetKind = validKind ?? kind;
+      const targetPaths = validPaths ?? sourcePaths;
       if (targetPaths.length < 2) return;
       updateMerge({
         kind: targetKind,
@@ -44,7 +50,8 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
         updateMerge({ isProcessing: false, preview, progressMessage: null });
       } catch (err) {
         if (request !== mergeRequest.current || !useUIStore.getState().mergeModalState.isOpen) return;
-        updateMerge({ error: String(err), isProcessing: false, progressMessage: null });
+        const isCancelled = String(err).toLowerCase().includes('cancel');
+        updateMerge({ error: isCancelled ? null : String(err), isProcessing: false, progressMessage: null });
       }
     },
     [updateMerge],
@@ -81,7 +88,11 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
       return savedPath;
     } catch (err) {
       console.error('Failed to save the merged image:', err);
-      updateMerge({ error: String(err) });
+      if (useUIStore.getState().mergeModalState.preview) {
+        toast.error(`Failed to save merge: ${String(err)}`);
+      } else {
+        updateMerge({ error: String(err) });
+      }
       throw err;
     }
   }, [refreshImageList, updateMerge]);
@@ -126,8 +137,10 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
       }));
 
       try {
+        const editorState = useEditorStore.getState();
+        const targetPath = denoiseModalState.targetPaths[0];
         await invoke(Invokes.ApplyDenoising, {
-          path: denoiseModalState.targetPaths[0],
+          path: targetPath,
           intensity,
           method,
           healDust,
@@ -138,10 +151,17 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
           shadowBoost,
           deband,
           filmGrain,
+          jsAdjustments: targetPath === editorState.selectedImage?.path ? editorState.adjustments : null,
         });
       } catch (err) {
+        const isCancelled = String(err).toLowerCase().includes('cancel');
         setUI((state) => ({
-          denoiseModalState: { ...state.denoiseModalState, isProcessing: false, error: String(err) },
+          denoiseModalState: {
+            ...state.denoiseModalState,
+            isProcessing: false,
+            progressMessage: null,
+            error: isCancelled ? null : String(err),
+          },
         }));
       }
     },
@@ -177,7 +197,15 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
         await refreshImageList();
         return savedPaths;
       } catch (err) {
-        setUI((state) => ({ denoiseModalState: { ...state.denoiseModalState, error: String(err) } }));
+        const isCancelled = String(err).toLowerCase().includes('cancel');
+        setUI((state) => ({
+          denoiseModalState: {
+            ...state.denoiseModalState,
+            isProcessing: false,
+            progressMessage: null,
+            error: isCancelled ? null : String(err),
+          },
+        }));
         throw err;
       }
     },
@@ -277,8 +305,14 @@ export function useProductivityActions(refreshImageList: () => Promise<void> = a
           nightSkyState: { ...state.nightSkyState, isProcessing: false, progressMessage: 'Session Stack Complete!' },
         }));
       } catch (err) {
+        const isCancelled = String(err).toLowerCase().includes('cancel');
         setUI((state) => ({
-          nightSkyState: { ...state.nightSkyState, isProcessing: false, error: String(err) },
+          nightSkyState: {
+            ...state.nightSkyState,
+            isProcessing: false,
+            progressMessage: null,
+            error: isCancelled ? null : String(err),
+          },
         }));
       }
     },

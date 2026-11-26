@@ -34,6 +34,7 @@ import StockPrepDropzone from '../../../enhanced/panels/StockPrepDropzone';
 import {
   ActiveTools,
   Adjustments,
+  INITIAL_ADJUSTMENTS,
   ADJUSTMENT_SECTIONS,
   getActiveTools,
   getVisibleAdjustmentSections,
@@ -66,6 +67,103 @@ function AdjustmentSectionContent(props: {
   return <AdjustmentSection {...props} adjustments={adjustments} />;
 }
 
+function isEqualValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!isEqualValue(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const objA = a as Record<string, unknown>;
+  const objB = b as Record<string, unknown>;
+  const keysA = Object.keys(objA);
+  const keysB = Object.keys(objB);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(objB, key) || !isEqualValue(objA[key], objB[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function AdjustmentSectionList({
+  sections,
+  activeTools,
+  collapsibleSectionsState,
+  handleSectionContextMenu,
+  handleToggleSection,
+  handleToggleVisibility,
+  setAdjustments,
+  theme,
+  handleLutSelect,
+  appSettings,
+  selectedImage,
+  isWbPickerActive,
+  toggleWbPicker,
+  onDragStateChange,
+}: any) {
+  const { t } = useTranslation();
+  return sections.map((sectionName: string) => {
+    const title = t(`editor.adjustments.sections.${sectionName}` as ParseKeys);
+    return (
+      <div className="shrink-0 group" key={sectionName}>
+        <CollapsibleSection
+          isContentVisible={isToolActive(activeTools, sectionName)}
+          isOpen={collapsibleSectionsState[sectionName as keyof typeof collapsibleSectionsState]}
+          onContextMenu={(e: any) => handleSectionContextMenu(e, sectionName)}
+          onToggle={() => handleToggleSection(sectionName)}
+          onToggleVisibility={() => handleToggleVisibility(sectionName)}
+          title={title}
+        >
+          <AdjustmentSectionContent
+            sectionName={sectionName}
+            activeTools={activeTools}
+            onToggleTool={handleToggleVisibility}
+            setAdjustments={setAdjustments}
+            theme={theme}
+            handleLutSelect={handleLutSelect}
+            appSettings={appSettings}
+            asShotWhiteBalance={selectedImage.asShotWhiteBalance}
+            isWbPickerActive={isWbPickerActive}
+            toggleWbPicker={toggleWbPicker}
+            onDragStateChange={onDragStateChange}
+          />
+        </CollapsibleSection>
+      </div>
+    );
+  });
+}
+
+function ActiveOnlyAdjustmentSections({ visibleSections, ...rest }: any) {
+  const adjustments = useEditorStore((state) => state.adjustments);
+  const displayedSections = useMemo(
+    () =>
+      visibleSections.filter((sectionName: string) => {
+        if (sectionName === 'basic') return true;
+        const sectionTools = ADJUSTMENT_SECTIONS[sectionName];
+        if (!sectionTools) return true;
+        return sectionTools.some((key: string) => {
+          const curr = (adjustments as any)?.[key];
+          const init = (INITIAL_ADJUSTMENTS as any)?.[key];
+          return curr !== undefined && !isEqualValue(curr, init);
+        });
+      }),
+    [visibleSections, adjustments],
+  );
+  return <AdjustmentSectionList sections={displayedSections} {...rest} />;
+}
+
+function FilteredAdjustmentSections({ visibleSections, showActiveOnly, ...rest }: any) {
+  if (showActiveOnly) {
+    return <ActiveOnlyAdjustmentSections visibleSections={visibleSections} {...rest} />;
+  }
+  return <AdjustmentSectionList sections={visibleSections} {...rest} />;
+}
+
 export default function Controls() {
   const { t } = useTranslation();
   const { showContextMenu } = useContextMenu();
@@ -82,9 +180,10 @@ export default function Controls() {
 
   const visibleSections = getVisibleAdjustmentSections(appSettings?.adjustmentLayout);
 
-  const { collapsibleSectionsState, setUI } = useUIStore(
+  const { collapsibleSectionsState, showActiveToolsOnly, setUI } = useUIStore(
     useShallow((state) => ({
       collapsibleSectionsState: state.collapsibleSectionsState,
+      showActiveToolsOnly: state.showActiveToolsOnly,
       setUI: state.setUI,
     })),
   );
@@ -287,6 +386,16 @@ export default function Controls() {
             <ChartArea size={18} />
           </button>
           <button
+            className={clsx(
+              'p-2 rounded-full transition-colors',
+              showActiveToolsOnly ? 'bg-accent/20 text-accent' : 'hover:bg-surface',
+            )}
+            onClick={() => setUI((s) => ({ showActiveToolsOnly: !s.showActiveToolsOnly }))}
+            data-tooltip={t('editor.adjustments.tooltips.activeOnly', 'Filter workspace to show active tools only')}
+          >
+            <LayoutList size={18} />
+          </button>
+          <button
             className="p-2 rounded-full hover:bg-surface disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             disabled={!selectedImage}
             onClick={handleResetAdjustments}
@@ -320,36 +429,23 @@ export default function Controls() {
 
       <div className="grow overflow-y-scroll p-3 flex flex-col gap-2">
         {selectedImage ? (
-          visibleSections.map((sectionName: string) => {
-            const title = t(`editor.adjustments.sections.${sectionName}` as ParseKeys);
-
-            return (
-              <div className="shrink-0 group" key={sectionName}>
-                <CollapsibleSection
-                  isContentVisible={isToolActive(activeTools, sectionName)}
-                  isOpen={collapsibleSectionsState[sectionName as keyof typeof collapsibleSectionsState]}
-                  onContextMenu={(e: any) => handleSectionContextMenu(e, sectionName)}
-                  onToggle={() => handleToggleSection(sectionName)}
-                  onToggleVisibility={() => handleToggleVisibility(sectionName)}
-                  title={title}
-                >
-                  <AdjustmentSectionContent
-                    sectionName={sectionName}
-                    activeTools={activeTools}
-                    onToggleTool={handleToggleVisibility}
-                    setAdjustments={setAdjustments}
-                    theme={theme}
-                    handleLutSelect={handleLutSelect}
-                    appSettings={appSettings}
-                    asShotWhiteBalance={selectedImage.asShotWhiteBalance}
-                    isWbPickerActive={isWbPickerActive}
-                    toggleWbPicker={toggleWbPicker}
-                    onDragStateChange={onDragStateChange}
-                  />
-                </CollapsibleSection>
-              </div>
-            );
-          })
+          <FilteredAdjustmentSections
+            visibleSections={visibleSections}
+            showActiveOnly={showActiveToolsOnly}
+            activeTools={activeTools}
+            collapsibleSectionsState={collapsibleSectionsState}
+            handleSectionContextMenu={handleSectionContextMenu}
+            handleToggleSection={handleToggleSection}
+            handleToggleVisibility={handleToggleVisibility}
+            setAdjustments={setAdjustments}
+            theme={theme}
+            handleLutSelect={handleLutSelect}
+            appSettings={appSettings}
+            selectedImage={selectedImage}
+            isWbPickerActive={isWbPickerActive}
+            toggleWbPicker={toggleWbPicker}
+            onDragStateChange={onDragStateChange}
+          />
         ) : (
           <div className="flex items-center justify-center py-8">
             <Text
@@ -492,11 +588,29 @@ function EnhancedStudioDrawer({
             </button>
             <button
               type="button"
+              onClick={() =>
+                setUI({
+                  colorMatcherModalState: {
+                    isOpen: true,
+                    heroPath: selectedImage?.path ?? studioPaths[0] ?? null,
+                    targetPaths: studioPaths,
+                    initialMode: 'harmonize',
+                  },
+                })
+              }
+              disabled={studioPaths.length < 2}
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Sparkles size={12} className="text-pink-400 shrink-0" />
+              <span className="truncate">Harmonize Series</span>
+            </button>
+            <button
+              type="button"
               onClick={() => setUI({ negativeModalState: { isOpen: true, targetPaths: studioPaths } })}
-              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer col-span-2"
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-surface hover:bg-card-active text-text-primary cursor-pointer"
             >
               <Film size={12} className="text-orange-400 shrink-0" />
-              <span className="truncate">Film Negative Converter</span>
+              <span className="truncate">Film Negative</span>
             </button>
           </div>
 

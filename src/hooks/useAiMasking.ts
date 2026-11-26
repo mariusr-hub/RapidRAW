@@ -511,8 +511,15 @@ export function useAiMasking() {
 
       const mergedParameters = { ...(subMask?.parameters || {}), ...newParameters };
       patchesSentToBackend.delete(subMaskId);
-      updateSubMask(subMaskId, { parameters: mergedParameters });
-      if (noResult) toast.error(`AI Text Mask Failed: ${noResult}`);
+      updateSubMask(subMaskId, {
+        parameters: mergedParameters,
+        ...(noResult ? { invert: false } : {}),
+      });
+      if (noResult) {
+        toast.error(
+          `AI Text Mask: ${noResult}. Tip: Use simple English nouns (e.g. "sky", "person", "tree", "carrot").`,
+        );
+      }
     } catch (error) {
       if (!String(error).includes('cancelled')) {
         toast.error(`AI Text Mask Failed: ${error}`);

@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'react-toastify';
 import Button from '../../components/ui/Button';
 import Dropdown from '../../components/ui/Dropdown';
 import Slider from '../../components/ui/Slider';
@@ -34,10 +35,12 @@ import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { listen } from '@tauri-apps/api/event';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useEditorStore } from '../../store/useEditorStore';
+import { useUIStore } from '../../store/useUIStore';
 import { Invokes } from '../../components/ui/AppProperties';
 import { useSettingsStore } from '../../store/useSettingsStore';
+import type { DenoiseRoiPreview } from '../types/denoise';
 
-export type DenoiseMethod = 'auto' | 'fast_gpu' | 'ai' | 'bm3d' | 'raw9';
+export type DenoiseMethod = 'auto' | 'fast_gpu' | 'ai' | 'bm3d' | 'raw9' | 'raw_pre_demosaic';
 
 const defaultIntensityFor = (m: DenoiseMethod): number => {
   switch (m) {
@@ -47,6 +50,8 @@ const defaultIntensityFor = (m: DenoiseMethod): number => {
       return 28;
     case 'raw9':
       return 40;
+    case 'raw_pre_demosaic':
+      return 45;
     case 'ai':
       return 35;
     case 'bm3d':
@@ -211,7 +216,7 @@ const ImageCompare = ({
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-[460px] bg-[#0a0a0a] rounded-lg overflow-hidden border border-surface select-none cursor-grab active:cursor-grabbing"
+      className="relative w-full h-full bg-[#0a0a0a] rounded-lg overflow-hidden border border-surface select-none cursor-grab active:cursor-grabbing"
       onMouseDown={handleMouseDown}
       onWheel={handleWheel}
     >
@@ -398,6 +403,7 @@ export default function DenoiseModal({
   targetPaths,
 }: DenoiseModalProps) {
   const { t } = useTranslation();
+  const setUI = useUIStore((s) => s.setUI);
   const selectedImage = useEditorStore((state) => state.selectedImage);
   const imageList = useLibraryStore((state) => state.imageList);
   const isAiFree = useSettingsStore((s) => s.appSettings?.aiProvider === 'ai-free');
@@ -432,6 +438,8 @@ export default function DenoiseModal({
   const [autoProfile, setAutoProfile] = useState<{
     sigma: number;
     effective_iso: number;
+    iso_calibrated?: boolean;
+    calibrated_iso_bucket?: number | null;
     snr_db: number;
     make?: string;
     model?: string;
@@ -471,11 +479,17 @@ export default function DenoiseModal({
 
   // Real-Time Sub-Tile Loupe ROI Preview State with monotonic ID & coalescing
   const [roiPreview, setRoiPreview] = useState<{ original: string; denoised: string } | null>(null);
+  const [roiFull, setRoiFull] = useState<DenoiseRoiPreview | null>(null);
+  const [roiCenter, setRoiCenter] = useState<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
+  const [roiChannelMode, setRoiChannelMode] = useState<'rgb' | 'luma' | 'chroma' | 'residual'>('rgb');
+  const [isCalibratingIso, setIsCalibratingIso] = useState(false);
   const [isRoiLoading, setIsRoiLoading] = useState(false);
   const roiRequestIdRef = useRef(0);
   const roiInFlightRef = useRef(false);
   const roiPendingRef = useRef<{
     targetPath: string;
+    roiX: number;
+    roiY: number;
     intensity: number;
     chromaIntensity: number;
     preserveDetails: number;
@@ -520,13 +534,18 @@ export default function DenoiseModal({
         value: 'bm3d',
       },
       {
+        label: `Raw Pre-Demosaic (GAT)${!isRaw ? ' (RAW only)' : ''}`,
+        value: 'raw_pre_demosaic',
+        disabled: !isRaw,
+      },
+      {
         label: `${t('modals.denoise.methodAi')}${recommendedEngine === 'ai' && !isAiFree ? ' (Tier 3)' : ''}`,
         value: 'ai',
         disabled: isAiFree,
       },
       ...(raw9Available ? [{ label: t('modals.denoise.methodRaw9'), value: 'raw9' as const }] : []),
     ],
-    [t, recommendedEngine, raw9Available, isAiFree],
+    [t, recommendedEngine, raw9Available, isAiFree, isRaw],
   );
 
   // Global keydown for hold-to-compare and snapshots
@@ -695,6 +714,8 @@ export default function DenoiseModal({
           sigma: number;
           iso: number | null;
           effective_iso: number;
+          iso_calibrated?: boolean;
+          calibrated_iso_bucket?: number | null;
           snr_db: number;
           make?: string;
           model?: string;
@@ -713,7 +734,10 @@ export default function DenoiseModal({
           gpu_accelerator?: string;
           pipeline_mode?: string;
           est_speed_sec?: number;
-        }>(Invokes.AnalyzeImageNoiseProfile, { path: targetPath, exposure_push: 0.0 })
+        }>(Invokes.AnalyzeImageNoiseProfile, {
+          path: targetPath,
+          exposurePush: Number(useEditorStore.getState().adjustments?.exposure ?? 0.0),
+        })
           .then((profile) => {
             if (profile?.sigma !== undefined) {
               setEmpiricalSigma(profile.sigma);
@@ -771,6 +795,9 @@ export default function DenoiseModal({
         setCameraProfile(null);
         setAutoProfile(null);
         setRoiPreview(null);
+        setRoiFull(null);
+        setRoiCenter({ x: 0.5, y: 0.5 });
+        setRoiChannelMode('rgb');
         roiPendingRef.current = null;
         roiInFlightRef.current = false;
       }, 300);
@@ -788,10 +815,11 @@ export default function DenoiseModal({
         roiPendingRef.current = null;
         const reqId = ++roiRequestIdRef.current;
         try {
-          const res = await invoke<{ original_roi: string; denoised_roi: string }>(Invokes.PreviewDenoisedRoi, {
+          const editorState = useEditorStore.getState();
+          const res = await invoke<DenoiseRoiPreview>(Invokes.PreviewDenoisedRoi, {
             path: params.targetPath,
-            centerX: 0.5,
-            centerY: 0.5,
+            centerX: params.roiX,
+            centerY: params.roiY,
             cropSize: 512,
             intensity: params.intensity / 100,
             chromaIntensity: params.chromaIntensity / 100,
@@ -801,9 +829,11 @@ export default function DenoiseModal({
             protectStars: params.protectStars,
             filmGrain: params.filmGrain / 100,
             method: params.method,
+            jsAdjustments: params.targetPath === editorState.selectedImage?.path ? editorState.adjustments : null,
           });
-          if (reqId === roiRequestIdRef.current && res?.original_roi && res?.denoised_roi) {
-            setRoiPreview({ original: res.original_roi, denoised: res.denoised_roi });
+          if (reqId === roiRequestIdRef.current && res?.originalBase64 && res?.denoisedBase64) {
+            setRoiFull(res);
+            setRoiPreview({ original: res.originalBase64, denoised: res.denoisedBase64 });
           }
         } catch (e) {
           console.warn('Real-time Loupe ROI preview failed:', e);
@@ -824,6 +854,8 @@ export default function DenoiseModal({
     const timer = setTimeout(() => {
       roiPendingRef.current = {
         targetPath,
+        roiX: roiCenter.x,
+        roiY: roiCenter.y,
         intensity,
         chromaIntensity,
         preserveDetails,
@@ -843,6 +875,7 @@ export default function DenoiseModal({
     isProcessing,
     targetPaths,
     selectedImage,
+    roiCenter,
     intensity,
     chromaIntensity,
     preserveDetails,
@@ -854,10 +887,54 @@ export default function DenoiseModal({
     flushRoiQueue,
   ]);
 
+  const handleCalibrateIso = useCallback(async () => {
+    const targetPath = targetPaths[0] || selectedImage?.path;
+    const calPaths = targetPaths.length ? targetPaths : targetPath ? [targetPath] : [];
+    if (!calPaths.length) return;
+    setIsCalibratingIso(true);
+    try {
+      const res = await invoke<{ cameraKey: string; calibratedBuckets: number[]; filesProcessed: number }>(
+        Invokes.CalibrateCameraIsoNoiseProfile,
+        { paths: calPaths },
+      );
+      toast.success(`Calibrated ${res.cameraKey} @ ISO ${res.calibratedBuckets.join(', ')}`);
+      if (targetPath) {
+        const refreshed = await invoke<typeof autoProfile>(Invokes.AnalyzeImageNoiseProfile, {
+          path: targetPath,
+          exposurePush: Number(useEditorStore.getState().adjustments?.exposure ?? 0.0),
+        });
+        if (refreshed) {
+          setAutoProfile(refreshed);
+        }
+      }
+    } catch (e) {
+      toast.error(`ISO calibration failed: ${String(e)}`);
+    } finally {
+      setIsCalibratingIso(false);
+    }
+  }, [targetPaths, selectedImage]);
+
+  const handleCancelDenoise = useCallback(() => {
+    invoke(Invokes.CancelAiDenoise).catch((err) => console.warn('Cancel failed:', err));
+    setIsSaving(false);
+    setBatchProgress(null);
+    setUI((state) => ({
+      denoiseModalState: {
+        ...state.denoiseModalState,
+        isProcessing: false,
+        progressMessage: null,
+        error: null,
+      },
+    }));
+  }, [setUI]);
+
   const handleClose = useCallback(() => {
-    if (isSaving) return;
+    if (isSaving && !isBatch) return;
+    if (isProcessing || (isBatch && isSaving)) {
+      handleCancelDenoise();
+    }
     onClose();
-  }, [onClose, isSaving]);
+  }, [onClose, isSaving, isBatch, isProcessing, handleCancelDenoise]);
 
   const handleBackdropMouseDown = (e: React.MouseEvent) => {
     mouseDownTarget.current = e.target;
@@ -887,9 +964,12 @@ export default function DenoiseModal({
           deband,
           filmGrain / 100
         );
+        toast.success('Batch denoise complete');
         onClose();
       } catch (e) {
-        console.error('Batch denoise failed:', e);
+        if (!String(e).toLowerCase().includes('cancel')) {
+          console.error('Batch denoise failed:', e);
+        }
       } finally {
         setIsSaving(false);
         setBatchProgress(null);
@@ -915,6 +995,8 @@ export default function DenoiseModal({
     try {
       const path = await onSave();
       setSavedPath(path);
+      toast.success('Denoised image saved');
+      onClose();
     } catch (e) {
       console.error(e);
     } finally {
@@ -932,7 +1014,7 @@ export default function DenoiseModal({
   const renderContent = () => {
     if (error) {
       return (
-        <div className="flex flex-col items-center justify-center py-6 h-[260px] md:h-[340px]">
+        <div className="flex flex-col items-center justify-center py-6 min-h-[200px]">
           <div className="flex items-center justify-center mb-6">
             <XCircle className="w-12 h-12 text-red-500" />
           </div>
@@ -946,26 +1028,96 @@ export default function DenoiseModal({
       );
     }
 
-    const activePreview = previewBase64 || roiPreview?.denoised;
-    const activeOriginal = originalBase64 || roiPreview?.original;
+    const activeRoiOrig = !previewBase64 && roiFull
+      ? roiChannelMode === 'luma'
+        ? roiFull.lumaOriginalBase64
+        : roiChannelMode === 'chroma'
+          ? roiFull.chromaOriginalBase64
+          : roiFull.originalBase64
+      : roiPreview?.original;
+    const activeRoiDenoised = !previewBase64 && roiFull
+      ? roiChannelMode === 'luma'
+        ? roiFull.lumaDenoisedBase64
+        : roiChannelMode === 'chroma'
+          ? roiFull.chromaDenoisedBase64
+          : roiChannelMode === 'residual'
+            ? roiFull.residualBase64
+            : roiFull.denoisedBase64
+      : roiPreview?.denoised;
+
+    const activePreview = previewBase64 || activeRoiDenoised;
+    const activeOriginal = originalBase64 || activeRoiOrig;
 
     if (activePreview && activeOriginal && !isProcessing && !isBatch) {
       return (
-        <div className="w-full h-[300px] md:h-[400px] relative">
-          <ImageCompare
-            original={activeOriginal}
-            denoised={activePreview}
-            isHoldingOriginal={isHoldingOriginal}
-            viewMode={viewMode}
-            onViewModeChange={setViewMode}
-          />
-          {!previewBase64 && roiPreview && (
-            <div className="absolute top-3 right-3 z-30 pointer-events-none flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-surface/90 backdrop-blur-md border border-accent/30 text-accent text-[11px] font-mono shadow-md">
-              <span className="w-2 h-2 rounded-full bg-accent animate-pulse" />
-              <span>100% Loupe Live ROI (512x512)</span>
-              {isRoiLoading && <Loader2 size={11} className="animate-spin text-accent" />}
+        <div className="w-full flex flex-col">
+          {!previewBase64 && roiFull && (
+            <div className="flex flex-wrap items-center justify-between gap-1.5 mb-2">
+              <div className="flex flex-wrap items-center gap-1 px-1.5 py-1 rounded-full bg-bg-secondary/90 border border-border-color/60 shadow-xs">
+                {(['rgb', 'luma', 'chroma', 'residual'] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setRoiChannelMode(mode)}
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold transition-colors cursor-pointer ${
+                      roiChannelMode === mode
+                        ? 'bg-accent text-white'
+                        : 'text-text-secondary hover:text-text-primary'
+                    }`}
+                  >
+                    {mode === 'rgb'
+                      ? 'RGB'
+                      : mode === 'luma'
+                        ? 'Y Luma'
+                        : mode === 'chroma'
+                          ? 'CbCr Chroma'
+                          : 'Δ Noise'}
+                  </button>
+                ))}
+                <div className="h-3 w-px bg-border-color/60 mx-0.5" />
+                {(
+                  [
+                    { label: 'TL', x: 0.25, y: 0.25 },
+                    { label: 'TR', x: 0.75, y: 0.25 },
+                    { label: 'C', x: 0.5, y: 0.5 },
+                    { label: 'BL', x: 0.25, y: 0.75 },
+                    { label: 'BR', x: 0.75, y: 0.75 },
+                  ] as const
+                ).map((pos) => {
+                  const active = Math.abs(roiCenter.x - pos.x) < 0.05 && Math.abs(roiCenter.y - pos.y) < 0.05;
+                  return (
+                    <button
+                      key={pos.label}
+                      type="button"
+                      onClick={() => setRoiCenter({ x: pos.x, y: pos.y })}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer ${
+                        active ? 'bg-accent/25 text-accent font-bold' : 'text-text-secondary hover:text-text-primary'
+                      }`}
+                      title={`Inspect 1:1 ROI around (${Math.round(pos.x * 100)}%, ${Math.round(pos.y * 100)}%)`}
+                    >
+                      {pos.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-bg-secondary/90 border border-accent/30 text-accent text-[11px] font-mono shadow-xs">
+                <span className="w-2 h-2 rounded-full bg-accent animate-pulse" />
+                <span>
+                  1:1 ROI ({roiFull.size}×{roiFull.size} · {roiFull.effectiveMethod})
+                </span>
+                {isRoiLoading && <Loader2 size={11} className="animate-spin text-accent" />}
+              </div>
             </div>
           )}
+          <div className="w-full h-[clamp(200px,36vh,360px)] relative overflow-hidden rounded-lg">
+            <ImageCompare
+              original={activeOriginal}
+              denoised={activePreview}
+              isHoldingOriginal={isHoldingOriginal}
+              viewMode={viewMode}
+              onViewModeChange={setViewMode}
+            />
+          </div>
           {savedPath && (
             <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
               <Text
@@ -984,20 +1136,28 @@ export default function DenoiseModal({
     }
 
     if (isProcessing || (isBatch && isSaving)) {
+      const pctMatch = currentStatusText?.match(/(\d+(?:\.\d+)?)%/);
+      const pctValue = pctMatch ? Math.min(100, Math.max(0, Number(pctMatch[1]))) : null;
       return (
-        <div className="flex flex-col items-center justify-center py-6 h-[260px] md:h-[340px]">
+        <div className="flex flex-col items-center justify-center py-6 min-h-[200px]">
           <Loader2 className="w-12 h-12 animate-spin text-accent mb-4" />
           <Text variant={TextVariants.title} className="mb-2 text-center">
             {currentStatusText}
           </Text>
+          {pctValue !== null && (
+            <div className="w-72 h-2 bg-bg-secondary rounded-full overflow-hidden mb-3 border border-border-color/40">
+              <div
+                className="h-full bg-accent transition-all duration-150"
+                style={{ width: `${pctValue}%` }}
+              />
+            </div>
+          )}
           <Text color={TextColors.secondary} className="mb-4 text-center">
             {t('modals.denoise.waitText', 'This may take a moment depending on resolution...')}
           </Text>
           <Button
             variant="secondary"
-            onClick={() => {
-              invoke(Invokes.CancelAiDenoise).catch(() => {});
-            }}
+            onClick={handleCancelDenoise}
           >
             <XCircle className="mr-1.5" size={16} />
             {t('modals.denoise.cancel', 'Cancel')}
@@ -1007,7 +1167,7 @@ export default function DenoiseModal({
     }
 
     return (
-      <div className="flex flex-col items-center justify-center py-4 h-[260px] md:h-[340px] text-center">
+      <div className="flex flex-col items-center justify-center py-4 min-h-[160px] text-center">
         <div className="relative mb-4">
           <div className="w-20 h-20 rounded-2xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent">
             <Sparkles size={36} />
@@ -1065,55 +1225,56 @@ export default function DenoiseModal({
                 {autoProfile ? `ISO ${autoProfile.effective_iso}` : activeIso ? `ISO ${activeIso}` : 'Auto'}
                 {autoProfile ? ` · SNR ${autoProfile.snr_db}dB` : ''}
                 {` · σ = ${(empiricalSigma * 100).toFixed(1)}%`}
+                {autoProfile?.iso_calibrated ? ` · 🎯 Calibrated (${autoProfile.calibrated_iso_bucket ?? autoProfile.effective_iso})` : ''}
                 {autoProfile?.dual_gain_active ? ' · ⚡ DCG' : ''}
                 {autoProfile?.flat_patch_used ? ' · 🎯 Flat' : ''}
               </span>
             </span>
           )}
           {autoProfile && (
-            <button
-              type="button"
-              onClick={() => {
-                setIntensity(autoProfile.recommended_intensity);
-                setChromaIntensity(autoProfile.recommended_chroma);
-                setPreserveDetails(autoProfile.recommended_details);
-                setShadowBoost(autoProfile.recommended_shadow_boost);
-                setDeband(autoProfile.recommended_deband);
-                setMethod(autoProfile.recommended_engine);
-              }}
-              className="px-2 py-1 rounded-md bg-accent/20 hover:bg-accent/30 text-accent text-[11px] font-mono font-medium border border-accent/30 flex items-center gap-1 transition-colors"
-              title="Reset all sliders to physical sensor auto-calibrated values"
-            >
-              <Sparkles size={11} />
-              <span>Re-Auto</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setIntensity(autoProfile.recommended_intensity);
+                  setChromaIntensity(autoProfile.recommended_chroma);
+                  setPreserveDetails(autoProfile.recommended_details);
+                  setShadowBoost(autoProfile.recommended_shadow_boost);
+                  setDeband(autoProfile.recommended_deband);
+                  setMethod(autoProfile.recommended_engine);
+                }}
+                className="px-2 py-1 rounded-md bg-accent/20 hover:bg-accent/30 text-accent text-[11px] font-mono font-medium border border-accent/30 flex items-center gap-1 transition-colors"
+                title="Reset all sliders to physical sensor auto-calibrated values"
+              >
+                <Sparkles size={11} />
+                <span>Re-Auto</span>
+              </button>
+              <button
+                type="button"
+                disabled={isCalibratingIso}
+                onClick={() => void handleCalibrateIso()}
+                className="px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 text-[11px] font-mono font-medium border border-blue-500/30 flex items-center gap-1 transition-colors disabled:opacity-50"
+                title="Measure and persist camera per-ISO noise floor profile"
+              >
+                <Camera size={11} />
+                <span>{isCalibratingIso ? 'Calibrating…' : 'Calibrate ISO'}</span>
+              </button>
+            </>
           )}
         </div>
       </div>
     );
   };
 
-  const renderButtons = () => {
-    if (savedPath) {
-      return (
-        <>
-          <button
-            onClick={handleClose}
-            className="px-4 py-2 rounded-md text-text-secondary hover:bg-card-active transition-colors"
-          >
-            {t('modals.denoise.close')}
-          </button>
-          <Button onClick={handleOpen}>{t('modals.denoise.openInEditor')}</Button>
-        </>
-      );
-    }
-
+  const renderControls = () => {
+    if (savedPath) return null;
     const disabled = isProcessing || isSaving;
 
     return (
-      <div className={`w-full flex flex-col gap-3 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
+      <div className="w-full flex flex-col gap-3 mt-3 pt-3 border-t border-border-color/40">
         {/* Navigation Tabs */}
-        <div className="flex items-center justify-between border-b border-border-color/40 pb-2">
+        <div className={disabled ? 'opacity-50 pointer-events-none flex flex-col gap-3' : 'flex flex-col gap-3'}>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border-color/40 pb-2">
           <div className="flex items-center gap-1 bg-bg-secondary/60 p-0.5 rounded-lg border border-border-color/30">
             <button
               type="button"
@@ -1181,8 +1342,8 @@ export default function DenoiseModal({
 
         {/* Tab Contents */}
         {activeTab === 'basic' && (
-          <div className="flex items-center gap-6">
-            <div className="flex flex-col gap-1 w-[260px] shrink-0">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-6">
+            <div className="flex flex-col gap-1 w-full sm:w-[260px] shrink-0">
               <div className="flex items-center justify-between">
                 <Text variant={TextVariants.small} weight={TextWeights.medium}>
                   {t('modals.denoise.methodLabel')}
@@ -1261,7 +1422,7 @@ export default function DenoiseModal({
         )}
 
         {activeTab === 'pro' && (
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div>
               <div className="flex justify-between mb-1">
                 <Text variant={TextVariants.small} weight={TextWeights.medium}>
@@ -1354,8 +1515,8 @@ export default function DenoiseModal({
         )}
 
         {/* Feature Toggles */}
-        <div className="flex flex-wrap items-center justify-between pt-2 border-t border-border-color/30">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-border-color/30">
+          <div className="flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-1.5 cursor-pointer select-none">
               <input
                 type="checkbox"
@@ -1411,42 +1572,61 @@ export default function DenoiseModal({
               <span>Defects HUD</span>
             </button>
           </div>
-
-          <div className="flex gap-2">
-            <button
-              onClick={handleClose}
-              className="px-4 py-2 rounded-md text-text-secondary hover:bg-card-active transition-colors text-sm cursor-pointer"
-            >
-              {previewBase64 ? t('modals.denoise.close') : t('modals.denoise.cancel')}
-            </button>
-
-            <Button
-              onClick={handleRunDenoise}
-              disabled={isProcessing || isSaving}
-              variant={previewBase64 && !isBatch ? 'secondary' : 'primary'}
-            >
-              {isProcessing || (isBatch && isSaving) ? (
-                <Loader2 className="animate-spin mr-2" size={16} />
-              ) : previewBase64 && !isBatch ? (
-                <RefreshCw className="mr-2" size={16} />
-              ) : (
-                <Grip className="mr-2" size={16} />
-              )}
-              {isBatch
-                ? t('modals.denoise.btnBatchDenoise')
-                : previewBase64
-                  ? t('modals.denoise.btnRetry')
-                  : t('modals.denoise.btnStart')}
-            </Button>
-
-            {previewBase64 && !isBatch && (
-              <Button onClick={handleSave} disabled={isSaving || isProcessing}>
-                {isSaving ? <Loader2 className="animate-spin mr-2" size={16} /> : <Save className="mr-2" size={16} />}
-                {t('modals.denoise.btnSave')}
-              </Button>
-            )}
           </div>
         </div>
+      </div>
+    );
+  };
+
+  const renderButtons = () => {
+    if (savedPath) {
+      return (
+        <>
+          <button
+            onClick={handleClose}
+            className="px-4 py-2 rounded-md text-text-secondary hover:bg-card-active transition-colors"
+          >
+            {t('modals.denoise.close')}
+          </button>
+          <Button onClick={handleOpen}>{t('modals.denoise.openInEditor')}</Button>
+        </>
+      );
+    }
+
+    return (
+      <div className="flex flex-wrap gap-2 justify-end">
+        <button
+          onClick={isProcessing || (isBatch && isSaving) ? handleCancelDenoise : handleClose}
+          className="px-4 py-2 rounded-md text-text-secondary hover:bg-card-active transition-colors text-sm cursor-pointer"
+        >
+          {previewBase64 ? t('modals.denoise.close') : t('modals.denoise.cancel')}
+        </button>
+
+        <Button
+          onClick={handleRunDenoise}
+          disabled={isProcessing || isSaving}
+          variant={previewBase64 && !isBatch ? 'secondary' : 'primary'}
+        >
+          {isProcessing || (isBatch && isSaving) ? (
+            <Loader2 className="animate-spin mr-2" size={16} />
+          ) : previewBase64 && !isBatch ? (
+            <RefreshCw className="mr-2" size={16} />
+          ) : (
+            <Grip className="mr-2" size={16} />
+          )}
+          {isBatch
+            ? t('modals.denoise.btnBatchDenoise')
+            : previewBase64
+              ? t('modals.denoise.btnRetry')
+              : t('modals.denoise.btnStart')}
+        </Button>
+
+        {previewBase64 && !isBatch && (
+          <Button onClick={handleSave} disabled={isSaving || isProcessing}>
+            {isSaving ? <Loader2 className="animate-spin mr-2" size={16} /> : <Save className="mr-2" size={16} />}
+            {t('modals.denoise.btnSave')}
+          </Button>
+        )}
       </div>
     );
   };
@@ -1455,19 +1635,20 @@ export default function DenoiseModal({
 
   return (
     <div
-      className={`fixed inset-0 flex items-center justify-center z-50 bg-black/50 backdrop-blur-xs transition-opacity duration-300 ease-in-out ${
+      className={`fixed inset-0 flex items-center justify-center p-2 sm:p-4 z-50 bg-black/50 backdrop-blur-xs transition-opacity duration-300 ease-in-out ${
         show ? 'opacity-100' : 'opacity-0'
       }`}
       onMouseDown={handleBackdropMouseDown}
       onClick={handleBackdropClick}
     >
       <div
-        className={`bg-surface rounded-xl shadow-2xl p-5 md:p-6 w-full max-w-5xl max-h-[90vh] flex flex-col transform transition-all duration-300 ease-out ${
+        className={`bg-surface rounded-xl shadow-2xl p-4 sm:p-5 w-full max-w-5xl max-h-[92vh] flex flex-col transform transition-all duration-300 ease-out ${
           show ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4'
         }`}
       >
         <div className="flex-1 overflow-y-auto pr-1 min-h-0">
           {renderContent()}
+          {renderControls()}
         </div>
         <div className={`mt-3 pt-3 flex justify-end gap-3 shrink-0 ${savedPath ? '' : 'border-t border-surface/50'}`}>
           {renderButtons()}

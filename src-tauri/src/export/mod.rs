@@ -126,12 +126,15 @@ pub fn render_edited_image_for_batch(
 
     let is_raw = is_raw_file(&source_path_str);
     if let Ok(context) = get_or_init_gpu_context(&state, app_handle) {
+        let prepared_base = prepare_base_image(&base_image, &source_path_str, &metadata.adjustments)
+            .unwrap_or(Cow::Borrowed(&base_image));
+        let base_scale = crate::ai::upscale::scale_between(&base_image, &prepared_base);
         let render_opts = crate::render::options::resolve_render_options(settings, is_raw);
         let renders = [(render_opts, RenderOutputPrecision::EightBit)];
         if let Ok(mut rendered) = process_image_for_export_pipeline(
             &source_path_str,
-            &base_image,
-            1.0,
+            &prepared_base,
+            base_scale,
             &metadata.adjustments,
             &context,
             &state,
@@ -145,6 +148,65 @@ pub fn render_edited_image_for_batch(
     }
 
     Ok(base_image)
+}
+
+/// Renders `base_image` through the full GPU adjustment pipeline using either
+/// `js_adjustments` (when provided & non-empty) or the `.rrdata` sidecar on disk.
+/// Returns `None` if no edits are present or GPU rendering is unavailable.
+pub fn render_image_with_edits(
+    path_str: &str,
+    base_image: &DynamicImage,
+    js_adjustments: Option<&Value>,
+    settings: &crate::app::settings::AppSettings,
+    app_handle: &tauri::AppHandle,
+    high_precision: bool,
+) -> Option<DynamicImage> {
+    let (source_path, sidecar_path) = parse_virtual_path(path_str);
+    let source_path_str = source_path.to_string_lossy().to_string();
+
+    let mut adjustments = if let Some(adj) = js_adjustments
+        && adj.as_object().is_some_and(|o| !o.is_empty())
+    {
+        adj.clone()
+    } else {
+        crate::metadata::sidecar::load_sidecar(&sidecar_path).adjustments
+    };
+
+    let state = app_handle.state::<AppState>();
+    hydrate_adjustments(&state, &mut adjustments);
+
+    let has_edits = adjustments
+        .as_object()
+        .is_some_and(|obj| !obj.is_empty());
+    if !has_edits {
+        return None;
+    }
+
+    let is_raw = is_raw_file(&source_path_str);
+    let context = get_or_init_gpu_context(&state, app_handle).ok()?;
+    let prepared_base = prepare_base_image(base_image, &source_path_str, &adjustments)
+        .unwrap_or(Cow::Borrowed(base_image));
+    let base_scale = crate::ai::upscale::scale_between(base_image, &prepared_base);
+    let render_opts = crate::render::options::resolve_render_options(settings, is_raw);
+    let precision = if high_precision {
+        RenderOutputPrecision::SixteenBit
+    } else {
+        RenderOutputPrecision::EightBit
+    };
+    let renders = [(render_opts, precision)];
+    let mut rendered = process_image_for_export_pipeline(
+        &source_path_str,
+        &prepared_base,
+        base_scale,
+        &adjustments,
+        &context,
+        &state,
+        is_raw,
+        "denoise_render",
+        &renders,
+    )
+    .ok()?;
+    rendered.pop()
 }
 
 pub fn save_jpeg_high_quality_with_metadata<P: AsRef<Path>>(

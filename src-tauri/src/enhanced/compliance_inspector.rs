@@ -308,6 +308,13 @@ pub fn auto_inpaint_compliance_issues(
         let mut new_img = (*loaded_image.image).clone();
         let count = inpaint_compliance_boxes(&mut new_img, &issues);
         loaded_image.image = Arc::new(new_img);
+        drop(orig_guard);
+
+        *state.gpu_image_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::render::cache_utils::clear_preview_stage_caches(&state);
+        for target in crate::app::state::PreviewTarget::ALL {
+            crate::render::cache_utils::clear_preview_slot(&state, target);
+        }
 
         // Also update cached preview if available
         if let Ok(mut preview_guard) = state.cached_preview.lock()

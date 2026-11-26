@@ -211,7 +211,7 @@ const KeybindRow = ({
 
   return (
     <div className="flex justify-between items-center py-2">
-      <Text variant={TextVariants.label}>{t(def.description as any)}</Text>
+      <Text variant={TextVariants.label}>{t(def.description as any, def.fallbackDescription ?? def.description)}</Text>
       <div className="flex items-center gap-1">
         {isConflicting && <span className="text-yellow-400 text-xs">⚠</span>}
         <button onClick={() => onStartRecording(def.action)} className="flex items-center gap-1 flex-wrap shrink-0">
@@ -269,7 +269,7 @@ const LocalSmartCalibrationCard = ({
   const refreshSummary = useCallback(() => {
     invoke<typeof summary>(Invokes.GetLocalPriorsSummary)
       .then((res) => setSummary(res))
-      .catch(() => {});
+      .catch((err) => console.warn('Failed to load local priors summary:', err));
   }, []);
 
   useEffect(() => {

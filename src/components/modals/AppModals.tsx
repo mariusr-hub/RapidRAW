@@ -1,4 +1,4 @@
-import { Suspense, lazy } from 'react';
+import { Component, type ErrorInfo, type ReactNode, Suspense, lazy } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useTranslation } from 'react-i18next';
 import { closeMergeModal, useUIStore } from '../../store/useUIStore';
@@ -74,6 +74,52 @@ export interface AppModalsProps {
   handleSaveCollage: (base64Data: string, firstPath: string) => Promise<string>;
   handleCreateAlbumItem: (name: string, type: 'album' | 'group') => Promise<void>;
   handleRenameAlbumItem: (newName: string) => Promise<void>;
+}
+
+class ModalErrorBoundary extends Component<
+  { children: ReactNode; onReset: () => void },
+  { hasError: boolean; errorMessage: string }
+> {
+  constructor(props: { children: ReactNode; onReset: () => void }) {
+    super(props);
+    this.state = { hasError: false, errorMessage: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, errorMessage: error?.message || String(error) };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('Modal render error caught by ModalErrorBoundary:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="fixed inset-0 z-100 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <div className="bg-surface border border-border-color rounded-xl shadow-2xl p-6 max-w-md w-full text-text-primary space-y-4">
+            <h3 className="text-base font-semibold text-red-400">Modal Error</h3>
+            <p className="text-xs text-text-secondary bg-bg-primary p-3 rounded-lg break-words">
+              {this.state.errorMessage || 'An unexpected rendering error occurred.'}
+            </p>
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  this.props.onReset();
+                  this.setState({ hasError: false, errorMessage: '' });
+                }}
+                className="px-4 py-2 rounded-md bg-accent text-button-text text-sm font-medium cursor-pointer"
+              >
+                Reset &amp; Close Modal
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default function AppModals(props: AppModalsProps) {
@@ -192,7 +238,16 @@ export default function AppModals(props: AppModalsProps) {
   const isAlbumGroup = currentAlbumData?.type === 'group';
 
   return (
-    <>
+    <ModalErrorBoundary
+      onReset={() => {
+        closeMergeModal();
+        setUI((state) => ({
+          denoiseModalState: { ...state.denoiseModalState, isOpen: false, isProcessing: false },
+          drizzleModalState: { ...state.drizzleModalState, isOpen: false, isProcessing: false },
+          cullingModalState: { ...state.cullingModalState, isOpen: false, progress: null },
+        }));
+      }}
+    >
       <CopyPasteSettingsModal
         isOpen={isCopyPasteSettingsModalOpen}
         onClose={() => setUI({ isCopyPasteSettingsModalOpen: false })}
@@ -399,6 +454,6 @@ export default function AppModals(props: AppModalsProps) {
           }}
         />
       </Suspense>
-    </>
+    </ModalErrorBoundary>
   );
 }

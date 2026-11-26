@@ -1,5 +1,6 @@
 pub mod agency_uploader;
 pub mod astro_stacking;
+pub mod astro_starless;
 pub mod atomic_output;
 pub mod auto_tune_loop;
 pub mod batch_export_engine;

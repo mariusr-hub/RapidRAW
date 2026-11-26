@@ -2,12 +2,13 @@ use image::{Rgb, Rgb32FImage};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 
 struct ProgressReporter<'a> {
     counter: &'a Arc<AtomicUsize>,
     total_work: usize,
     on_progress: &'a (dyn Fn(f32) + Sync),
+    cancel: Option<&'a AtomicBool>,
 }
 
 const BLOCK_SIZE: usize = 8;
@@ -42,6 +43,19 @@ pub fn denoise(
     intensity: f32,
     on_progress: &(dyn Fn(f32) + Sync),
 ) -> Rgb32FImage {
+    denoise_with_cancel(rgb_img, intensity, None, on_progress)
+        .unwrap_or_else(|_| rgb_img.clone())
+}
+
+pub fn denoise_with_cancel(
+    rgb_img: &Rgb32FImage,
+    intensity: f32,
+    cancel: Option<&AtomicBool>,
+    on_progress: &(dyn Fn(f32) + Sync),
+) -> Result<Rgb32FImage, String> {
+    if cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+        return Err("AI denoise cancelled".to_string());
+    }
     let (width, height) = rgb_img.dimensions();
     let params = Bm3dParams::from_intensity(intensity);
     let dct_tables = Arc::new(DctTables::new());
@@ -60,9 +74,10 @@ pub fn denoise(
         counter: &progress_counter,
         total_work: total_work_units,
         on_progress,
+        cancel,
     };
     let mut denoised_channels =
-        bm3d_process_joint(&channels, width, height, &params, &dct_tables, &progress);
+        bm3d_process_joint(&channels, width, height, &params, &dct_tables, &progress)?;
 
     {
         let blurred_y = gaussian_blur_1ch(&original_y, width as usize, height as usize, 3.0);
@@ -80,7 +95,7 @@ pub fn denoise(
         &denoised_channels[2],
     );
 
-    merge_channels(&[r, g, b], width, height)
+    Ok(merge_channels(&[r, g, b], width, height))
 }
 
 fn rgb_to_ycbcr(r: &[f32], g: &[f32], b: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -122,7 +137,7 @@ fn bm3d_process_joint(
     params: &Bm3dParams,
     tables: &DctTables,
     progress: &ProgressReporter,
-) -> Vec<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>, String> {
     let basic_estimate = run_bm3d_step_joint(
         noisy_channels,
         noisy_channels,
@@ -132,7 +147,7 @@ fn bm3d_process_joint(
         true,
         tables,
         progress,
-    );
+    )?;
 
     run_bm3d_step_joint(
         noisy_channels,
@@ -156,7 +171,10 @@ fn run_bm3d_step_joint(
     is_step_1: bool,
     tables: &DctTables,
     progress: &ProgressReporter,
-) -> Vec<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>, String> {
+    if progress.cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+        return Err("AI denoise cancelled".to_string());
+    }
     let w = width as usize;
     let h = height as usize;
     let count = w * h;
@@ -177,6 +195,9 @@ fn run_bm3d_step_joint(
     }
 
     ref_patches.par_iter().for_each(|&(rx, ry)| {
+        if progress.cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+            return;
+        }
         let c = progress.counter.fetch_add(1, AtomicOrdering::Relaxed);
         if c.is_multiple_of(200) {
             (progress.on_progress)(c as f32 / progress.total_work as f32);
@@ -245,6 +266,9 @@ fn run_bm3d_step_joint(
         }
     });
 
+    if progress.cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed)) {
+        return Err("AI denoise cancelled".to_string());
+    }
     let mut results = Vec::new();
     for ch in 0..num_channels {
         let num_vec = numerators[ch].to_vec();
@@ -257,7 +281,7 @@ fn run_bm3d_step_joint(
             .collect();
         results.push(final_ch);
     }
-    results
+    Ok(results)
 }
 
 fn hard_threshold(stack: &mut [f32], th: f32) -> usize {
@@ -701,4 +725,18 @@ fn gaussian_blur_1ch(data: &[f32], width: usize, height: usize, sigma: f32) -> V
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn test_denoise_with_cancel_returns_err_when_cancelled() {
+        let img = Rgb32FImage::from_fn(32, 32, |_x, _y| image::Rgb([0.25, 0.25, 0.25]));
+        let cancel = AtomicBool::new(true);
+        let res = denoise_with_cancel(&img, 0.5, Some(&cancel), &|_| {});
+        assert!(res.is_err(), "denoise_with_cancel should return Err when cancel flag is true");
+    }
 }

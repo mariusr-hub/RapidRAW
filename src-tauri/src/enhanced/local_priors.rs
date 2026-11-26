@@ -86,6 +86,16 @@ pub struct EmpiricalSensorFit {
     pub fitted_shot_noise_coeff: Option<f32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IsoNoiseProfileBucket {
+    pub iso_bucket: u32,
+    pub samples: u32,
+    pub read_noise: f32,
+    pub shot_noise: f32,
+    pub chroma_ratio: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DustSpotEntry {
@@ -136,6 +146,8 @@ pub struct LocalPriors {
     #[serde(default)]
     pub empirical_sensors: HashMap<String, EmpiricalSensorFit>,
     #[serde(default)]
+    pub iso_noise_buckets: HashMap<String, Vec<IsoNoiseProfileBucket>>,
+    #[serde(default)]
     pub sensor_dust: HashMap<String, Vec<DustSpotEntry>>,
     #[serde(default)]
     pub culler_sharpness: HashMap<String, CullerSharpnessPrior>,
@@ -154,6 +166,7 @@ impl Default for LocalPriors {
             auto_enhance: HashMap::new(),
             denoise: HashMap::new(),
             empirical_sensors: HashMap::new(),
+            iso_noise_buckets: HashMap::new(),
             sensor_dust: HashMap::new(),
             culler_sharpness: HashMap::new(),
             hdr_preferences: HashMap::new(),
@@ -483,6 +496,122 @@ pub fn get_empirical_sensor_fit(camera_key: &str) -> Option<(f32, f32)> {
     }
 }
 
+pub fn quantize_iso_bucket(iso: u32) -> u32 {
+    const STOPS: &[u32] = &[
+        50, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200,
+        4000, 5000, 6400, 8000, 10000, 12800, 25600, 51200, 102400,
+    ];
+    let iso_c = iso.max(25) as f32;
+    let log_iso = iso_c.log2();
+    let mut best = STOPS[0];
+    let mut best_dist = f32::INFINITY;
+    for &stop in STOPS {
+        let d = ((stop as f32).log2() - log_iso).abs();
+        if d < best_dist {
+            best_dist = d;
+            best = stop;
+        }
+    }
+    best
+}
+
+pub fn record_iso_noise_bucket(
+    camera_key: &str,
+    iso: u32,
+    read_noise: f32,
+    shot_noise: f32,
+    chroma_ratio: f32,
+) {
+    if !is_learning_enabled()
+        || iso < 25
+        || !read_noise.is_finite()
+        || !shot_noise.is_finite()
+        || !chroma_ratio.is_finite()
+        || read_noise <= 0.0
+    {
+        return;
+    }
+    let bucket_iso = quantize_iso_bucket(iso);
+    let r = read_noise.clamp(0.0001, 0.08);
+    let s = shot_noise.max(0.0).clamp(0.0, 0.05);
+    let c = chroma_ratio.clamp(0.25, 3.0);
+
+    if let Ok(mut guard) = PRIORS_STORE.write() {
+        let list = guard
+            .iso_noise_buckets
+            .entry(camera_key.to_string())
+            .or_default();
+        if let Some(existing) = list.iter_mut().find(|b| b.iso_bucket == bucket_iso) {
+            let w = (1.0 / ((existing.samples + 1).min(8) as f32)).clamp(0.12, 1.0);
+            existing.read_noise = (1.0 - w) * existing.read_noise + w * r;
+            existing.shot_noise = (1.0 - w) * existing.shot_noise + w * s;
+            existing.chroma_ratio = (1.0 - w) * existing.chroma_ratio + w * c;
+            existing.samples = existing.samples.saturating_add(1);
+        } else {
+            list.push(IsoNoiseProfileBucket {
+                iso_bucket: bucket_iso,
+                samples: 1,
+                read_noise: r,
+                shot_noise: s,
+                chroma_ratio: c,
+            });
+            list.sort_by_key(|b| b.iso_bucket);
+        }
+    }
+    schedule_flush();
+}
+
+pub fn interpolate_iso_buckets(
+    buckets: &[IsoNoiseProfileBucket],
+    iso: u32,
+) -> Option<IsoNoiseProfileBucket> {
+    if buckets.is_empty() {
+        return None;
+    }
+    let mut sorted = buckets.to_vec();
+    sorted.sort_by_key(|b| b.iso_bucket);
+
+    // Preserve exact stops cleanly so dual-native-ISO cliffs never blur into adjacent stops
+    if let Some(exact) = sorted.iter().find(|b| b.iso_bucket == iso) {
+        return Some(exact.clone());
+    }
+    if iso <= sorted[0].iso_bucket {
+        return Some(sorted[0].clone());
+    }
+    let last = sorted.len() - 1;
+    if iso >= sorted[last].iso_bucket {
+        return Some(sorted[last].clone());
+    }
+
+    for pair in sorted.windows(2) {
+        let lo = &pair[0];
+        let hi = &pair[1];
+        if iso > lo.iso_bucket && iso < hi.iso_bucket {
+            let l0 = (lo.iso_bucket.max(1) as f32).log2();
+            let l1 = (hi.iso_bucket.max(1) as f32).log2();
+            let lx = (iso.max(1) as f32).log2();
+            let t = ((lx - l0) / (l1 - l0).max(1e-5)).clamp(0.0, 1.0);
+            return Some(IsoNoiseProfileBucket {
+                iso_bucket: iso,
+                samples: lo.samples.min(hi.samples),
+                read_noise: lo.read_noise + (hi.read_noise - lo.read_noise) * t,
+                shot_noise: lo.shot_noise + (hi.shot_noise - lo.shot_noise) * t,
+                chroma_ratio: lo.chroma_ratio + (hi.chroma_ratio - lo.chroma_ratio) * t,
+            });
+        }
+    }
+    Some(sorted[last].clone())
+}
+
+pub fn lookup_iso_noise_profile(camera_key: &str, iso: u32) -> Option<IsoNoiseProfileBucket> {
+    if !is_learning_enabled() {
+        return None;
+    }
+    let guard = PRIORS_STORE.read().ok()?;
+    let buckets = guard.iso_noise_buckets.get(camera_key)?;
+    interpolate_iso_buckets(buckets, iso)
+}
+
 pub fn record_dust_spot_confirmation(camera_key: &str, norm_x: f32, norm_y: f32, radius: f32, source_tag: &str) {
     if !is_learning_enabled()
         || !norm_x.is_finite()
@@ -773,10 +902,12 @@ pub fn reset_priors_internal(category: Option<&str>, camera_key: Option<&str>) {
             (Some("denoise"), Some(cam)) => {
                 guard.denoise.retain(|k, _| !k.starts_with(&format!("{}|", cam)));
                 guard.empirical_sensors.remove(cam);
+                guard.iso_noise_buckets.remove(cam);
             }
             (Some("denoise"), None) => {
                 guard.denoise.clear();
                 guard.empirical_sensors.clear();
+                guard.iso_noise_buckets.clear();
             }
             (Some("sensor_dust"), Some(cam)) => {
                 guard.sensor_dust.remove(cam);
@@ -1070,5 +1201,52 @@ mod tests {
         crate::enhanced::auto_tune_loop::init_calibration_vault_path(tmp.clone());
         assert!(!vault_path.exists(), "calibration_vault.json must always be purged on init");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_iso_noise_bucket_log_interpolation_preserves_dual_gain_step() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_priors_internal(None, None);
+        set_learning_enabled(true);
+        let cam = "sony_a7siii_dcg";
+
+        // Dual-native-ISO camera: ISO 400 has higher read noise before the second gain circuit engages at ISO 800
+        record_iso_noise_bucket(cam, 100, 0.0020, 0.0003, 1.0);
+        record_iso_noise_bucket(cam, 400, 0.0065, 0.0008, 1.1);
+        record_iso_noise_bucket(cam, 800, 0.0018, 0.0004, 1.0);
+        record_iso_noise_bucket(cam, 3200, 0.0052, 0.0012, 1.3);
+
+        // Exact stops must preserve dual-native-ISO discontinuity without blurring across the step
+        let at_400 = lookup_iso_noise_profile(cam, 400).expect("ISO 400 bucket");
+        let at_800 = lookup_iso_noise_profile(cam, 800).expect("ISO 800 bucket");
+        assert!(
+            (at_400.read_noise - 0.0065).abs() < 1e-5,
+            "ISO 400 exact bucket must stay 0.0065, got {}",
+            at_400.read_noise
+        );
+        assert!(
+            (at_800.read_noise - 0.0018).abs() < 1e-5,
+            "ISO 800 DCG drop must stay 0.0018, got {}",
+            at_800.read_noise
+        );
+
+        // Log2 midpoint between 100 and 400 is ISO 200 -> exact arithmetic midpoint of log stops
+        let at_200 = lookup_iso_noise_profile(cam, 200).expect("ISO 200 interpolated");
+        assert!(
+            (at_200.read_noise - 0.00425).abs() < 1e-4,
+            "ISO 200 log2-midpoint should be ~0.00425, got {}",
+            at_200.read_noise
+        );
+
+        // Log2 midpoint between 800 and 3200 is ISO 1600
+        let at_1600 = lookup_iso_noise_profile(cam, 1600).expect("ISO 1600 interpolated");
+        assert!(
+            (at_1600.read_noise - 0.0035).abs() < 1e-4,
+            "ISO 1600 log2-midpoint should be ~0.0035, got {}",
+            at_1600.read_noise
+        );
+
+        reset_priors_internal(Some("denoise"), Some(cam));
+        assert!(lookup_iso_noise_profile(cam, 800).is_none());
     }
 }

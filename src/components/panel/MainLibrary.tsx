@@ -3,6 +3,8 @@ import { getVersion } from '@tauri-apps/api/app';
 import { open } from '@tauri-apps/plugin-shell';
 import {
   CheckCheck,
+  ChevronLeft,
+  ChevronRight,
   Folder,
   FolderInput,
   Home,
@@ -16,6 +18,7 @@ import {
   SlidersHorizontal,
   Rows3,
   X,
+  Zap,
 } from 'lucide-react';
 import CullingView from './library/CullingView';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -69,6 +72,8 @@ interface MainLibraryProps {
   onImportClick(): void;
   onLibraryRefresh(): void;
   onOpenFolder(): void;
+  onHistoryBack?: () => void;
+  onHistoryForward?: () => void;
   onSettingsChange(settings: AppSettings): Promise<void>;
   onThumbnailAspectRatioChange(aspectRatio: ThumbnailAspectRatio): void;
   onThumbnailSizeChange(size: ThumbnailSize): void;
@@ -86,6 +91,8 @@ interface DisplayModeSwitchProps {
   setDisplayMode: (mode: LibraryDisplayMode) => void;
   t: any;
 }
+
+const APP_DISPLAY_VERSION = '1.7.1.2';
 
 function DisplayModeSwitch({ displayMode, setDisplayMode, t }: DisplayModeSwitchProps) {
   const options = useMemo(
@@ -159,7 +166,7 @@ function ThumbnailProgressCount() {
 export default function MainLibrary(props: MainLibraryProps) {
   const { t } = useTranslation();
   const setUI = useUIStore((state) => state.setUI);
-  const [appVersion, setAppVersion] = useState('1.7.1.1');
+  const [appVersion, setAppVersion] = useState(APP_DISPLAY_VERSION);
   const [isUpdateAvailable, setIsUpdateAvailable] = useState(false);
   const [latestVersion, setLatestVersion] = useState('');
   const [splashSplit, setSplashSplit] = useState(50);
@@ -211,6 +218,10 @@ export default function MainLibrary(props: MainLibraryProps) {
 
   const searchCriteria = useLibraryStore((state) => state.searchCriteria);
   const setLibrary = useLibraryStore((state) => state.setLibrary);
+  const navHistory = useLibraryStore((state) => state.navHistory);
+  const navIndex = useLibraryStore((state) => state.navIndex);
+  const canGoBack = navIndex > 0;
+  const canGoForward = navIndex < navHistory.length - 1;
 
   const translatedRatingFilterOptions = useMemo(
     () => [
@@ -319,7 +330,8 @@ export default function MainLibrary(props: MainLibraryProps) {
 
     const checkVersion = async () => {
       try {
-        const currentVersion = await getVersion();
+        const rawVersion = await getVersion();
+        const currentVersion = rawVersion === '1.7.1' ? APP_DISPLAY_VERSION : rawVersion;
         setAppVersion(currentVersion);
 
         const response = await fetch('https://api.github.com/repos/CyberTimon/RapidRAW/releases/latest');
@@ -425,7 +437,7 @@ export default function MainLibrary(props: MainLibraryProps) {
                         data-testid="splash-version-badge"
                         className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold bg-accent text-button-text shadow-sm"
                       >
-                        {`v${appVersion || '1.7.1.1'}`}
+                        {`v${appVersion || APP_DISPLAY_VERSION}`}
                       </span>
                     </div>
                     <Text
@@ -635,6 +647,24 @@ export default function MainLibrary(props: MainLibraryProps) {
               <DisplayModeSwitch displayMode={libraryDisplayMode} setDisplayMode={setLibraryDisplayMode} t={t} />
 
               <div className="flex items-center bg-surface p-1 rounded-lg gap-1 border border-border-color/20">
+                <div className="flex items-center gap-0.5 mr-0.5">
+                  <Button
+                    className="h-10 w-10 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:bg-card-active rounded-md transition-colors disabled:opacity-25 disabled:pointer-events-none"
+                    disabled={!canGoBack}
+                    onClick={props.onHistoryBack}
+                    data-tooltip="Go Back (History)"
+                  >
+                    <ChevronLeft size={18} />
+                  </Button>
+                  <Button
+                    className="h-10 w-10 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center hover:bg-card-active rounded-md transition-colors disabled:opacity-25 disabled:pointer-events-none"
+                    disabled={!canGoForward}
+                    onClick={props.onHistoryForward}
+                    data-tooltip="Go Forward (History)"
+                  >
+                    <ChevronRight size={18} />
+                  </Button>
+                </div>
                 <SearchInput indexingProgress={props.aiTaggingJob?.progress} isIndexing={!!props.aiTaggingJob} />
                 <ViewOptionsDropdown
                   libraryViewMode={props.libraryViewMode}
@@ -663,13 +693,32 @@ export default function MainLibrary(props: MainLibraryProps) {
                   </Button>
                 )}
                 {!props.isAndroid && (
-                  <Button
-                    className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center"
-                    onClick={props.onNavigateToCommunity}
-                    data-tooltip={t('library.tooltips.communityPresets')}
-                  >
-                    <Users className="w-5 h-5" />
-                  </Button>
+                  <>
+                    <Button
+                      className="h-12 w-12 bg-transparent text-amber-400 shadow-none p-0 flex items-center justify-center hover:text-amber-300 hover:scale-105 transition-all"
+                      onClick={() =>
+                        setUI({
+                          speedCullerModalState: {
+                            isOpen: true,
+                            selectedPaths: props.multiSelectedPaths.length > 1 ? props.multiSelectedPaths : [],
+                            initialIndex: props.activePath
+                              ? Math.max(0, props.imageList.findIndex((im) => im.path === props.activePath))
+                              : 0,
+                          },
+                        })
+                      }
+                      data-tooltip="Speed Culler & AI Face Loupe (C)"
+                    >
+                      <Zap className="w-5 h-5 fill-amber-400/20 text-amber-400" />
+                    </Button>
+                    <Button
+                      className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center"
+                      onClick={props.onNavigateToCommunity}
+                      data-tooltip={t('library.tooltips.communityPresets')}
+                    >
+                      <Users className="w-5 h-5" />
+                    </Button>
+                  </>
                 )}
                 <Button
                   className="h-12 w-12 bg-transparent text-text-primary shadow-none p-0 flex items-center justify-center"

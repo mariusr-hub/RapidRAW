@@ -16,6 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import Button from '../../components/ui/Button';
 import Text from '../../components/ui/Text';
 import { TextColors, TextVariants } from '../../types/typography';
+import { Invokes } from '../../types/invokes';
 import { useUIStore } from '../../store/useUIStore';
 
 interface DrizzleModalProps {
@@ -33,6 +34,8 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
     sourcePaths,
     scaleFactor,
     pixfrac,
+    bayerCfaMode = true,
+    alignmentMode = 'auto',
     progressMessage,
     error,
     finalImageBase64,
@@ -95,10 +98,12 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
       },
     }));
 
-    invoke('drizzle_super_resolution', {
+    invoke(Invokes.DrizzleSuperResolution, {
       paths: sourcePaths,
       scaleFactor,
       pixfrac,
+      bayerCfaMode,
+      alignmentMode,
     }).catch((err) => {
       setUI((state) => ({
         drizzleModalState: {
@@ -141,7 +146,7 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
     <AnimatePresence>
       {show && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 select-none"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-2 sm:p-4 select-none"
           onMouseDown={handleBackdropMouseDown}
           onClick={handleBackdropClick}
         >
@@ -150,11 +155,11 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: 15 }}
             transition={{ duration: 0.2 }}
-            className="relative flex flex-col w-full max-w-5xl h-[88vh] max-h-[850px] bg-bg-surface border border-border-subtle rounded-2xl shadow-2xl overflow-hidden text-text-primary"
+            className="relative flex flex-col w-full max-w-4xl max-h-[92vh] bg-bg-surface border border-border-subtle rounded-2xl shadow-2xl overflow-hidden text-text-primary"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-border-subtle bg-bg-secondary/40">
+            <div className="shrink-0 flex items-center justify-between gap-2 px-4 sm:px-6 py-3 border-b border-border-subtle bg-bg-secondary/40">
               <div className="flex items-center gap-3">
                 <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-purple-500/10 border border-purple-500/20 text-purple-400">
                   <Telescope className="w-5 h-5" />
@@ -224,28 +229,46 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
                     <span>•</span>
                     <span>Drop Pixfrac p = {pixfrac}</span>
                   </div>
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      invoke(Invokes.CancelDrizzle).catch((err) => console.warn('Cancel failed:', err));
+                      setUI((state) => ({
+                        drizzleModalState: {
+                          ...state.drizzleModalState,
+                          isProcessing: false,
+                          progressMessage: null,
+                        },
+                      }));
+                    }}
+                    className="mt-6"
+                  >
+                    <XCircle className="w-4 h-4 mr-1.5" />
+                    Cancel
+                  </Button>
                 </div>
               )}
 
               {/* Configuration & Ready State */}
               {!isProcessing && !finalImageBase64 && !error && (
-                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-2xl mx-auto">
-                  <div className="w-16 h-16 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400 mb-6">
-                    <Sparkles className="w-8 h-8" />
-                  </div>
-                  <Text variant={TextVariants.heading} className="mb-2 font-semibold">
-                    Configure Drizzle Super-Resolution
-                  </Text>
-                  <Text variant={TextVariants.body} color={TextColors.secondary} className="mb-8 leading-relaxed">
-                    Harness micro-vibrations across {sourcePaths.length} burst exposures to bypass sensor Bayer pixel limits, doubling or tripling true optical resolving power while dramatically boosting signal-to-noise ratio.
-                  </Text>
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  <div className="flex flex-col items-center p-4 sm:p-6 text-center max-w-2xl mx-auto">
+                    <div className="w-12 h-12 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400 mb-3">
+                      <Sparkles className="w-6 h-6" />
+                    </div>
+                    <Text variant={TextVariants.heading} className="mb-1.5 font-semibold">
+                      Configure Drizzle Super-Resolution
+                    </Text>
+                    <Text variant={TextVariants.body} color={TextColors.secondary} className="mb-4 text-sm leading-relaxed">
+                      Harness micro-vibrations across {sourcePaths.length} burst exposures to bypass sensor Bayer pixel limits, doubling or tripling true optical resolving power while dramatically boosting signal-to-noise ratio.
+                    </Text>
 
-                  {/* Scale Factor Selector */}
-                  <div className="w-full bg-bg-surface p-5 rounded-2xl border border-border-subtle mb-6 text-left">
-                    <label className="text-xs font-semibold text-text-secondary uppercase tracking-wider block mb-3">
-                      Reconstruction Scale Factor
-                    </label>
-                    <div className="grid grid-cols-3 gap-3">
+                    {/* Scale Factor Selector */}
+                    <div className="w-full bg-bg-surface p-4 rounded-2xl border border-border-subtle mb-4 text-left">
+                      <label className="text-xs font-semibold text-text-secondary uppercase tracking-wider block mb-2.5">
+                        Reconstruction Scale Factor
+                      </label>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                       {[
                         { factor: 2, label: '2x Super-Res', desc: '4x Resolution Area (Recommended)' },
                         { factor: 3, label: '3x Deep Sky', desc: '9x Resolution Area (Telescopes)' },
@@ -305,15 +328,59 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
                     </div>
                   </div>
 
-                  <Button
-                    variant="primary"
-                    size="lg"
-                    onClick={handleStartDrizzle}
-                    className="w-full max-w-sm flex items-center justify-center gap-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 shadow-lg shadow-purple-500/20 font-semibold py-3"
-                  >
-                    <Telescope className="w-5 h-5" />
-                    Reconstruct Super-Resolution
-                  </Button>
+                  {/* Bayer CFA & Alignment Options */}
+                  <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-3 mb-6 text-left">
+                    <label className="flex items-center justify-between gap-2 bg-bg-surface p-3.5 rounded-xl border border-border-subtle cursor-pointer">
+                      <div>
+                        <div className="text-xs font-semibold text-text-primary">Bayer CFA Drizzle</div>
+                        <div className="text-[11px] text-text-tertiary">Per-channel pre-demosaic RAW drops</div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={bayerCfaMode}
+                        onChange={(e) =>
+                          setUI((state) => ({
+                            drizzleModalState: {
+                              ...state.drizzleModalState,
+                              bayerCfaMode: e.target.checked,
+                            },
+                          }))
+                        }
+                        className="accent-purple-500 w-4 h-4 rounded"
+                      />
+                    </label>
+
+                    <div className="bg-bg-surface p-3.5 rounded-xl border border-border-subtle">
+                      <div className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-1.5">
+                        Alignment Mode
+                      </div>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(['auto', 'terrestrial', 'stars'] as const).map((mode) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() =>
+                              setUI((state) => ({
+                                drizzleModalState: {
+                                  ...state.drizzleModalState,
+                                  alignmentMode: mode,
+                                },
+                              }))
+                            }
+                            className={clsx(
+                              'px-2 py-1 rounded-lg text-[11px] font-medium capitalize transition-colors border',
+                              alignmentMode === mode
+                                ? 'bg-purple-500/20 border-purple-500 text-purple-200'
+                                : 'bg-bg-primary border-border-subtle text-text-secondary hover:text-text-primary',
+                            )}
+                          >
+                            {mode}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
                 </div>
               )}
 
@@ -374,9 +441,25 @@ export default function DrizzleModal({ onOpenFile }: DrizzleModalProps) {
             </div>
 
             {/* Modal Footer Controls */}
+            {!isProcessing && !finalImageBase64 && !error && (
+              <div className="shrink-0 flex flex-wrap items-center justify-end gap-3 px-4 sm:px-6 py-3 border-t border-border-subtle bg-bg-secondary/40">
+                <Button variant="secondary" onClick={handleClose}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  onClick={handleStartDrizzle}
+                  className="flex items-center justify-center gap-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 shadow-lg shadow-purple-500/20 font-semibold"
+                >
+                  <Telescope className="w-4 h-4" />
+                  Reconstruct Super-Resolution
+                </Button>
+              </div>
+            )}
+
             {finalImageBase64 && !isProcessing && (
-              <div className="flex items-center justify-between px-6 py-4 border-t border-border-subtle bg-bg-secondary/40">
-                <div className="flex items-center gap-3">
+              <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 px-4 sm:px-6 py-3 border-t border-border-subtle bg-bg-secondary/40">
+                <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                   <span className="text-xs font-medium text-text-secondary">Export Format:</span>
                   <div className="flex items-center gap-1.5 bg-bg-primary p-1 rounded-xl border border-border-subtle">
                     {(['tiff', 'dng', 'jpeg', 'png'] as const).map((fmt) => (

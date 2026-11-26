@@ -14,17 +14,40 @@ pub fn preview_geometry_transform(
     state: State<AppState>,
 ) -> Result<String, String> {
     let source_img: DynamicImage = {
-        let preview_guard = state.cached_preview.lock().map_err(|e| e.to_string())?;
-        if let Some(cached) = &*preview_guard {
-            (*cached.preview.image).clone()
-        } else {
-            let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-            let loaded = orig_guard.as_ref().ok_or("No active image loaded")?;
-            loaded.image.thumbnail(1024, 1024)
-        }
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        let loaded = orig_guard.as_ref().ok_or("No active image loaded")?;
+        loaded.image.thumbnail(1024, 1024)
     };
 
-    let thumb = source_img.thumbnail(1024, 1024);
+    let mut thumb = source_img.thumbnail(1024, 1024);
+    if params
+        .get("defringeEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let purple_amount = params
+            .get("defringePurpleAmount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(50.0) as f32;
+        let green_amount = params
+            .get("defringeGreenAmount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(50.0) as f32;
+        let edge_threshold = params
+            .get("defringeEdgeThreshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.12) as f32;
+        if purple_amount >= 0.5 || green_amount >= 0.5 {
+            let mut rgb32f = thumb.to_rgb32f();
+            crate::enhanced::denoising::apply_chromatic_defringe_edge_aware(
+                &mut rgb32f,
+                purple_amount,
+                green_amount,
+                edge_threshold,
+            );
+            thumb = DynamicImage::ImageRgb32F(rgb32f);
+        }
+    }
     let (w, h) = thumb.dimensions();
     if w == 0 || h == 0 {
         return Err("Empty image dimensions".to_string());

@@ -42,6 +42,7 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
 import { Invokes } from '../../../types/invokes';
+import DustScratchProSection from '../../../enhanced/panels/DustScratchProSection';
 
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import Switch from '../../ui/Switch';
@@ -490,6 +491,7 @@ export default function AIPanel() {
   const activeAiTasks = useProcessStore((s) => s.activeAiTasks);
   const aiModelDownloadStatus = useProcessStore(selectAiModelDownloadStatus);
   const setCustomEscapeHandler = useUIStore((s) => s.setCustomEscapeHandler);
+  const pendingQuickAction = useUIStore((s) => s.pendingQuickAction);
 
   const { setAdjustments } = useEditorActions();
   const {
@@ -596,12 +598,14 @@ export default function AIPanel() {
                 brushSize: Math.max(24, (s.radius ?? 4) * 3.5),
                 feather: 0.5,
                 points:
-                  s.end_x != null && s.end_y != null
-                    ? [
-                        { x: s.x, y: s.y },
-                        { x: s.end_x, y: s.end_y },
-                      ]
-                    : [{ x: s.x, y: s.y }],
+                  s.points && s.points.length >= 2
+                    ? s.points.map((pt: number[]) => ({ x: pt[0], y: pt[1] }))
+                    : s.end_x != null && s.end_y != null
+                      ? [
+                          { x: s.x, y: s.y },
+                          { x: s.end_x, y: s.end_y },
+                        ]
+                      : [{ x: s.x, y: s.y }],
               })),
             },
           },
@@ -614,8 +618,7 @@ export default function AIPanel() {
         aiPatches: [...(current.aiPatches || []), newContainer],
       };
 
-      setAdjustments(nextAdjustments);
-      useEditorStore.getState().pushHistory(nextAdjustments, t('editor.ai.autoDustBlemishName', 'Auto Dust & Blemishes'));
+      setAdjustments(nextAdjustments, t('editor.ai.autoDustBlemishName', 'Auto Dust & Blemishes'));
 
       onSelectPatchContainer(patchId);
       onSelectSubMask(subMaskId);
@@ -930,6 +933,19 @@ export default function AIPanel() {
           : p,
       ),
     }));
+
+  const handleAddAiPatchContainerRef = useRef(handleAddAiPatchContainer);
+  handleAddAiPatchContainerRef.current = handleAddAiPatchContainer;
+
+  useEffect(() => {
+    if (pendingQuickAction !== 'retouch' && pendingQuickAction !== 'liquify') return;
+    const action = useUIStore.getState().consumeQuickAction();
+    if (action === 'retouch') {
+      handleAddAiPatchContainerRef.current(Mask.Retouch);
+    } else if (action === 'liquify') {
+      handleAddAiPatchContainerRef.current(Mask.Liquify);
+    }
+  }, [pendingQuickAction]);
 
   const handleDeleteContainer = (id: string) => {
     const container = adjustments.aiPatches?.find((p) => p.id === id);
@@ -1525,6 +1541,8 @@ export default function AIPanel() {
                   </AiListRoot>
                 )}
               </AnimatePresence>
+
+              <DustScratchProSection />
 
               <div className="h-4 shrink-0 w-full" onClick={handleDeselect} />
 

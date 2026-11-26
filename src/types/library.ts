@@ -111,17 +111,48 @@ export type PanoramaProjectionMode = 'auto' | PanoramaProjection;
 
 export type MergeKind = 'panorama' | 'hdr' | 'focusStack';
 
+export type HdrToneProfile = 'natural' | 'interior' | 'dramatic' | 'vivid' | 'agxScene' | 'localLaplacian';
+export type HdrDeghostSensitivity = 'off' | 'low' | 'medium' | 'high';
+export type HdrDeghostMode = 'fast' | 'opticalFlow';
+export type HdrPreviewMode = 'sdr' | 'hdr10' | 'headroom';
+
 export interface PanoramaSettings {
   autoCrop: boolean;
   boundaryWarp: number;
   exposureCompensation: boolean;
   projection: PanoramaProjectionMode;
+  yawDeg?: number;
+  pitchDeg?: number;
+  rollDeg?: number;
   fastDraft?: boolean;
   halfSize?: boolean;
+  applyEdits?: boolean;
+  hdrPanorama?: boolean | null;
+  hdrProfile?: HdrToneProfile;
+  hdrStrength?: number;
+  exposureBias?: number;
+  highlightRecovery?: number;
+  shadowLift?: number;
+  detailBoost?: number;
+  outputFormat?: MergeOutputFormat;
 }
+
+export type MergeOutputFormat = 'tiff' | 'jpeg' | 'ultrahdr' | 'png' | 'dng';
 
 export interface HdrSettings {
   autoCrop: boolean;
+  halfSize?: boolean;
+  applyEdits?: boolean;
+  profile?: HdrToneProfile;
+  hdrStrength?: number;
+  deghostSensitivity?: HdrDeghostSensitivity;
+  deghostMode?: HdrDeghostMode;
+  previewMode?: HdrPreviewMode;
+  exposureBias?: number;
+  highlightRecovery?: number;
+  shadowLift?: number;
+  detailBoost?: number;
+  outputFormat?: MergeOutputFormat;
 }
 
 export type FocusStackMethod = 'detail' | 'smooth';
@@ -129,6 +160,8 @@ export type FocusStackMethod = 'detail' | 'smooth';
 export interface FocusStackSettings {
   autoCrop: boolean;
   method: FocusStackMethod;
+  halfSize?: boolean;
+  outputFormat?: MergeOutputFormat;
 }
 
 export interface MergeSettingsByKind {
@@ -145,15 +178,41 @@ export const DEFAULT_MERGE_SETTINGS: MergeSettingsByKind = {
     boundaryWarp: 0,
     exposureCompensation: true,
     projection: 'auto',
+    yawDeg: 0,
+    pitchDeg: 0,
+    rollDeg: 0,
     fastDraft: false,
     halfSize: false,
+    applyEdits: true,
+    hdrPanorama: null,
+    hdrProfile: 'natural',
+    hdrStrength: 100,
+    exposureBias: 0,
+    highlightRecovery: 50,
+    shadowLift: 30,
+    detailBoost: 1.05,
+    outputFormat: 'tiff',
   },
   hdr: {
     autoCrop: true,
+    halfSize: false,
+    applyEdits: true,
+    profile: 'natural',
+    hdrStrength: 100,
+    deghostSensitivity: 'medium',
+    deghostMode: 'opticalFlow',
+    previewMode: 'sdr',
+    exposureBias: 0,
+    highlightRecovery: 50,
+    shadowLift: 30,
+    detailBoost: 1.05,
+    outputFormat: 'tiff',
   },
   focusStack: {
     autoCrop: true,
     method: 'detail',
+    halfSize: false,
+    outputFormat: 'tiff',
   },
 };
 
@@ -161,13 +220,19 @@ export interface MergePreview {
   base64: string;
   excludedCount: number;
   fovDeg?: number | null;
+  hdrPeakNits?: number | null;
+  hdrPreviewBase64?: string | null;
+  headroomMapBase64?: string | null;
   height: number;
   imageCount: number;
+  isSceneReferred?: boolean;
   overlayBase64: string | null;
+  referenceBase64?: string | null;
   projection: PanoramaProjection | null;
   projectionNote?: string | null;
   unalignedCount: number;
   width: number;
+  wraps?: boolean;
 }
 
 export interface CullingSettings {

@@ -391,6 +391,68 @@ pub fn extract_green_cfa_focus_peaking(
     })
 }
 
+fn downscale_2048(img: DynamicImage) -> DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w.max(h) > 2048 {
+        crate::enhanced::fast_resizer::fast_downscale_dynamic(&img, 2048, 2048)
+    } else {
+        img
+    }
+}
+
+fn raw_working_to_srgb8_preview(mut img: DynamicImage) -> image::RgbImage {
+    crate::render::image_processing::apply_cpu_default_raw_processing(&mut img);
+    crate::render::image_processing::working_display_image_to_srgb8(&img)
+}
+
+#[tauri::command]
+pub async fn extract_embedded_raw_preview(
+    path: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let (source_path, _) = crate::library::sidecars::parse_virtual_path(&path);
+        let path_str = source_path.to_string_lossy().to_string();
+
+        let rgb8: image::RgbImage = if let Some(embedded) =
+            crate::library::thumbnails::try_load_embedded_raw_preview(&source_path, 1600)
+                .or_else(|| crate::library::thumbnails::try_load_embedded_raw_preview(&source_path, 512))
+        {
+            downscale_2048(embedded).to_rgb8()
+        } else {
+            let bytes = crate::library::file_ops::read_file_mapped(&source_path)
+                .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+            if !crate::decode::formats::is_raw_file(&path_str) {
+                let display_img = crate::decode::image_loader::load_display_image(&bytes, &path_str)
+                    .map_err(|e| format!("Could not extract preview for '{}': {}", path, e))?;
+                downscale_2048(display_img).to_rgb8()
+            } else {
+                let settings = crate::app::settings::load_settings(app_handle).unwrap_or_default();
+                let raw_img = load_base_image_from_bytes(
+                    &bytes,
+                    &path_str,
+                    true,
+                    &settings,
+                    None,
+                )
+                .map_err(|e| format!("Could not extract preview for '{}': {}", path, e))?;
+                raw_working_to_srgb8_preview(downscale_2048(raw_img))
+            }
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        rgb8.write_to(&mut buf, ImageFormat::Jpeg)
+            .map_err(|e| format!("Failed to encode preview JPEG: {}", e))?;
+
+        Ok(format!(
+            "data:image/jpeg;base64,{}",
+            general_purpose::STANDARD.encode(buf.get_ref())
+        ))
+    })
+    .await
+    .map_err(|e| format!("Embedded preview task failed: {}", e))?
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BurstGroup {
     pub group_id: usize,
@@ -773,5 +835,20 @@ mod tests {
             score_open,
             score_blink
         );
+    }
+
+    #[test]
+    fn test_raw_working_to_srgb8_preview_maps_midgray_non_black() {
+        let mid_gray = image::Rgb32FImage::from_pixel(4, 4, image::Rgb([0.18, 0.18, 0.18]));
+        let srgb8 = raw_working_to_srgb8_preview(DynamicImage::ImageRgb32F(mid_gray));
+        for px in srgb8.pixels() {
+            for &ch in &px.0 {
+                assert!(
+                    (100..=150).contains(&ch),
+                    "Expected mid-gray preview channel in 100..=150, got {}",
+                    ch
+                );
+            }
+        }
     }
 }

@@ -1,6 +1,7 @@
 export interface KeybindDefinition {
   action: string;
   description: string;
+  fallbackDescription?: string;
   defaultCombo: string[];
   macDefaultCombo?: string[];
   section: 'library' | 'view' | 'rating' | 'panels' | 'editing';
@@ -133,6 +134,20 @@ export const KEYBIND_DEFINITIONS: KeybindDefinition[] = [
     action: 'show_original',
     description: 'settings.keybinds.actions.show_original',
     defaultCombo: ['KeyB'],
+    section: 'view',
+  },
+  {
+    action: 'cycle_compare_mode',
+    description: 'settings.keybinds.actions.cycle_compare_mode',
+    fallbackDescription: 'Cycle Compare Mode (Split / 4-Way)',
+    defaultCombo: ['KeyY'],
+    section: 'view',
+  },
+  {
+    action: 'toggle_soft_proof',
+    description: 'settings.keybinds.actions.toggle_soft_proof',
+    fallbackDescription: 'Toggle Soft-Proofing',
+    defaultCombo: ['shift', 'KeyG'],
     section: 'view',
   },
   { action: 'rate_0', description: 'settings.keybinds.actions.rate_0', defaultCombo: ['Digit0'], section: 'rating' },
@@ -283,6 +298,13 @@ export const KEYBIND_DEFINITIONS: KeybindDefinition[] = [
     action: 'focus_search',
     description: 'settings.keybinds.actions.focus_search',
     defaultCombo: ['ctrl', 'KeyF'],
+    section: 'library',
+  },
+  {
+    action: 'open_speed_culler',
+    description: 'settings.keybinds.actions.open_speed_culler',
+    fallbackDescription: 'Open Speed Culler & Face Loupe',
+    defaultCombo: ['KeyC'],
     section: 'library',
   },
   { action: 'undo', description: 'settings.keybinds.actions.undo', defaultCombo: ['ctrl', 'KeyZ'], section: 'editing' },

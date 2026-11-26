@@ -211,17 +211,30 @@ pub fn run_stock_photo_prep_batch(
             }
         };
 
-        let is_raw = is_raw_file(path_str);
-        if !is_raw {
-            dyn_img = apply_srgb_to_linear(dyn_img);
-        }
-
         // -------------------------------------------------------------
         // Stage 1: Ingestion & Baseline Polish (Sidecar check vs. Auto-Polish)
         // -------------------------------------------------------------
         let sidecar = load_sidecar(&sidecar_path);
         let has_user_adjustments = !sidecar.adjustments.is_null()
             && sidecar.adjustments.as_object().map_or(false, |m| !m.is_empty());
+
+        if has_user_adjustments
+            && let Some(rendered) = crate::export::render_image_with_edits(
+                path_str,
+                &dyn_img,
+                Some(&sidecar.adjustments),
+                settings,
+                app_handle,
+                false,
+            )
+        {
+            dyn_img = rendered;
+        }
+
+        let is_raw = is_raw_file(path_str);
+        if !is_raw || has_user_adjustments {
+            dyn_img = apply_srgb_to_linear(dyn_img);
+        }
 
         let (scene, _) = detect_semantic_scene(&dyn_img);
         let mut rgb32f = dyn_img.to_rgb32f();
@@ -1092,6 +1105,22 @@ pub fn generate_conceptual_seo_keywords(
                 "contemporary".into(),
                 "stock footage".into(),
                 "commercial stock".into(),
+            ]);
+        }
+        SemanticScene::Hdr => {
+            tags.extend([
+                "high dynamic range".into(),
+                "hdr photography".into(),
+                "dramatic lighting".into(),
+                "tonemapped".into(),
+            ]);
+        }
+        SemanticScene::Panorama => {
+            tags.extend([
+                "panoramic view".into(),
+                "wide angle".into(),
+                "panoramic landscape".into(),
+                "stitched panorama".into(),
             ]);
         }
     }

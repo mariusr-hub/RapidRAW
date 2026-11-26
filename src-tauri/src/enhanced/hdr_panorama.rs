@@ -67,6 +67,78 @@ pub struct HdrPanoGroupingReport {
     pub detected_bracket_size: usize,
 }
 
+#[derive(Clone, Debug)]
+struct BracketItemMeta {
+    path: String,
+    timestamp: u64,
+    physical_scale: f32,
+    has_valid_exposure: bool,
+}
+
+fn read_real_physical_scale(path: &str) -> Option<f32> {
+    let (source_path, _) = parse_virtual_path(path);
+    let path_str = source_path.to_string_lossy();
+    let sidecar_map = crate::metadata::exif_processing::read_rrexif_sidecar(&source_path);
+    let mut exposure_opt = read_exposure_time_secs(&path_str, &[]);
+    let mut iso_opt = read_iso(&path_str, &[]);
+    let mut f_num_opt = sidecar_map
+        .as_ref()
+        .and_then(|m| m.get("FNumber").or_else(|| m.get("ApertureValue")))
+        .and_then(|s| s.replace("f/", "").replace("F/", "").trim().parse::<f32>().ok())
+        .filter(|&v| v > 0.1 && v < 128.0);
+
+    if exposure_opt.is_none() || iso_opt.is_none() || f_num_opt.is_none() {
+        if let Ok(mapped) = crate::library::file_ops::read_file_mapped(&source_path) {
+            if exposure_opt.is_none() {
+                exposure_opt = read_exposure_time_secs(&path_str, &mapped);
+            }
+            if iso_opt.is_none() {
+                iso_opt = read_iso(&path_str, &mapped);
+            }
+            if f_num_opt.is_none() {
+                f_num_opt = read_f_number(&path_str, &mapped);
+            }
+        }
+    }
+
+    let exposure_sec = exposure_opt?;
+    let iso = iso_opt.map(|g| g as f32).unwrap_or(100.0);
+    let f_number = f_num_opt.unwrap_or(5.6);
+    Some(compute_physical_exposure_scale(Duration::from_secs_f32(exposure_sec), iso, f_number))
+}
+
+fn groups_have_real_spread(scales: &[Vec<Option<f32>>]) -> bool {
+    if scales.len() < 2 {
+        return false;
+    }
+    scales.iter().all(|group| {
+        if group.len() < 2 {
+            return false;
+        }
+        let valid: Vec<f32> = group
+            .iter()
+            .filter_map(|v| v.filter(|&s| s.is_finite() && s > 0.0))
+            .collect();
+        if valid.len() < 2 {
+            return false;
+        }
+        let min_s = valid.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_s = valid.iter().copied().fold(0.0f32, f32::max);
+        min_s > 0.0 && (max_s / min_s) >= 1.45
+    })
+}
+
+pub fn has_real_hdr_exposure_spread(groups: &[ExposureBracketGroup]) -> bool {
+    if groups.len() < 2 {
+        return false;
+    }
+    let scales: Vec<Vec<Option<f32>>> = groups
+        .iter()
+        .map(|g| g.paths.iter().map(|p| read_real_physical_scale(p)).collect())
+        .collect();
+    groups_have_real_spread(&scales)
+}
+
 /// Automatically clusters arbitrary RAW photo selections into HDR exposure bracket groups
 /// by physical exposure scale E = (t * ISO) / F^2, temporal burst proximity, and outlier isolation.
 pub fn cluster_hdr_brackets_robust(paths: &[String]) -> (Vec<ExposureBracketGroup>, Vec<String>) {
@@ -74,28 +146,66 @@ pub fn cluster_hdr_brackets_robust(paths: &[String]) -> (Vec<ExposureBracketGrou
         return (Vec::new(), Vec::new());
     }
 
-    #[derive(Clone)]
-    struct ItemMeta {
-        path: String,
-        timestamp: u64,
-        physical_scale: f32,
-    }
-
-    let mut items: Vec<ItemMeta> = Vec::with_capacity(paths.len());
+    let mut items: Vec<BracketItemMeta> = Vec::with_capacity(paths.len());
 
     for path in paths {
         let (source_path, _) = parse_virtual_path(path);
-        let file_bytes = fs::read(&source_path).unwrap_or_default();
-        let exposure_sec = read_exposure_time_secs(&source_path.to_string_lossy(), &file_bytes).unwrap_or(0.01);
-        let iso = read_iso(&source_path.to_string_lossy(), &file_bytes).map(|g| g as f32).unwrap_or(100.0);
-        let f_number = read_f_number(&source_path.to_string_lossy(), &file_bytes).unwrap_or(5.6);
+        let path_str = source_path.to_string_lossy();
+        let sidecar_map = crate::metadata::exif_processing::read_rrexif_sidecar(&source_path);
+        let mut exposure_opt = read_exposure_time_secs(&path_str, &[]);
+        let mut iso_opt = read_iso(&path_str, &[]);
+        let mut f_num_opt = sidecar_map
+            .as_ref()
+            .and_then(|m| m.get("FNumber").or_else(|| m.get("ApertureValue")))
+            .and_then(|s| s.replace("f/", "").replace("F/", "").trim().parse::<f32>().ok())
+            .filter(|&v| v > 0.1 && v < 128.0);
+        let has_sidecar_ts = sidecar_map
+            .as_ref()
+            .and_then(|m| m.get("DateTimeOriginal").or_else(|| m.get("DateTime")))
+            .and_then(|s| parse_exif_timestamp(s))
+            .is_some();
+
+        let mapped = if exposure_opt.is_none() || iso_opt.is_none() || f_num_opt.is_none() || !has_sidecar_ts {
+            crate::library::file_ops::read_file_mapped(&source_path).ok()
+        } else {
+            None
+        };
+        let bytes_slice: &[u8] = mapped.as_deref().unwrap_or(&[]);
+
+        if exposure_opt.is_none() {
+            exposure_opt = read_exposure_time_secs(&path_str, bytes_slice);
+        }
+        if iso_opt.is_none() {
+            iso_opt = read_iso(&path_str, bytes_slice);
+        }
+        if f_num_opt.is_none() {
+            f_num_opt = read_f_number(&path_str, bytes_slice);
+        }
+
+        let has_valid_exposure = exposure_opt.is_some();
+        let exposure_sec = exposure_opt.unwrap_or(0.01);
+        let iso = iso_opt.map(|g| g as f32).unwrap_or(100.0);
+        let f_number = f_num_opt.unwrap_or(5.6);
         let physical_scale = compute_physical_exposure_scale(Duration::from_secs_f32(exposure_sec), iso, f_number);
 
-        let exif_map = crate::metadata::sidecar::read_exif_data(&source_path.to_string_lossy(), &file_bytes);
+        let exif_map = sidecar_map.unwrap_or_else(|| {
+            crate::metadata::sidecar::read_exif_data(&path_str, bytes_slice)
+        });
         let timestamp = exif_map
             .get("DateTimeOriginal")
             .or_else(|| exif_map.get("DateTime"))
             .and_then(|s| parse_exif_timestamp(s))
+            .or_else(|| {
+                if !bytes_slice.is_empty() {
+                    let disk_exif = crate::metadata::sidecar::read_exif_data(&path_str, bytes_slice);
+                    disk_exif
+                        .get("DateTimeOriginal")
+                        .or_else(|| disk_exif.get("DateTime"))
+                        .and_then(|s| parse_exif_timestamp(s))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| {
                 fs::metadata(&source_path)
                     .and_then(|m| m.modified())
@@ -103,13 +213,21 @@ pub fn cluster_hdr_brackets_robust(paths: &[String]) -> (Vec<ExposureBracketGrou
                     .unwrap_or(0)
             });
 
-        items.push(ItemMeta {
+        items.push(BracketItemMeta {
             path: path.clone(),
             timestamp,
             physical_scale,
+            has_valid_exposure,
         });
     }
 
+    cluster_bracket_items(paths, items)
+}
+
+fn cluster_bracket_items(
+    paths: &[String],
+    mut items: Vec<BracketItemMeta>,
+) -> (Vec<ExposureBracketGroup>, Vec<String>) {
     // Sort chronologically, then by filename
     items.sort_by(|a, b| {
         if a.timestamp != b.timestamp && a.timestamp > 0 && b.timestamp > 0 {
@@ -158,8 +276,22 @@ pub fn cluster_hdr_brackets_robust(paths: &[String]) -> (Vec<ExposureBracketGrou
         }
     }
 
+    let valid_scales: Vec<f32> = cohesive_items
+        .iter()
+        .filter(|it| it.has_valid_exposure && it.physical_scale.is_finite() && it.physical_scale > 0.0)
+        .map(|it| it.physical_scale)
+        .collect();
+    let any_valid = !valid_scales.is_empty();
+    let spread = if valid_scales.len() >= 2 {
+        let min_s = valid_scales.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_s = valid_scales.iter().copied().fold(0.0f32, f32::max);
+        if min_s > 0.0 { max_s / min_s } else { 1.0 }
+    } else {
+        1.0
+    };
+
     let mut groups: Vec<ExposureBracketGroup> = Vec::new();
-    let mut current_group: Vec<ItemMeta> = Vec::new();
+    let mut current_group: Vec<BracketItemMeta> = Vec::new();
 
     for item in cohesive_items {
         let mut start_new_group = false;
@@ -222,10 +354,15 @@ pub fn cluster_hdr_brackets_robust(paths: &[String]) -> (Vec<ExposureBracketGrou
     }
 
     // Smart fallback: If grouping produced single-frame orphans or only 1 group,
-    // but the cohesive files count is divisible by 3 and >= 6, chunk by 3!
+    // but the cohesive files count is divisible by 3 and >= 6, chunk by 3 —
+    // unless real EXIF exposures were read and show a flat single-exposure panorama (< 0.5 EV spread).
     let total_cohesive = paths.len().saturating_sub(excluded_outliers.len());
     let has_orphans = groups.iter().any(|g| g.paths.len() < 2);
-    if (groups.len() <= 1 || has_orphans) && total_cohesive >= 6 && total_cohesive % 3 == 0 {
+    if (groups.len() <= 1 || has_orphans)
+        && total_cohesive >= 6
+        && total_cohesive % 3 == 0
+        && !(any_valid && spread < 1.45)
+    {
         let mut fallback_paths = Vec::new();
         for path in paths {
             if !excluded_outliers.contains(path) {
@@ -378,8 +515,30 @@ pub fn stitch_hdr_panorama_native(
         );
     }
     println!("  [HDR Pano] Applying global Virtual-Exposure Laplacian Pyramid tone-mapping...");
+    let to_srgb = crate::render::color_space::working_to_srgb();
+    let srgb_out = crate::render::color_space::OutputTransform::srgb(true);
+    let (sw, sh) = stitched_linear.dimensions();
+    let mut srgb_lin = Rgb32FImage::new(sw, sh);
+    srgb_lin
+        .as_mut()
+        .par_chunks_exact_mut(3)
+        .zip(stitched_linear.as_raw().par_chunks_exact(3))
+        .for_each(|(dst, src)| {
+            let clean = glam::Vec3::new(
+                if src[0].is_finite() { src[0].max(0.0) } else { 0.0 },
+                if src[1].is_finite() { src[1].max(0.0) } else { 0.0 },
+                if src[2].is_finite() { src[2].max(0.0) } else { 0.0 },
+            );
+            let mapped = crate::render::color_space::fit_gamut(
+                (to_srgb * clean).to_array(),
+                &srgb_out.compression,
+            );
+            dst[0] = mapped[0].max(0.0);
+            dst[1] = mapped[1].max(0.0);
+            dst[2] = mapped[2].max(0.0);
+        });
     let tone_mapped = crate::enhanced::hdr_handheld::tone_map_virtual_exposure_pyramid(
-        &stitched_linear,
+        &srgb_lin,
         &crate::enhanced::hdr_handheld::HdrMergeOptions::default(),
     );
 
@@ -864,50 +1023,66 @@ pub fn stitch_hdr_panels_with_optics(
 }
 
 #[tauri::command]
-pub fn inspect_hdr_pano_grouping(paths: Vec<String>) -> Result<HdrPanoGroupingReport, String> {
-    let (panels, excluded_outliers) = cluster_hdr_brackets_robust(&paths);
-    let total_files = paths.len();
-    let detected_bracket_size = if !panels.is_empty() { panels[0].paths.len() } else { 0 };
-    let is_consistent_bracket_size = !panels.is_empty() && panels.iter().all(|p| p.paths.len() == detected_bracket_size);
+pub async fn inspect_hdr_pano_grouping(paths: Vec<String>) -> Result<HdrPanoGroupingReport, String> {
+    tokio::task::spawn_blocking(move || {
+        let (panels, excluded_outliers) = cluster_hdr_brackets_robust(&paths);
+        let total_files = paths.len();
+        let detected_bracket_size = if !panels.is_empty() { panels[0].paths.len() } else { 0 };
+        let is_consistent_bracket_size =
+            !panels.is_empty() && panels.iter().all(|p| p.paths.len() == detected_bracket_size);
 
-    Ok(HdrPanoGroupingReport {
-        total_files,
-        panels,
-        excluded_outliers,
-        is_consistent_bracket_size,
-        detected_bracket_size,
+        Ok(HdrPanoGroupingReport {
+            total_files,
+            panels,
+            excluded_outliers,
+            is_consistent_bracket_size,
+            detected_bracket_size,
+        })
     })
+    .await
+    .map_err(|e| format!("HDR panorama grouping task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn inspect_panorama_brackets(paths: Vec<String>) -> serde_json::Value {
-    let (panels, excluded_outliers) = cluster_hdr_brackets_robust(&paths);
-    let panel_count = panels.len();
-    let bracket_size = panels.first().map(|p| p.paths.len()).unwrap_or(0);
-    let is_hdr_bracket_set = panel_count >= 2 && bracket_size >= 2;
-    let summary = if is_hdr_bracket_set {
-        format!(
-            "Detected {} panorama panels x {} exposure brackets ({} total frames){}",
-            panel_count,
-            bracket_size,
-            paths.len(),
-            if excluded_outliers.is_empty() {
-                String::new()
-            } else {
-                format!(", {} outlier(s)", excluded_outliers.len())
-            }
-        )
-    } else {
-        "Standard single-exposure panorama set".to_string()
-    };
+pub async fn inspect_panorama_brackets(paths: Vec<String>) -> serde_json::Value {
+    tokio::task::spawn_blocking(move || {
+        let (panels, excluded_outliers) = cluster_hdr_brackets_robust(&paths);
+        let panel_count = panels.len();
+        let bracket_size = panels.first().map(|p| p.paths.len()).unwrap_or(0);
+        let is_hdr_bracket_set =
+            panel_count >= 2 && bracket_size >= 2 && has_real_hdr_exposure_spread(&panels);
+        let summary = if is_hdr_bracket_set {
+            format!(
+                "Detected {} panorama panels x {} exposure brackets ({} total frames){}",
+                panel_count,
+                bracket_size,
+                paths.len(),
+                if excluded_outliers.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} outlier(s)", excluded_outliers.len())
+                }
+            )
+        } else {
+            "Standard single-exposure panorama set".to_string()
+        };
 
-    serde_json::json!({
-        "isHdrBracketSet": is_hdr_bracket_set,
-        "panelCount": panel_count,
-        "bracketSize": bracket_size,
-        "excludedOutliers": excluded_outliers.len(),
-        "summary": summary,
+        serde_json::json!({
+            "isHdrBracketSet": is_hdr_bracket_set,
+            "panelCount": panel_count,
+            "bracketSize": bracket_size,
+            "excludedOutliers": excluded_outliers.len(),
+            "summary": summary,
+        })
     })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({
+        "isHdrBracketSet": false,
+        "panelCount": 0,
+        "bracketSize": 0,
+        "excludedOutliers": 0,
+        "summary": "Standard single-exposure panorama set",
+    }))
 }
 
 #[tauri::command]
@@ -965,6 +1140,119 @@ pub async fn update_hdr_panorama_preview(
     .map_err(|e| format!("Failed to update HDR panorama preview: {}", e))?
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PanoramaSequenceGroup {
+    pub id: String,
+    pub paths: Vec<String>,
+    pub is_hdr: bool,
+    pub count: usize,
+    pub focal_length: Option<f64>,
+}
+
+fn parse_focal_length_mm(raw: &str) -> Option<f64> {
+    raw.split(|c: char| !c.is_ascii_digit() && c != '.')
+        .find(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f64>().ok())
+}
+
+fn group_consecutive_sequences(
+    mut items: Vec<(String, Option<u64>, Option<f64>)>,
+) -> Vec<(Vec<String>, Option<f64>)> {
+    items.sort_by(|a, b| (a.1.unwrap_or(u64::MAX), a.0.as_str()).cmp(&(b.1.unwrap_or(u64::MAX), b.0.as_str())));
+
+    let mut result: Vec<(Vec<String>, Option<f64>)> = Vec::new();
+    let mut current_group: Vec<String> = Vec::new();
+    let mut last_timestamp: Option<u64> = None;
+    let mut last_focal: Option<f64> = None;
+
+    for (path_str, timestamp, focal) in items {
+        let is_consecutive = match (last_timestamp, timestamp, last_focal, focal) {
+            (Some(lt), Some(ct), Some(lf), Some(cf)) => {
+                ct.abs_diff(lt) <= 5 && (cf - lf).abs() < 1.0
+            }
+            (Some(lt), Some(ct), _, _) => ct.abs_diff(lt) <= 4,
+            _ => false,
+        };
+
+        if is_consecutive {
+            current_group.push(path_str);
+        } else {
+            if current_group.len() >= 2 {
+                result.push((current_group, last_focal));
+            }
+            current_group = vec![path_str];
+        }
+
+        last_timestamp = timestamp;
+        last_focal = focal;
+    }
+
+    if current_group.len() >= 2 {
+        result.push((current_group, last_focal));
+    }
+
+    result
+}
+
+#[tauri::command]
+pub async fn detect_panorama_sequences(
+    image_paths: Vec<String>,
+) -> Result<Vec<PanoramaSequenceGroup>, String> {
+    if image_paths.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let items: Vec<(String, Option<u64>, Option<f64>)> = image_paths
+            .into_iter()
+            .map(|path_str| {
+                let (real_path, _) = parse_virtual_path(&path_str);
+                let real_str = real_path.to_string_lossy();
+                let meta = crate::metadata::exif_processing::read_rrexif_sidecar(&real_path)
+                    .unwrap_or_else(|| {
+                        let mapped = crate::library::file_ops::read_file_mapped(&real_path).ok();
+                        crate::metadata::sidecar::read_exif_data(&real_str, mapped.as_deref().unwrap_or(&[]))
+                    });
+
+                let timestamp = meta
+                    .get("DateTimeOriginal")
+                    .or_else(|| meta.get("DateTime"))
+                    .and_then(|s| parse_exif_timestamp(s));
+                let focal = meta
+                    .get("FocalLength")
+                    .and_then(|fl| parse_focal_length_mm(fl));
+
+                (path_str, timestamp, focal)
+            })
+            .collect();
+
+        let sequences = group_consecutive_sequences(items);
+        let groups: Vec<PanoramaSequenceGroup> = sequences
+            .into_iter()
+            .enumerate()
+            .map(|(i, (paths, focal_length))| {
+                let count = paths.len();
+                let (bracket_groups, _) = cluster_hdr_brackets_robust(&paths);
+                let is_hdr = bracket_groups.len() >= 2
+                    && bracket_groups.iter().all(|g| g.paths.len() >= 2)
+                    && has_real_hdr_exposure_spread(&bracket_groups);
+                PanoramaSequenceGroup {
+                    id: format!("pano_{}_{}", i + 1, count),
+                    paths,
+                    is_hdr,
+                    count,
+                    focal_length,
+                }
+            })
+            .collect();
+
+        Ok(groups)
+    })
+    .await
+    .map_err(|e| format!("Panorama sequence detection failed: {}", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1295,77 @@ mod tests {
         // Check that 18% gray (approx 0.18) is mapped into middle range rather than crushed near 0
         let mid_pixel = gray.get_pixel(50, 50)[0];
         assert!(mid_pixel > 80, "Midtone details must be lifted above dark floor for ORB detector, got {}", mid_pixel);
+    }
+
+    #[test]
+    fn test_detect_panorama_sequences_empty_or_unreadable() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let empty = rt.block_on(detect_panorama_sequences(Vec::new())).unwrap();
+        assert!(empty.is_empty(), "Empty input should yield zero panorama sequences");
+
+        let no_exif = rt
+            .block_on(detect_panorama_sequences(vec![
+                "d:/Rapidraw_04/nonexistent_pano_1.jpg".to_string(),
+                "d:/Rapidraw_04/nonexistent_pano_2.jpg".to_string(),
+            ]))
+            .unwrap();
+        assert!(no_exif.is_empty(), "Files without EXIF timestamps should yield zero sequences");
+    }
+
+    #[test]
+    fn test_single_exposure_6_frame_pano_not_misclassified_as_hdr() {
+        let paths: Vec<String> = (1..=6).map(|i| format!("P{}.CR2", i)).collect();
+        let items: Vec<BracketItemMeta> = (1..=6)
+            .map(|i| BracketItemMeta {
+                path: format!("P{}.CR2", i),
+                timestamp: 1000 + (i as u64 - 1) * 2,
+                physical_scale: 1.0,
+                has_valid_exposure: true,
+            })
+            .collect();
+
+        let (groups, excluded) = cluster_bracket_items(&paths, items);
+        assert!(excluded.is_empty());
+        assert!(
+            groups.iter().all(|g| g.paths.len() <= 1),
+            "Flat 6-frame single-exposure panorama must not be chunked into multi-frame HDR brackets: {:?}",
+            groups
+        );
+        let total: usize = groups.iter().map(|g| g.paths.len()).sum();
+        assert_eq!(total, 6);
+
+        assert!(!groups_have_real_spread(&[
+            vec![Some(1.0), Some(1.0), Some(1.0)],
+            vec![Some(1.0), Some(1.0), Some(1.0)],
+        ]));
+    }
+
+    #[test]
+    fn test_real_brackets_detected_as_hdr_spread() {
+        assert!(groups_have_real_spread(&[
+            vec![Some(0.25), Some(1.0), Some(4.0)],
+            vec![Some(0.25), Some(1.0), Some(4.0)],
+        ]));
+        assert!(!groups_have_real_spread(&[
+            vec![None, None, None],
+            vec![None, None, None],
+        ]));
+    }
+
+    #[test]
+    fn test_parse_focal_length_mm_and_chronological_order() {
+        assert_eq!(parse_focal_length_mm("24mm"), Some(24.0));
+        assert_eq!(parse_focal_length_mm("24.0 mm"), Some(24.0));
+        assert_eq!(parse_focal_length_mm("50 mm (35mm equivalent: 75 mm)"), Some(50.0));
+        assert_eq!(parse_focal_length_mm("abc"), None);
+
+        let sequences = group_consecutive_sequences(vec![
+            ("C".to_string(), Some(104), Some(24.0)),
+            ("A".to_string(), Some(100), Some(24.0)),
+            ("B".to_string(), Some(102), Some(24.0)),
+            ("Z".to_string(), Some(500), Some(24.0)),
+        ]);
+        assert_eq!(sequences.len(), 1);
+        assert_eq!(sequences[0].0, vec!["A", "B", "C"]);
     }
 }

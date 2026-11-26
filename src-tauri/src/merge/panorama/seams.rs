@@ -46,7 +46,7 @@ impl SeamLayer {
     }
 }
 
-fn distance_to_border(layer: &SeamLayer, width: usize, height: usize) -> Vec<f32> {
+fn distance_to_border(layer: &SeamLayer, width: usize, height: usize, wraps: bool) -> Vec<f32> {
     let (w, h) = (layer.roi.width, layer.roi.height);
     let (x0, y0) = (layer.roi.x as isize, layer.roi.y as isize);
     let mut dist: Vec<f32> = layer
@@ -57,7 +57,7 @@ fn distance_to_border(layer: &SeamLayer, width: usize, height: usize) -> Vec<f32
     let at = |d: &Vec<f32>, x: isize, y: isize| -> f32 {
         if x < 0 || y < 0 || x >= w as isize || y >= h as isize {
             let (gx, gy) = (x0 + x, y0 + y);
-            if gx < 0 || gy < 0 || gx >= width as isize || gy >= height as isize {
+            if gy < 0 || gy >= height as isize || (!wraps && (gx < 0 || gx >= width as isize)) {
                 f32::MAX
             } else {
                 0.0
@@ -127,12 +127,22 @@ fn pair_region(
     b: usize,
     width: usize,
     height: usize,
+    wraps: bool,
 ) -> Option<Rect> {
     let overlap = layers[a].roi.intersect(&layers[b].roi)?;
     Some(Rect {
-        x: overlap.x.saturating_sub(1),
+        x: if wraps && overlap.x == 0 {
+            0
+        } else {
+            overlap.x.saturating_sub(1)
+        },
         y: overlap.y.saturating_sub(1),
-        width: (overlap.right() + 1).min(width) - overlap.x.saturating_sub(1),
+        width: (overlap.right() + 1).min(width)
+            - if wraps && overlap.x == 0 {
+                0
+            } else {
+                overlap.x.saturating_sub(1)
+            },
         height: (overlap.bottom() + 1).min(height) - overlap.y.saturating_sub(1),
     })
 }
@@ -145,6 +155,7 @@ fn refine_pair(
     distances: &[Vec<f32>],
     (a, b): (usize, usize),
     region: Rect,
+    wraps: bool,
 ) -> Vec<(usize, u16)> {
     let (la, lb) = (&layers[a], &layers[b]);
     let (label_a, label_b) = (a as u16, b as u16);
@@ -196,10 +207,17 @@ fn refine_pair(
         for (dx, dy) in [(1isize, 0isize), (0, 1), (-1, 0), (0, -1)] {
             let nx = x as isize + dx;
             let ny = y as isize + dy;
-            if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
+            if ny < 0 || ny >= height as isize {
                 continue;
             }
-            if let Some(m) = node_at(nx, ny) {
+            let wx = if wraps {
+                nx.rem_euclid(width as isize)
+            } else if nx < 0 || nx >= width as isize {
+                continue;
+            } else {
+                nx
+            };
+            if let Some(m) = node_at(wx, ny) {
                 if dx + dy > 0 {
                     let m = m as usize;
                     let cost = (difference[n] + difference[m])
@@ -209,7 +227,7 @@ fn refine_pair(
                 }
                 continue;
             }
-            let neighbor_label = labels[ny as usize * width + nx as usize];
+            let neighbor_label = labels[ny as usize * width + wx as usize];
             let cost =
                 (2.0 * difference[n]) / (2.0 * gradient[n] + GRADIENT_EPSILON) + SMOOTHNESS_COST;
             if neighbor_label == label_a {
@@ -246,15 +264,15 @@ fn expanded(rect: &Rect, margin: usize) -> Rect {
     }
 }
 
-pub fn find_seams(width: usize, height: usize, layers: &[SeamLayer]) -> Vec<u16> {
+pub fn find_seams(width: usize, height: usize, layers: &[SeamLayer], wraps: bool) -> Vec<u16> {
     let distances: Vec<Vec<f32>> = layers
         .par_iter()
-        .map(|layer| distance_to_border(layer, width, height))
+        .map(|layer| distance_to_border(layer, width, height, wraps))
         .collect();
     let mut labels = initial_labels(width, height, layers, &distances);
     let mut pending: Vec<((usize, usize), Rect)> = (0..layers.len())
         .flat_map(|a| (a + 1..layers.len()).map(move |b| (a, b)))
-        .filter_map(|(a, b)| pair_region(layers, a, b, width, height).map(|r| ((a, b), r)))
+        .filter_map(|(a, b)| pair_region(layers, a, b, width, height, wraps).map(|r| ((a, b), r)))
         .collect();
 
     while !pending.is_empty() {
@@ -274,7 +292,7 @@ pub fn find_seams(width: usize, height: usize, layers: &[SeamLayer]) -> Vec<u16>
         let updates: Vec<Vec<(usize, u16)>> = batch
             .par_iter()
             .map(|&(pair, region)| {
-                refine_pair(&labels, width, height, layers, &distances, pair, region)
+                refine_pair(&labels, width, height, layers, &distances, pair, region, wraps)
             })
             .collect();
         for (index, label) in updates.into_iter().flatten() {

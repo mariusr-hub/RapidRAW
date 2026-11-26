@@ -1,21 +1,29 @@
 import { memo, useState, useEffect, useRef, useMemo } from 'react';
 import {
   ArrowLeft,
+  ChevronDown,
   Columns2,
   Eye,
   EyeOff,
+  Feather,
+  Flame,
   Grid2X2,
   Loader2,
   LucideIcon,
   Maximize,
+  Palette,
   Redo,
   RotateCcw,
+  Sparkles,
   SquareSplitHorizontal,
   SquareSplitVertical,
   Sun,
   Undo,
+  Waves,
+  Zap,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
 import { Invokes } from '../../../types/invokes';
@@ -28,7 +36,7 @@ import { TextColors, TextVariants, TextWeights } from '../../../types/typography
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useLibraryStore } from '../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
-import { useUIStore } from '../../../store/useUIStore';
+import { QuickEnhanceAction, useUIStore } from '../../../store/useUIStore';
 import { Panel } from '../../../types/ui';
 import { useDisplayStatus } from '../../../hooks/useDisplayStatus';
 import { findGroupVariants, getVariantLabel } from '../../../utils/imageGrouping';
@@ -75,6 +83,134 @@ function HdrButton({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HTMLButtonE
         HDR
       </div>
     </button>
+  );
+}
+
+function SoftProofButton({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HTMLButtonElement>): void }) {
+  const softProofState = useUIStore((state) => state.softProofState);
+  const setUI = useUIStore((state) => state.setUI);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useMenuDismiss(menuRef, isMenuOpen, setIsMenuOpen);
+
+  const applyConfig = (patch: Partial<typeof softProofState>) => {
+    const next = { ...softProofState, ...patch };
+    setUI({ softProofState: next });
+    invoke(Invokes.SetSoftProofConfig, { config: next }).catch((err) =>
+      console.warn('SetSoftProofConfig failed:', err),
+    );
+  };
+
+  const handlePickCustomIcc = async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'ICC Profiles', extensions: ['icc', 'icm'] }],
+      });
+      if (typeof selected === 'string') {
+        applyConfig({ enabled: true, target: 'custom', customIccPath: selected });
+      }
+    } catch (err) {
+      console.warn('ICC pick failed:', err);
+    }
+  };
+
+  return (
+    <div className="relative flex items-center" ref={menuRef}>
+      <button
+        type="button"
+        className={clsx(
+          'p-2 rounded-full transition-colors relative',
+          softProofState.enabled
+            ? 'bg-accent text-button-text hover:bg-accent/90'
+            : 'bg-surface hover:bg-card-active text-text-primary',
+        )}
+        onClick={() => applyConfig({ enabled: !softProofState.enabled })}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setIsMenuOpen((prev) => !prev);
+        }}
+        onKeyDown={onKeyDown}
+        data-tooltip="Soft-Proofing (Right-click for Profile / Gamut Options, Shift+G)"
+      >
+        <div className="relative w-5 h-5 flex items-center justify-center">
+          <Palette size={19} />
+        </div>
+      </button>
+
+      <ToolbarMenu className="w-64 p-2 text-xs" isOpen={isMenuOpen} title="Soft-Proofing">
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] uppercase tracking-wider text-text-secondary">Target Space</span>
+            <div className="grid grid-cols-2 gap-1">
+              {[
+                { id: 'srgb', label: 'sRGB' },
+                { id: 'displayP3', label: 'Display P3' },
+                { id: 'adobeRgb', label: 'Adobe RGB' },
+                { id: 'rec2020', label: 'Rec.2020' },
+              ].map((tItem) => (
+                <button
+                  key={tItem.id}
+                  type="button"
+                  onClick={() => applyConfig({ enabled: true, target: tItem.id, customIccPath: null })}
+                  className={clsx(
+                    'px-2 py-1 rounded text-left border transition-colors',
+                    softProofState.target === tItem.id && !softProofState.customIccPath
+                      ? 'bg-accent/20 border-accent text-accent font-medium'
+                      : 'bg-surface border-border-color/40 text-text-secondary hover:text-text-primary',
+                  )}
+                >
+                  {tItem.label}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={handlePickCustomIcc}
+              className="px-2 py-1 rounded text-left border bg-surface border-border-color/40 text-text-secondary hover:text-text-primary truncate"
+            >
+              {softProofState.customIccPath
+                ? `Custom ICC (${softProofState.customIccPath.split(/[/\\]/).pop()})`
+                : 'Load Custom ICC/CMYK...'}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-1 pt-1 border-t border-white/10">
+            <span className="text-[10px] uppercase tracking-wider text-text-secondary">Intent</span>
+            <div className="flex rounded bg-surface border border-border-color/40 overflow-hidden">
+              {[
+                { id: 'relativeColorimetric', label: 'Relative' },
+                { id: 'perceptual', label: 'Perceptual' },
+              ].map((intent) => (
+                <button
+                  key={intent.id}
+                  type="button"
+                  onClick={() => applyConfig({ intent: intent.id })}
+                  className={clsx(
+                    'px-1.5 py-0.5 text-[10px]',
+                    softProofState.intent === intent.id
+                      ? 'bg-accent/25 text-accent font-medium'
+                      : 'text-text-secondary hover:text-text-primary',
+                  )}
+                >
+                  {intent.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="flex items-center justify-between gap-2 pt-1 border-t border-white/10 cursor-pointer">
+            <span className="text-[11px] text-text-primary">Out-of-Gamut Overlay</span>
+            <input
+              type="checkbox"
+              checked={softProofState.oogWarning}
+              onChange={(e) => applyConfig({ oogWarning: e.target.checked })}
+              className="accent-pink-500"
+            />
+          </label>
+        </div>
+      </ToolbarMenu>
+    </div>
   );
 }
 
@@ -152,6 +288,87 @@ function CompareButton({ compareMode, isComparing, onKeyDown, onSelectMode, onTo
             );
             setIsMenuOpen(false);
           }}
+          onKeyDown={onKeyDown}
+        />
+      </ToolbarMenu>
+    </div>
+  );
+}
+
+function QuickEnhanceButton({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HTMLButtonElement>): void }) {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  useMenuDismiss(containerRef, isMenuOpen, setIsMenuOpen);
+
+  const dispatchQuick = (panel: Panel, action: QuickEnhanceAction) => {
+    useUIStore.getState().triggerQuickAction(panel, action);
+    setIsMenuOpen(false);
+  };
+
+  return (
+    <div className="relative" ref={containerRef}>
+      <div className="flex items-center bg-surface rounded-full border border-border-color/40 overflow-hidden">
+        <button
+          type="button"
+          className="hover:bg-card-active text-text-primary pl-2.5 pr-1.5 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 cursor-pointer"
+          onClick={() => dispatchQuick(Panel.Adjustments, 'smart-tone')}
+          onKeyDown={onKeyDown}
+          data-tooltip="Smart Tone (Dynamic Exposure & Contrast)"
+        >
+          <Sun size={14} className="text-amber-400" />
+          <span className="hidden xl:inline">Smart Tone</span>
+        </button>
+        <button
+          type="button"
+          className="hover:bg-card-active text-text-secondary hover:text-text-primary px-1.5 py-1.5 border-l border-border-color/40 transition-colors cursor-pointer"
+          onClick={() => setIsMenuOpen((prev) => !prev)}
+          onKeyDown={onKeyDown}
+          data-tooltip="More 1-Click Quick Enhancements"
+        >
+          <ChevronDown size={12} className={clsx('transition-transform', isMenuOpen && 'rotate-180')} />
+        </button>
+      </div>
+      <ToolbarMenu isOpen={isMenuOpen} title="Quick Enhance">
+        <ToolbarMenuItem
+          icon={Sun}
+          isSelected={false}
+          label="Smart Tone"
+          onClick={() => dispatchQuick(Panel.Adjustments, 'smart-tone')}
+          onKeyDown={onKeyDown}
+        />
+        <ToolbarMenuItem
+          icon={Flame}
+          isSelected={false}
+          label="Color Contrast"
+          onClick={() => dispatchQuick(Panel.Adjustments, 'color-contrast')}
+          onKeyDown={onKeyDown}
+        />
+        <ToolbarMenuItem
+          icon={Feather}
+          isSelected={false}
+          label="Light Diffusion"
+          onClick={() => dispatchQuick(Panel.Adjustments, 'diffusion')}
+          onKeyDown={onKeyDown}
+        />
+        <ToolbarMenuItem
+          icon={Zap}
+          isSelected={false}
+          label="Tonal Dynamics"
+          onClick={() => dispatchQuick(Panel.Adjustments, 'supercontrast')}
+          onKeyDown={onKeyDown}
+        />
+        <ToolbarMenuItem
+          icon={Sparkles}
+          isSelected={false}
+          label="1-Click Retouch"
+          onClick={() => dispatchQuick(Panel.Ai, 'retouch')}
+          onKeyDown={onKeyDown}
+        />
+        <ToolbarMenuItem
+          icon={Waves}
+          isSelected={false}
+          label="Liquify Mesh"
+          onClick={() => dispatchQuick(Panel.Ai, 'liquify')}
           onKeyDown={onKeyDown}
         />
       </ToolbarMenu>
@@ -565,10 +782,10 @@ const EditorToolbar = memo(
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0 z-40">
-          <div className="relative flex items-center gap-2" ref={historyButtonRef}>
+        <div className="flex items-center gap-1 xl:gap-2 shrink-0 z-40">
+          <div className="relative flex items-center gap-1 xl:gap-2" ref={historyButtonRef}>
             <button
-              className="bg-surface text-text-primary p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="bg-surface text-text-primary p-1.5 xl:p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               disabled={!canUndo}
               onClick={onUndo}
               onKeyDown={handleButtonKeyDown}
@@ -582,7 +799,7 @@ const EditorToolbar = memo(
               <Undo size={20} />
             </button>
             <button
-              className="bg-surface text-text-primary p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="bg-surface text-text-primary p-1.5 xl:p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               disabled={!canRedo}
               onClick={onRedo}
               onKeyDown={handleButtonKeyDown}
@@ -616,19 +833,7 @@ const EditorToolbar = memo(
             </ToolbarMenu>
           </div>
 
-          <button
-            type="button"
-            className="bg-surface hover:bg-card-active text-text-primary px-2.5 py-1.5 rounded-full text-xs font-medium transition-colors flex items-center gap-1.5"
-            onClick={() => {
-              useUIStore.getState().setPanel(Panel.Adjustments);
-              window.dispatchEvent(new CustomEvent('rapidraw-quick-smart-tone'));
-            }}
-            onKeyDown={handleButtonKeyDown}
-            data-tooltip="Smart Tone (Dynamic Exposure & Contrast)"
-          >
-            <Sun size={14} className="text-amber-400" />
-            <span className="hidden xl:inline">Smart Tone</span>
-          </button>
+          <QuickEnhanceButton onKeyDown={handleButtonKeyDown} />
 
           <CompareButton
             compareMode={compareMode}
@@ -639,9 +844,10 @@ const EditorToolbar = memo(
           />
           <SplitCompareToggle onKeyDown={handleButtonKeyDown} />
           <MatrixCompareToggle onKeyDown={handleButtonKeyDown} />
+          <SoftProofButton onKeyDown={handleButtonKeyDown} />
           {isHdrAvailable && <HdrButton onKeyDown={handleButtonKeyDown} />}
           <button
-            className="bg-surface text-text-primary p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed relative"
+            className="bg-surface text-text-primary p-1.5 xl:p-2 rounded-full hover:bg-card-active transition-colors disabled:opacity-50 disabled:cursor-not-allowed relative"
             onClick={onToggleFullScreen}
             onKeyDown={handleButtonKeyDown}
             data-tooltip={t('editor.toolbar.tooltips.fullscreen')}
@@ -677,7 +883,7 @@ function SplitCompareToggle({ onKeyDown }: { onKeyDown(e: React.KeyboardEvent<HT
     invoke(Invokes.RecordAutoEditRejection, {
       path: selectedImagePath ?? null,
       scene,
-    }).catch(() => {});
+    }).catch((err) => console.warn('RecordAutoEditRejection failed:', err));
   };
 
   return (

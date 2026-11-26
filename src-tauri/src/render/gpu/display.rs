@@ -6,7 +6,7 @@ use crate::platform::monitor::{
 use crate::render::color_space::{OutputColorSpace, TransferCurve, with_shader_prelude};
 use crate::render::display_color::{
     ColorLut, DisplayColorMode, LUT_SHAPER_GAMMA, LUT_SIZE, MonitorColor, MonitorProfile,
-    shared_space,
+    SoftProofConfig, build_soft_proof_lut, shared_space,
 };
 use crate::render::gpu::context::{GpuContext, current_gpu_context};
 use crate::render::gpu::processor::RenderOutputPrecision;
@@ -40,7 +40,8 @@ pub struct DisplayTransform {
     pub frame_curve: [f32; 4],
     pub frame_to_srgb: [[f32; 4]; 3],
     pub linear_max: f32,
-    pub _padding: [f32; 3],
+    pub soft_proof_oog_opacity: f32,
+    pub _padding: [f32; 2],
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -69,7 +70,8 @@ impl Default for DisplayTransform {
             frame_curve: OutputColorSpace::Srgb.curve().uniform(),
             frame_to_srgb: frame_matrix(OutputColorSpace::Srgb),
             linear_max: f32::MAX,
-            _padding: [0.0; 3],
+            soft_proof_oog_opacity: 0.0,
+            _padding: [0.0; 2],
         }
     }
 }
@@ -128,6 +130,7 @@ pub struct WgpuDisplay {
     lut: Option<ColorLut>,
     lut_source: Option<(Arc<MonitorProfile>, OutputColorSpace)>,
     lut_view: wgpu::TextureView,
+    pub soft_proof: SoftProofConfig,
     backgrounds: [[f32; 4]; 2],
     clear_color: wgpu::Color,
     pub bind_group_layout: wgpu::BindGroupLayout,
@@ -360,8 +363,16 @@ impl WgpuDisplay {
         } else if retag {
             monitor::tag_surface(&self.surface, tag);
         }
-        if !same_lut {
-            self.lut = lut_source.as_ref().and_then(|(profile, space)| {
+        let active_lut = if self.soft_proof.enabled {
+            match build_soft_proof_lut(self.space, &self.color, &self.soft_proof) {
+                Ok(proof_lut) => proof_lut,
+                Err(e) => {
+                    log::warn!("Soft-proof LUT build error: {}", e);
+                    self.lut.take()
+                }
+            }
+        } else if !same_lut {
+            lut_source.as_ref().and_then(|(profile, space)| {
                 profile.lut_from(*space).unwrap_or_else(|e| {
                     log::warn!(
                         "Cannot convert to monitor profile '{}': {}",
@@ -370,15 +381,26 @@ impl WgpuDisplay {
                     );
                     None
                 })
-            });
+            })
+        } else {
+            None
+        };
+        if self.soft_proof.enabled || !same_lut {
+            self.lut = active_lut;
             self.lut_view = lut_texture_view(device, queue, self.lut.as_ref());
             self.lut_source = lut_source;
             self.rebind(device);
         }
         let size = LUT_SIZE as f32;
+        let sp_flag = if self.soft_proof.enabled { 1.0 } else { 0.0 };
         self.latest_transform.lut = match self.lut {
-            Some(_) => [(size - 1.0) / size, 0.5 / size, 1.0 / LUT_SHAPER_GAMMA, 0.0],
+            Some(_) => [(size - 1.0) / size, 0.5 / size, 1.0 / LUT_SHAPER_GAMMA, sp_flag],
             None => [0.0; 4],
+        };
+        self.latest_transform.soft_proof_oog_opacity = if self.soft_proof.enabled && self.soft_proof.oog_warning {
+            0.55
+        } else {
+            0.0
         };
         self.latest_transform.frame_curve = space.curve().uniform();
         self.latest_transform.frame_to_srgb = frame_matrix(space);
@@ -431,6 +453,41 @@ impl WgpuDisplay {
             self.backgrounds = [primary, secondary];
             self.apply_backgrounds();
         }
+    }
+
+    pub fn set_soft_proof(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: SoftProofConfig,
+    ) -> Result<bool, String> {
+        if self.soft_proof == config {
+            return Ok(false);
+        }
+        self.soft_proof = config;
+        let next_lut = if self.soft_proof.enabled {
+            build_soft_proof_lut(self.space, &self.color, &self.soft_proof)?
+        } else {
+            self.lut_source
+                .as_ref()
+                .and_then(|(profile, space)| profile.lut_from(*space).ok().flatten())
+        };
+        self.lut = next_lut;
+        self.lut_view = lut_texture_view(device, queue, self.lut.as_ref());
+        let size = LUT_SIZE as f32;
+        let sp_flag = if self.soft_proof.enabled { 1.0 } else { 0.0 };
+        self.latest_transform.lut = match self.lut {
+            Some(_) => [(size - 1.0) / size, 0.5 / size, 1.0 / LUT_SHAPER_GAMMA, sp_flag],
+            None => [0.0; 4],
+        };
+        self.latest_transform.soft_proof_oog_opacity = if self.soft_proof.enabled && self.soft_proof.oog_warning {
+            0.55
+        } else {
+            0.0
+        };
+        self.rebind(device);
+        self.flush(device, queue);
+        Ok(true)
     }
 
     pub fn set_background(&mut self, color: [f32; 4]) {
@@ -706,6 +763,7 @@ pub fn build_wgpu_display(
         lut: None,
         lut_source: None,
         lut_view: lut_texture_view(device, queue, None),
+        soft_proof: SoftProofConfig::default(),
         backgrounds: [
             DisplayTransform::default().bg_primary,
             DisplayTransform::default().bg_secondary,
@@ -1233,4 +1291,21 @@ pub static WGPU_DISPLAY_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub fn wgpu_display_failed() -> bool {
     WGPU_DISPLAY_FAILED.load(Ordering::Acquire)
+}
+
+#[tauri::command]
+pub async fn set_soft_proof_config(
+    config: SoftProofConfig,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    if let Some(context) = current_gpu_context(&app_handle.state::<AppState>()) {
+        for (_, display_mutex) in displays(&context) {
+            let mut guard = display_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(display) = guard.as_mut() {
+                display.set_soft_proof(&context.device, &context.queue, config.clone())?;
+            }
+        }
+        let _ = app_handle.emit(DISPLAY_CHANGED_EVENT, ());
+    }
+    Ok(())
 }

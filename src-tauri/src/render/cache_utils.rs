@@ -73,6 +73,12 @@ fn hash_ai_patches(adjustments: &serde_json::Value, hasher: &mut DefaultHasher) 
 
                 color_len > 0 && mask_len == 0
             } else {
+                for key in ["type", "kind", "x", "y", "radius", "endX", "endY", "points"] {
+                    if let Some(val) = patch.get(key) {
+                        key.hash(hasher);
+                        val.to_string().hash(hasher);
+                    }
+                }
                 let data_len = patch
                     .get("patchDataBase64")
                     .and_then(|v| v.as_str())
@@ -164,6 +170,42 @@ pub fn calculate_patch_hash(adjustments: &serde_json::Value) -> u64 {
     hash_ai_patches(adjustments, &mut hasher);
     hash_ai_denoise(adjustments, &mut hasher);
     hash_negative_conversion(adjustments, &mut hasher);
+    hash_effect_keys(
+        adjustments,
+        &[
+            "cameraProfileId",
+            "defringeEnabled",
+            "defringePurpleAmount",
+            "defringeGreenAmount",
+            "defringeEdgeThreshold",
+            "tiltShiftEnabled",
+            "tiltShiftCenterY",
+            "tiltShiftBandHeight",
+            "tiltShiftAngleDeg",
+            "tiltShiftBlurRadius",
+            "tiltShiftSpecularBoost",
+            "astroLpEnabled",
+            "astroLpPreservePedestal",
+            "astroLpMode",
+            "astroLpSmoothing",
+            "astroLpStrength",
+            "astroPccEnabled",
+            "astroPccGainR",
+            "astroPccGainG",
+            "astroPccGainB",
+            "astroPccBgNeutralize",
+            "astroAdcEnabled",
+            "astroAdcRedDx",
+            "astroAdcRedDy",
+            "astroAdcBlueDx",
+            "astroAdcBlueDy",
+            "astroStarlessEnabled",
+            "astroStarMix",
+            "astroStarReduction",
+            "astroNebulaBoost",
+        ],
+        &mut hasher,
+    );
 
     let uses_generated_masks = adjustments
         .get("aiPatches")
@@ -384,6 +426,42 @@ pub fn calculate_transform_hash(adjustments: &serde_json::Value) -> u64 {
     hash_ai_patches(adjustments, &mut hasher);
     hash_ai_denoise(adjustments, &mut hasher);
     hash_negative_conversion(adjustments, &mut hasher);
+    hash_effect_keys(
+        adjustments,
+        &[
+            "cameraProfileId",
+            "defringeEnabled",
+            "defringePurpleAmount",
+            "defringeGreenAmount",
+            "defringeEdgeThreshold",
+            "tiltShiftEnabled",
+            "tiltShiftCenterY",
+            "tiltShiftBandHeight",
+            "tiltShiftAngleDeg",
+            "tiltShiftBlurRadius",
+            "tiltShiftSpecularBoost",
+            "astroLpEnabled",
+            "astroLpPreservePedestal",
+            "astroLpMode",
+            "astroLpSmoothing",
+            "astroLpStrength",
+            "astroPccEnabled",
+            "astroPccGainR",
+            "astroPccGainG",
+            "astroPccGainB",
+            "astroPccBgNeutralize",
+            "astroAdcEnabled",
+            "astroAdcRedDx",
+            "astroAdcRedDy",
+            "astroAdcBlueDx",
+            "astroAdcBlueDy",
+            "astroStarlessEnabled",
+            "astroStarMix",
+            "astroStarReduction",
+            "astroNebulaBoost",
+        ],
+        &mut hasher,
+    );
 
     hasher.finish()
 }

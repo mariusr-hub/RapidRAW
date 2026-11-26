@@ -186,6 +186,19 @@ export interface AppSettings {
   groupEditedFiles?: boolean;
   groupPreferredType?: GroupPreference; // legacy
   alwaysDecodeRawThumbnails?: boolean;
+  taggingThreadCount?: number;
+  thumbnailWorkerThreads?: number;
+  imageCacheSize?: number;
+  rawPreprocessingColorNr?: number;
+  rawPreprocessingSharpening?: number;
+  applyPreprocessingToNonRaws?: boolean;
+  starnetModelPath?: string | null;
+  rawDenoiseModelPath?: string | null;
+  useAppleRaw9?: boolean;
+  linuxGpuOptimizationMigratedV1?: boolean;
+  linuxWgpuRendererMigratedV1?: boolean;
+  aiCacheLimitsMigratedV1?: boolean;
+  groupAssociatedFiles?: boolean;
   workspace?: WorkspaceState;
   immich?: ImmichSettings;
 }

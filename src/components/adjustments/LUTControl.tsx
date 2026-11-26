@@ -9,6 +9,7 @@ import { toast } from 'react-toastify';
 import Slider from '../ui/Slider';
 import { useEditorStore } from '../../store/useEditorStore';
 import { useSettingsStore } from '../../store/useSettingsStore';
+import { useUIStore } from '../../store/useUIStore';
 import { useHoverPreview, withLut } from '../../hooks/useEditorActions';
 
 interface LutEntry {
@@ -49,6 +50,7 @@ export default function LUTControl({
   const { showContextMenu } = useContextMenu();
   const selectedImagePath = useEditorStore((state) => state.selectedImage?.path ?? null);
   const isImageReady = useEditorStore((state) => state.selectedImage?.isReady ?? false);
+  const isColorSectionOpen = useUIStore((state) => state.collapsibleSectionsState.color);
 
   const [isExpanded, setIsExpanded] = useState(false);
   const [entries, setEntries] = useState<LutEntry[]>([]);
@@ -102,6 +104,16 @@ export default function LUTControl({
   useEffect(() => {
     refreshList();
   }, [refreshList]);
+
+  useEffect(() => {
+    if (!isExpanded || !isColorSectionOpen) {
+      hoverPreview.show(null);
+    }
+  }, [isExpanded, isColorSectionOpen, hoverPreview]);
+
+  useEffect(() => {
+    hoverPreview.show(null);
+  }, [selectedImagePath, hoverPreview]);
 
   useEffect(() => {
     if (!isExpanded || !selectedImagePath || !isImageReady || entries.length === 0) {

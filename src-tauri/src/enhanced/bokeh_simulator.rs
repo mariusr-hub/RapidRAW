@@ -39,6 +39,7 @@ pub struct BokehResult {
     pub blur_radius_px: u32,
     pub specular_highlights_detected: usize,
     pub preview_base64: Option<String>,
+    pub depth_map_base64: Option<String>,
 }
 
 fn generate_subject_depth_map(img: &DynamicImage) -> ImageBuffer<image::Luma<u8>, Vec<u8>> {
@@ -84,7 +85,9 @@ pub fn simulate_optical_bokeh(
     specular_boost: Option<f32>,
     focal_distance: Option<f32>,
     depth_range: Option<f32>,
+    js_adjustments: Option<serde_json::Value>,
     state: State<AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<BokehResult, String> {
     let f_stop = aperture_f_stop.unwrap_or(1.4).clamp(1.0, 16.0);
     let shape_str = bokeh_shape.unwrap_or_else(|| "circular".to_string());
@@ -93,12 +96,32 @@ pub fn simulate_optical_bokeh(
     let focus_plane = focal_distance.unwrap_or(0.85).clamp(0.0, 1.0);
     let dof_range = depth_range.unwrap_or(0.20).clamp(0.05, 0.80);
 
-    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-    let active_img = if let Some(loaded) = &*orig_guard {
-        &loaded.image
-    } else {
-        return Err("No active image loaded in RapidRAW".to_string());
+    let (loaded_path, loaded_img) = {
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        if let Some(loaded) = &*orig_guard {
+            (loaded.path.clone(), loaded.image.clone())
+        } else {
+            return Err("No active image loaded in RapidRAW".to_string());
+        }
     };
+
+    let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
+    let stripped_adj = js_adjustments.map(|mut adj| {
+        if let Some(obj) = adj.as_object_mut() {
+            obj.insert("lensBlurEnabled".to_string(), serde_json::json!(false));
+            obj.insert("tiltShiftEnabled".to_string(), serde_json::json!(false));
+        }
+        adj
+    });
+    let edited_img = crate::export::render_image_with_edits(
+        &loaded_path,
+        &loaded_img,
+        stripped_adj.as_ref(),
+        &settings,
+        &app_handle,
+        false,
+    );
+    let active_img: &DynamicImage = edited_img.as_ref().unwrap_or(&loaded_img);
 
     let blur_radius = match f_stop {
         f if f <= 1.2 => 26u32,
@@ -233,12 +256,21 @@ pub fn simulate_optical_bokeh(
         base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
     );
 
+    let mut depth_buf = Cursor::new(Vec::new());
+    let _ = DynamicImage::ImageLuma8(depth_map).write_to(&mut depth_buf, image::ImageFormat::Png);
+    let depth_map_base64 = format!(
+        "{}{}",
+        crate::effects::maps::SOURCE_SPACE_MAP_PREFIX,
+        base64::engine::general_purpose::STANDARD.encode(depth_buf.into_inner())
+    );
+
     Ok(BokehResult {
         aperture_simulated: format!("f/{:.1}", f_stop),
         bokeh_shape: format!("{:?}", shape),
         blur_radius_px: blur_radius,
         specular_highlights_detected: specular_count / 15,
         preview_base64: Some(base64_str),
+        depth_map_base64: Some(depth_map_base64),
     })
 }
 
@@ -260,7 +292,8 @@ pub fn apply_tilt_shift_transform(
     let cy = center_y_norm.clamp(0.05, 0.95) * th as f32;
     let cx = tw as f32 * 0.5;
     let half_band_px = band_height_norm.clamp(0.02, 0.8) * th as f32 * 0.5;
-    let blur_rad = blur_amount.clamp(4.0, 60.0);
+    let res_scale = (tw.max(th) as f32 / 960.0).max(1.0);
+    let blur_rad = blur_amount.clamp(4.0, 60.0) * res_scale;
     let spec = specular_boost.clamp(0.0, 100.0);
 
     let theta = angle_deg.clamp(-90.0, 90.0).to_radians();
@@ -353,9 +386,16 @@ pub fn apply_tilt_shift_if_enabled<'a>(
     let blur = adjustments["tiltShiftBlurRadius"].as_f64().unwrap_or(24.0) as f32;
     let spec = adjustments["tiltShiftSpecularBoost"].as_f64().unwrap_or(40.0) as f32;
 
+    let is_f32 = matches!(image.as_ref(), DynamicImage::ImageRgb32F(_));
     let rgb8 = image.to_rgb8();
     let transformed = apply_tilt_shift_transform(&rgb8, cy, band, angle, blur, spec);
-    Cow::Owned(DynamicImage::ImageRgb8(transformed))
+    if is_f32 {
+        Cow::Owned(DynamicImage::ImageRgb32F(
+            DynamicImage::ImageRgb8(transformed).to_rgb32f(),
+        ))
+    } else {
+        Cow::Owned(DynamicImage::ImageRgb8(transformed))
+    }
 }
 
 /// 1-Click Tilt-Shift Scheimpflug Miniature Mode
@@ -366,14 +406,36 @@ pub fn simulate_tilt_shift(
     angle_deg: Option<f32>,
     blur_amount: Option<f32>,
     specular_boost: Option<f32>,
+    js_adjustments: Option<serde_json::Value>,
     state: State<AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
-    let active_img = if let Some(loaded) = &*orig_guard {
-        &loaded.image
-    } else {
-        return Err("No active image loaded".to_string());
+    let (loaded_path, loaded_img) = {
+        let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
+        if let Some(loaded) = &*orig_guard {
+            (loaded.path.clone(), loaded.image.clone())
+        } else {
+            return Err("No active image loaded".to_string());
+        }
     };
+
+    let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
+    let stripped_adj = js_adjustments.map(|mut adj| {
+        if let Some(obj) = adj.as_object_mut() {
+            obj.insert("lensBlurEnabled".to_string(), serde_json::json!(false));
+            obj.insert("tiltShiftEnabled".to_string(), serde_json::json!(false));
+        }
+        adj
+    });
+    let edited_img = crate::export::render_image_with_edits(
+        &loaded_path,
+        &loaded_img,
+        stripped_adj.as_ref(),
+        &settings,
+        &app_handle,
+        false,
+    );
+    let active_img: &DynamicImage = edited_img.as_ref().unwrap_or(&loaded_img);
 
     let cy = center_y_norm.unwrap_or(0.5);
     let band = band_height_norm.unwrap_or(0.25);

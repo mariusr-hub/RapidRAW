@@ -1,6 +1,7 @@
 ﻿import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import {
   Zap,
   Star,
@@ -15,7 +16,7 @@ import { useLibraryStore } from '../../store/useLibraryStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useProcessStore } from '../../store/useProcessStore';
 import { useShallow } from 'zustand/react/shallow';
-import { Invokes } from '../../components/ui/AppProperties';
+import { Invokes } from '../../types/invokes';
 
 interface FaceLoupeCrop {
   face_index: number;
@@ -38,9 +39,10 @@ interface CullingFrameAnalysis {
 }
 
 export interface BurstGroup {
-  group_id: string;
+  group_id: number;
+  photo_paths: string[];
   hero_path: string;
-  member_paths: string[];
+  similarity_score: number;
   hero_score: number;
   frame_count: number;
 }
@@ -77,11 +79,30 @@ export default function SpeedCullerModal() {
   const [analysis, setAnalysis] = useState<CullingFrameAnalysis | null>(null);
   const [, setIsAnalyzing] = useState(false);
   const [isTriaging, setIsTriaging] = useState(false);
+  const [triageProgress, setTriageProgress] = useState<{ current: number; total: number } | null>(null);
   const [triageReport, setTriageReport] = useState<string | null>(null);
   const [rawPreviewCache, setRawPreviewCache] = useState<Record<string, string>>({});
   const [burstGroups, setBurstGroups] = useState<BurstGroup[]>([]);
   const [isBurstGrouping, setIsBurstGrouping] = useState(false);
   const requestedPathsRef = useRef<Set<string>>(new Set());
+  const rawPreviewCacheRef = useRef<Record<string, string>>(rawPreviewCache);
+  rawPreviewCacheRef.current = rawPreviewCache;
+
+  const MAX_RAW_PREVIEW_CACHE = 30;
+  const cacheRawPreview = useCallback((targetPath: string, dataUrl: string) => {
+    setRawPreviewCache((prev) => {
+      const next: Record<string, string> = { ...prev };
+      delete next[targetPath];
+      next[targetPath] = dataUrl;
+      const keys = Object.keys(next);
+      while (keys.length > MAX_RAW_PREVIEW_CACHE) {
+        const oldest = keys.shift()!;
+        delete next[oldest];
+        requestedPathsRef.current.delete(oldest);
+      }
+      return next;
+    });
+  }, []);
 
   const currentPath = paths[currentIndex] || '';
   const nextComparePath = paths[currentIndex + 1] || paths[currentIndex - 1] || '';
@@ -91,7 +112,7 @@ export default function SpeedCullerModal() {
   );
 
   const currentBurstGroup = useMemo(() => {
-    return burstGroups.find((g) => g.member_paths.includes(currentPath));
+    return burstGroups.find((g) => (g.photo_paths ?? []).includes(currentPath));
   }, [burstGroups, currentPath]);
 
   // Auto-Burst & Hero Pick Detection
@@ -103,19 +124,23 @@ export default function SpeedCullerModal() {
     return analysis.sharpness_score > 40.0 && !analysis.is_blurry;
   }, [currentBurstGroup, currentPath, analysis]);
 
-  // Sync initial index
+  // Sync initial index and release high-res cache on close
   useEffect(() => {
     if (isOpen) {
       setCurrentIndex(speedCullerModalState.initialIndex || 0);
       setTriageReport(null);
+    } else {
+      setRawPreviewCache({});
+      setBurstGroups([]);
+      requestedPathsRef.current.clear();
     }
   }, [isOpen, speedCullerModalState.initialIndex]);
 
-  // Load active frame preview (from cache, thumbnails, or fast embedded extractor)
+  // Upgrade active frame to crisp 2048px embedded RAW preview (thumbnails act as instant placeholder only)
   useEffect(() => {
     if (!isOpen || !currentPath) return;
 
-    if (rawPreviewCache[currentPath] || thumbnails[currentPath]) {
+    if (rawPreviewCacheRef.current[currentPath]) {
       return;
     }
 
@@ -123,29 +148,44 @@ export default function SpeedCullerModal() {
     requestedPathsRef.current.add(currentPath);
 
     let isMounted = true;
-    invoke<number[]>(Invokes.GeneratePreviewForPath, { path: currentPath, jsAdjustments: null })
-      .then((bytes) => {
-        if (!isMounted || !bytes?.length) return;
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          if (isMounted && typeof reader.result === 'string') {
-            setRawPreviewCache((prev) => ({ ...prev, [currentPath]: reader.result as string }));
-          }
-        };
-        reader.readAsDataURL(new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' }));
+    invoke<string>(Invokes.ExtractEmbeddedRawPreview, { path: currentPath })
+      .then((dataUrl) => {
+        if (isMounted && dataUrl) {
+          cacheRawPreview(currentPath, dataUrl);
+        } else if (!dataUrl) {
+          requestedPathsRef.current.delete(currentPath);
+        }
       })
       .catch(() => {
-        if (isMounted) {
-          setRawPreviewCache((prev) => ({ ...prev, [currentPath]: prev[currentPath] || '' }));
-        }
+        invoke<number[]>(Invokes.GeneratePreviewForPath, { path: currentPath, jsAdjustments: null })
+          .then((bytes) => {
+            if (!isMounted || !bytes?.length) {
+              requestedPathsRef.current.delete(currentPath);
+              return;
+            }
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              if (isMounted && typeof reader.result === 'string') {
+                cacheRawPreview(currentPath, reader.result);
+              }
+            };
+            reader.onerror = () => {
+              requestedPathsRef.current.delete(currentPath);
+            };
+            reader.readAsDataURL(new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' }));
+          })
+          .catch((err) => {
+            requestedPathsRef.current.delete(currentPath);
+            console.warn('SpeedCuller preview fallback failed:', err);
+          });
       });
 
     return () => {
       isMounted = false;
     };
-  }, [isOpen, currentPath, thumbnails]);
+  }, [isOpen, currentPath, cacheRawPreview]);
 
-  // Pre-load lookahead ring buffer (previous 1, next 2 images) with request deduplication
+  // Pre-load lookahead ring buffer (previous 1, next 2 images) to high-res previews with request deduplication
   useEffect(() => {
     if (!isOpen || paths.length === 0) return;
     const preloadIndices = [
@@ -156,23 +196,23 @@ export default function SpeedCullerModal() {
 
     preloadIndices.forEach((i) => {
       const p = paths[i];
-      if (p && !thumbnails[p] && !requestedPathsRef.current.has(p)) {
+      if (p && !rawPreviewCacheRef.current[p] && !requestedPathsRef.current.has(p)) {
         requestedPathsRef.current.add(p);
-        invoke<number[]>(Invokes.GeneratePreviewForPath, { path: p, jsAdjustments: null })
-          .then((bytes) => {
-            if (!bytes?.length) return;
-            const reader = new FileReader();
-            reader.onloadend = () => {
-              if (typeof reader.result === 'string') {
-                setRawPreviewCache((prev) => ({ ...prev, [p]: reader.result as string }));
-              }
-            };
-            reader.readAsDataURL(new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' }));
+        invoke<string>(Invokes.ExtractEmbeddedRawPreview, { path: p })
+          .then((dataUrl) => {
+            if (dataUrl) {
+              cacheRawPreview(p, dataUrl);
+            } else {
+              requestedPathsRef.current.delete(p);
+            }
           })
-          .catch(() => {});
+          .catch((err) => {
+            requestedPathsRef.current.delete(p);
+            console.warn('SpeedCuller lookahead preview failed:', err);
+          });
       }
     });
-  }, [isOpen, currentIndex, paths, thumbnails]);
+  }, [isOpen, currentIndex, paths, cacheRawPreview]);
 
   // Background face analysis for active frame with 120ms debounce
   useEffect(() => {
@@ -214,7 +254,7 @@ export default function SpeedCullerModal() {
   }, []);
 
   const handleRate = useCallback(
-    (rating: number) => {
+    (rating: number, advance = true) => {
       if (!currentPath) return;
       setLibrary((s) => ({
         imageRatings: { ...s.imageRatings, [currentPath]: rating },
@@ -222,7 +262,7 @@ export default function SpeedCullerModal() {
       }));
       invoke(Invokes.SetRatingForPaths, { paths: [currentPath], rating }).catch(console.error);
 
-      if (autoAdvance) {
+      if (advance && autoAdvance) {
         handleNext();
       }
     },
@@ -230,10 +270,10 @@ export default function SpeedCullerModal() {
   );
 
   const handleColorLabel = useCallback(
-    (color: string | null) => {
+    (color: string | null, advance = true) => {
       if (!currentPath) return;
       invoke(Invokes.SetColorLabelForPaths, { paths: [currentPath], color: color || null }).catch(console.error);
-      if (autoAdvance) {
+      if (advance && autoAdvance) {
         handleNext();
       }
     },
@@ -241,13 +281,13 @@ export default function SpeedCullerModal() {
   );
 
   const handlePick = useCallback(() => {
-    handleRate(5);
-    handleColorLabel('green');
+    handleRate(5, false);
+    handleColorLabel('green', true);
   }, [handleRate, handleColorLabel]);
 
   const handleReject = useCallback(() => {
-    handleRate(1);
-    handleColorLabel('red');
+    handleRate(1, false);
+    handleColorLabel('red', true);
   }, [handleRate, handleColorLabel]);
 
   const handleGroupBursts = useCallback(async () => {
@@ -320,8 +360,8 @@ export default function SpeedCullerModal() {
         case 'u':
         case 'U':
           e.preventDefault();
-          handleRate(0);
-          handleColorLabel(null);
+          handleRate(0, false);
+          handleColorLabel(null, true);
           break;
         case 'p':
         case 'P':
@@ -381,9 +421,27 @@ export default function SpeedCullerModal() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, handleNext, handlePrev, handleRate, handleColorLabel, handlePick, handleReject, setUI, handleGroupBursts]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    const unlistenPromise = listen<{ current?: number; total?: number }>('triage-cull-progress', (event) => {
+      if (!active) return;
+      const current = event.payload?.current ?? 0;
+      const total = event.payload?.total ?? 0;
+      if (total > 0) {
+        setTriageProgress({ current, total });
+      }
+    });
+    return () => {
+      active = false;
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [isOpen]);
+
   const handleRunAiTriage = async () => {
     if (paths.length === 0) return;
     setIsTriaging(true);
+    setTriageProgress({ current: 0, total: paths.length });
     try {
       const res = await invoke<{
         total_scanned: number;
@@ -403,6 +461,7 @@ export default function SpeedCullerModal() {
       console.error('Triage cull failed:', err);
     } finally {
       setIsTriaging(false);
+      setTriageProgress(null);
     }
   };
 
@@ -415,7 +474,8 @@ export default function SpeedCullerModal() {
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col select-none overflow-hidden font-sans w-screen h-screen max-w-full max-h-full">
       {/* Top Header Bar */}
-      <div className="h-12 shrink-0 bg-neutral-900/95 backdrop-blur-md border-b border-neutral-800 flex items-center justify-between px-3 md:px-4 z-20 gap-2 overflow-x-auto no-scrollbar">
+      <div className="h-12 shrink-0 bg-neutral-900/95 backdrop-blur-md border-b border-neutral-800 flex items-center justify-between px-3 md:px-4 z-20 gap-2">
+        <div className="flex-1 min-w-0 flex items-center justify-between gap-2 overflow-x-auto no-scrollbar">
         <div className="flex items-center gap-2 shrink-0">
           <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-bold uppercase tracking-wider">
             <Zap size={13} className="fill-amber-400 text-amber-400" />
@@ -471,7 +531,7 @@ export default function SpeedCullerModal() {
 
               {currentBurstGroup && (
                 <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-orange-500/20 border border-orange-500/40 text-orange-300 text-[10px] font-bold">
-                  <span>🔥 Burst ({currentBurstGroup.member_paths.indexOf(currentPath) + 1}/{currentBurstGroup.frame_count})</span>
+                  <span>🔥 Burst ({(currentBurstGroup.photo_paths ?? []).indexOf(currentPath) + 1}/{currentBurstGroup.frame_count})</span>
                   {currentBurstGroup.hero_path !== currentPath && (
                     <button
                       type="button"
@@ -509,7 +569,7 @@ export default function SpeedCullerModal() {
             title="Auto-group rapid bursts and identify sharpest Hero frame (B)"
           >
             {isBurstGrouping ? <Loader2 size={12} className="animate-spin text-orange-400" /> : <Zap size={12} className="text-orange-400" />}
-            <span className="hidden sm:inline">{burstGroups.length > 0 ? `${burstGroups.length} Bursts` : 'Bursts'}</span>
+            <span className="hidden xl:inline">{burstGroups.length > 0 ? `${burstGroups.length} Bursts` : 'Bursts'}</span>
             <span className="font-mono text-[10px] opacity-75">(B)</span>
           </button>
 
@@ -524,7 +584,7 @@ export default function SpeedCullerModal() {
             title="Toggle Focus Peaking overlay (F)"
           >
             <Sparkles size={12} className={focusPeaking ? 'text-emerald-400' : ''} />
-            <span className="hidden sm:inline">Peaking</span> <span className="font-mono text-[10px] opacity-75">(F)</span>
+            <span className="hidden xl:inline">Peaking</span> <span className="font-mono text-[10px] opacity-75">(F)</span>
           </button>
 
           <button
@@ -537,7 +597,7 @@ export default function SpeedCullerModal() {
             }`}
             title="Toggle 2-Up Side-by-Side Burst Comparison View (C)"
           >
-            <span className="hidden sm:inline">2-Up</span> <span className="font-mono text-[10px] opacity-75">(C)</span>
+            <span className="hidden xl:inline">2-Up</span> <span className="font-mono text-[10px] opacity-75">(C)</span>
           </button>
 
           <button
@@ -551,7 +611,7 @@ export default function SpeedCullerModal() {
             title="Auto-advance immediately upon pressing rating (1-5, P, X)"
           >
             <Zap size={11} className={autoAdvance ? 'fill-amber-400' : ''} />
-            <span className="hidden sm:inline">Auto-Advance</span>
+            <span className="hidden xl:inline">Auto-Advance</span>
           </button>
 
           <button
@@ -562,20 +622,25 @@ export default function SpeedCullerModal() {
             title="Automatically scan shoot and mark severe blinks and blurry misses as rejected"
           >
             {isTriaging ? <Loader2 size={12} className="animate-spin text-amber-400" /> : <Sparkles size={12} className="text-amber-400" />}
-            <span className="hidden md:inline">AI Auto-Triage</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() =>
-              setUI({ speedCullerModalState: { isOpen: false, selectedPaths: [], initialIndex: 0 } })
-            }
-            className="p-1 rounded-full hover:bg-neutral-800 text-neutral-400 hover:text-white transition-colors cursor-pointer shrink-0"
-            title="Close Speed Culler (Esc)"
-          >
-            <X size={18} />
+            <span className="hidden md:inline">
+              {isTriaging && triageProgress
+                ? `Triaging (${triageProgress.current}/${triageProgress.total})`
+                : 'AI Auto-Triage'}
+            </span>
           </button>
         </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={() =>
+            setUI({ speedCullerModalState: { isOpen: false, selectedPaths: [], initialIndex: 0 } })
+          }
+          className="p-1 rounded-full hover:bg-neutral-800 text-neutral-400 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
+          title="Close Speed Culler (Esc)"
+        >
+          <X size={18} />
+        </button>
       </div>
 
       {/* Main Viewport */}
@@ -761,7 +826,7 @@ export default function SpeedCullerModal() {
             const actualIdx = Math.max(0, currentIndex - 4) + idx;
             const thumbUrl = rawPreviewCache[p] || thumbnails[p] || '';
             const isSelected = actualIdx === currentIndex;
-            const burstMeta = burstGroups.find((g) => g.member_paths.includes(p));
+            const burstMeta = burstGroups.find((g) => (g.photo_paths ?? []).includes(p));
             const isHeroOfBurst = burstMeta?.hero_path === p;
             const starRating = (p && imageRatings[p]) || 0;
 

@@ -337,9 +337,9 @@ pub fn get_default_curated_presets() -> Vec<PresetItem> {
                     "grainAmount": 32, "grainSize": 35, "grainRoughness": 40
                 })),
                 make_preset("kodak-ektar-100", "Ektar 100 (Ultra Vivid)", json!({
-                    "contrast": 18, "highlights": -10, "shadows": -4, "whites": 8, "blacks": -8,
-                    "saturation": 24, "vibrance": 18, "temperature": 1, "tint": 3,
-                    "clarity": 16, "dehaze": 6, "grainAmount": 6, "grainSize": 16,
+                    "contrast": 14, "highlights": -10, "shadows": -4, "whites": 8, "blacks": -8,
+                    "saturation": 12, "vibrance": 12, "temperature": 1, "tint": 3,
+                    "clarity": 14, "dehaze": 6, "grainAmount": 6, "grainSize": 16,
                     "colorGrading": { "shadows": { "hue": 240, "saturation": 10, "luminance": -4 }, "highlights": { "hue": 35, "saturation": 12, "luminance": 2 } }
                 })),
                 make_preset("kodak-gold-200", "Gold 200 (Warm Nostalgia)", json!({
@@ -370,10 +370,10 @@ pub fn get_default_curated_presets() -> Vec<PresetItem> {
                     "clarity": 8, "grainAmount": 18, "grainSize": 26
                 })),
                 make_preset("kodak-ebx-100", "Kodak Elite Chrome Extra Color 100 (Sunlit Nature Slide)", json!({
-                    "contrast": 26, "highlights": -8, "shadows": -6, "whites": 14, "blacks": -12,
-                    "saturation": 32, "vibrance": 24, "temperature": 5, "tint": 2,
-                    "clarity": 18, "dehaze": 10, "grainAmount": 6, "grainSize": 16,
-                    "colorGrading": { "shadows": { "hue": 220, "saturation": 10, "luminance": -4 }, "highlights": { "hue": 46, "saturation": 20, "luminance": 3 } }
+                    "contrast": 16, "highlights": -8, "shadows": -6, "whites": 10, "blacks": -8,
+                    "saturation": 14, "vibrance": 12, "temperature": 4, "tint": 2,
+                    "clarity": 14, "dehaze": 8, "grainAmount": 6, "grainSize": 16,
+                    "colorGrading": { "shadows": { "hue": 220, "saturation": 10, "luminance": -4 }, "highlights": { "hue": 46, "saturation": 14, "luminance": 3 } }
                 })),
                 make_preset("kodak-ektapress-400", "Kodak Ektapress 400 (PJ400 Documentary News)", json!({
                     "contrast": 18, "highlights": -6, "shadows": 6, "whites": 10, "blacks": -8,

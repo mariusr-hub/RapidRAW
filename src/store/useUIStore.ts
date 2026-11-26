@@ -18,6 +18,14 @@ import { pickCropGeometry } from '../utils/adjustments';
 
 export type SwitcherPlacement = 'bottom' | 'right' | 'left' | 'top';
 
+export type QuickEnhanceAction =
+  | 'smart-tone'
+  | 'color-contrast'
+  | 'diffusion'
+  | 'supercontrast'
+  | 'retouch'
+  | 'liquify';
+
 export interface CropSectionsState {
   transform: boolean;
   lens: boolean;
@@ -67,6 +75,8 @@ export interface DrizzleModalState {
   sourcePaths: string[];
   scaleFactor: number;
   pixfrac: number;
+  bayerCfaMode?: boolean;
+  alignmentMode?: 'auto' | 'terrestrial' | 'stars';
   progressMessage: string | null;
   error: string | null;
   finalImageBase64: string | null;
@@ -423,6 +433,10 @@ export interface UIState {
   renderedPanel: Panel | null;
   slideDirection: number;
   collapsibleSectionsState: CollapsibleSectionsState;
+  showActiveToolsOnly: boolean;
+  pendingQuickAction: QuickEnhanceAction | null;
+  triggerQuickAction: (panel: Panel, action: QuickEnhanceAction) => void;
+  consumeQuickAction: () => QuickEnhanceAction | null;
   isColorGradingExpanded: boolean;
   isColorMixerExpanded: boolean;
   cropSectionsState: CropSectionsState;
@@ -457,6 +471,13 @@ export interface UIState {
   speedCullerModalState: SpeedCullerModalState;
   collageModalState: CollageModalState;
   nightSkyState: NightSkyState;
+  softProofState: {
+    enabled: boolean;
+    target: string;
+    intent: string;
+    oogWarning: boolean;
+    customIccPath: string | null;
+  };
   isLensCorrectionModalOpen: boolean;
   isTransformModalOpen: boolean;
 
@@ -518,6 +539,8 @@ export const useUIStore = create<UIState>((set, get) => ({
   renderedPanel: Panel.Adjustments,
   slideDirection: 1,
   collapsibleSectionsState: { basic: true, color: false, curves: true, details: false, effects: false },
+  showActiveToolsOnly: false,
+  pendingQuickAction: null,
   isColorGradingExpanded: false,
   isColorMixerExpanded: false,
   cropSectionsState: { transform: false, lens: false },
@@ -544,6 +567,8 @@ export const useUIStore = create<UIState>((set, get) => ({
     sourcePaths: [],
     scaleFactor: 2,
     pixfrac: 0.8,
+    bayerCfaMode: true,
+    alignmentMode: 'auto',
     progressMessage: null,
     error: null,
     finalImageBase64: null,
@@ -581,6 +606,13 @@ export const useUIStore = create<UIState>((set, get) => ({
     decayRate: 0.08,
     fillGaps: true,
     useGpu: true,
+  },
+  softProofState: {
+    enabled: false,
+    target: 'srgb',
+    intent: 'relativeColorimetric',
+    oogWarning: true,
+    customIccPath: null,
   },
   isLensCorrectionModalOpen: false,
   isTransformModalOpen: false,
@@ -661,6 +693,29 @@ export const useUIStore = create<UIState>((set, get) => ({
     if (targetRegion) state.setActivePanel(targetRegion, panelId);
   },
 
+  triggerQuickAction: (panel, action) => {
+    const state = get();
+    const isPlaced = PANEL_REGIONS.some((region) => state.panelLayout[region].includes(panel));
+    if (!isPlaced) {
+      state.movePanelToIndex(panel, 'rightTop', state.panelLayout.rightTop.length);
+    }
+    get().setPanel(panel);
+    set((s) => ({
+      pendingQuickAction: action,
+      ...(panel === Panel.Adjustments
+        ? { collapsibleSectionsState: { ...s.collapsibleSectionsState, basic: true } }
+        : {}),
+    }));
+  },
+
+  consumeQuickAction: () => {
+    const action = get().pendingQuickAction;
+    if (action !== null) {
+      set({ pendingQuickAction: null });
+    }
+    return action;
+  },
+
   toggleFullScreen: () => {
     const { isFullScreen } = get();
     const { zoom, selectedImage } = useEditorStore.getState();
@@ -727,6 +782,12 @@ useUIStore.subscribe((state, prev) => {
     });
   } else if (prev.activePanel === Panel.Crop) {
     setEditor({ cropSessionSnapshot: null });
+  }
+});
+
+useEditorStore.subscribe((state, prev) => {
+  if (state.selectedImage?.path !== prev.selectedImage?.path && useUIStore.getState().pendingQuickAction !== null) {
+    useUIStore.setState({ pendingQuickAction: null });
   }
 });
 

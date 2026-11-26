@@ -384,21 +384,31 @@ pub fn optimize_photographic_rendering(
 #[tauri::command]
 pub async fn run_auto_tune_quality_loop(
     state: tauri::State<'_, crate::app::state::AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let source_img = {
+    let (loaded_path, source_img) = {
         let guard = state
             .original_image
             .lock()
             .map_err(|e| e.to_string())?;
-        guard
+        let loaded = guard
             .as_ref()
-            .ok_or_else(|| "No active image loaded for Auto-Tune Quality Loop".to_string())?
-            .image
-            .clone()
+            .ok_or_else(|| "No active image loaded for Auto-Tune Quality Loop".to_string())?;
+        (loaded.path.clone(), loaded.image.clone())
     };
+    let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
 
     tokio::task::spawn_blocking(move || {
-        let preview = crate::enhanced::fast_resizer::fast_downscale_dynamic(&source_img, 1024, 1024);
+        let edited = crate::export::render_image_with_edits(
+            &loaded_path,
+            &source_img,
+            None,
+            &settings,
+            &app_handle,
+            false,
+        );
+        let eval_src = edited.as_ref().unwrap_or(&source_img);
+        let preview = crate::enhanced::fast_resizer::fast_downscale_dynamic(eval_src, 1024, 1024);
         let mut rgb32f = preview.to_rgb32f();
         let report = optimize_photographic_rendering(&mut rgb32f, None);
         Ok(serde_json::json!({

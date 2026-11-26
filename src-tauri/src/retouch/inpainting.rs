@@ -633,7 +633,7 @@ pub async fn invoke_generative_replace_with_mask_def(
     .map(|v| v.to_string())
 }
 
-fn generation_masks(mask: &GrayImage) -> Result<(GrayImage, GrayImage), String> {
+pub(crate) fn generation_masks(mask: &GrayImage) -> Result<(GrayImage, GrayImage), String> {
     let (min_x, max_x, min_y, max_y) = calculate_mask_bounds(mask)?;
     let diagonal = ((max_x - min_x + 1) as f32).hypot((max_y - min_y + 1) as f32);
     let radius = (diagonal * 0.012).round().clamp(4.0, 24.0) as u32;
@@ -930,7 +930,7 @@ fn match_grain(patch: &mut RgbaImage, source: &image::Rgb32FImage, fill: &GrayIm
     }
 }
 
-fn encode_generated_patch(
+pub(crate) fn encode_generated_patch(
     source_image: &DynamicImage,
     final_patch: &RgbaImage,
     (patch_x, patch_y): (u32, u32),

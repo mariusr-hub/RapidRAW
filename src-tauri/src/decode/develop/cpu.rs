@@ -32,12 +32,22 @@ pub(super) fn finish(
 ) -> Rgb32FImage {
     let highlights = finish
         .camera
+        .filter(|_| finish.recover_highlights)
         .map(|camera| Highlights::new(data, width, height, camera));
     let mut image = oriented_rgb32f(width, height, finish.orientation, |x, y| {
         let observed = data[y * width + x];
-        highlights
-            .as_ref()
-            .map_or(observed, |highlights| highlights.developed(x, y, observed))
+        if let Some(highlights) = highlights.as_ref() {
+            highlights.developed(x, y, observed)
+        } else if let Some(camera) = finish.camera {
+            let neutral = camera.wb.map(|c| 1.0 / c);
+            let cam: [f32; 3] = std::array::from_fn(|c| observed[c] * neutral[c]);
+            let rgb = camera
+                .matrix
+                .map(|row| row[0] * cam[0] + row[1] * cam[1] + row[2] * cam[2]);
+            fit_gamut(rgb, &camera.compression).map(|v| v.min(camera.clamp_limit))
+        } else {
+            observed
+        }
     });
 
     let luma =

@@ -181,14 +181,14 @@ export default function CopyPasteSettingsModal({ isOpen, onClose, onSave, settin
 
   return (
     <div
-      className={`fixed inset-0 flex items-center justify-center z-50 bg-black/30 backdrop-blur-xs transition-opacity duration-300 ease-in-out ${
+      className={`fixed inset-0 flex items-center justify-center p-2 sm:p-4 z-50 bg-black/30 backdrop-blur-xs transition-opacity duration-300 ease-in-out ${
         show ? 'opacity-100' : 'opacity-0'
       }`}
       onClick={onClose}
       role="dialog"
     >
       <div
-        className={`bg-surface rounded-lg shadow-xl p-6 w-full max-w-2xl flex flex-col transform transition-all duration-300 ease-out ${
+        className={`bg-surface rounded-lg shadow-xl p-5 sm:p-6 w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden transform transition-all duration-300 ease-out ${
           show ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4'
         }`}
         onClick={(e) => e.stopPropagation()}
@@ -274,7 +274,7 @@ export default function CopyPasteSettingsModal({ isOpen, onClose, onSave, settin
           </div>
         </div>
 
-        <div className="flex justify-end gap-3 mt-6 pt-4 border-t border-surface">
+        <div className="shrink-0 flex justify-end gap-3 mt-4 pt-3 border-t border-surface">
           <Button
             className="px-4 py-2 rounded-md text-text-secondary bg-surface hover:bg-surface transition-colors"
             onClick={onClose}

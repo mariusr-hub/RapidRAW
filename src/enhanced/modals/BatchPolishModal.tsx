@@ -124,10 +124,10 @@ export const BatchPolishModal: React.FC<BatchPolishModalProps> = ({
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0, scale: 0.95 }}
           transition={{ duration: 0.15, ease: 'easeOut' }}
-          className="relative w-full max-w-[560px] bg-surface rounded-xl border border-border-color shadow-2xl overflow-hidden"
+          className="relative w-full max-w-[560px] max-h-[92vh] bg-surface rounded-xl border border-border-color shadow-2xl overflow-hidden flex flex-col"
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-6 py-4 border-b border-border-color">
+          <div className="shrink-0 flex items-center justify-between px-5 py-3.5 border-b border-border-color">
             <div className="flex items-center gap-2">
               <Sparkles className="text-amber-400" size={18} />
               <Text variant={TextVariants.heading} weight={TextWeights.semibold}>
@@ -145,7 +145,7 @@ export const BatchPolishModal: React.FC<BatchPolishModalProps> = ({
           </div>
 
           {/* Body */}
-          <div className="p-6 flex flex-col gap-5 text-text-primary max-h-[80vh] overflow-y-auto">
+          <div className="flex-1 min-h-0 p-5 flex flex-col gap-4 text-text-primary overflow-y-auto">
             <div className="flex items-start gap-3 p-3.5 rounded-lg bg-bg-secondary border border-border-color/60">
               <div className="p-2 rounded-md bg-amber-500/10 text-amber-400 mt-0.5 shrink-0">
                 <Wand2 size={20} />
@@ -326,12 +326,19 @@ export const BatchPolishModal: React.FC<BatchPolishModalProps> = ({
           </div>
 
           {/* Footer Actions */}
-          <div className="flex justify-end items-center gap-2 px-6 py-4 bg-bg-secondary/40 border-t border-border-color">
+          <div className="shrink-0 flex justify-end items-center gap-2 px-5 py-3.5 bg-bg-secondary/40 border-t border-border-color">
             <button
               type="button"
-              onClick={result ? handleFinishAndClose : onClose}
-              disabled={isProcessing}
-              className="px-4 py-2 rounded-md text-text-secondary hover:bg-surface transition-colors text-sm disabled:opacity-50 cursor-pointer"
+              onClick={() => {
+                if (isProcessing) {
+                  invoke('cancel_ai_denoise').catch((err) => console.warn('Cancel failed:', err));
+                  setIsProcessing(false);
+                  return;
+                }
+                if (result) handleFinishAndClose();
+                else onClose();
+              }}
+              className="px-4 py-2 rounded-md text-text-secondary hover:bg-surface transition-colors text-sm cursor-pointer"
             >
               {result ? 'Done' : 'Cancel'}
             </button>

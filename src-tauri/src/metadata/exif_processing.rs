@@ -213,21 +213,53 @@ fn insert_missing_lens_fields(map: &mut HashMap<String, String>, lens: &LensDesc
     }
 }
 
+fn parse_exposure_seconds_str(val_str: &str) -> Option<f32> {
+    let cleaned = val_str
+        .trim()
+        .trim_end_matches("sec")
+        .trim_end_matches('s')
+        .trim();
+    if let Some((num_s, den_s)) = cleaned.split_once('/') {
+        let num = num_s.trim().parse::<f32>().ok()?;
+        let den = den_s.trim().parse::<f32>().ok()?;
+        (den != 0.0 && num > 0.0).then_some(num / den)
+    } else {
+        let val = cleaned.parse::<f32>().ok()?;
+        (val.is_finite() && val > 0.0).then_some(val)
+    }
+}
+
+fn parse_apex_shutter_str(val_str: &str) -> Option<f32> {
+    let cleaned = val_str.trim();
+    let apex = if let Some((num_s, den_s)) = cleaned.split_once('/') {
+        let num = num_s.trim().parse::<f32>().ok()?;
+        let den = den_s.trim().parse::<f32>().ok()?;
+        if den == 0.0 {
+            return None;
+        }
+        num / den
+    } else {
+        cleaned.parse::<f32>().ok()?
+    };
+    if apex.is_finite() && (-10.0..=20.0).contains(&apex) {
+        let secs = 2.0f32.powf(-apex);
+        (secs.is_finite() && secs > 0.0).then_some(secs)
+    } else {
+        None
+    }
+}
+
 pub fn read_exposure_time_secs(path: &str, file_bytes: &[u8]) -> Option<f32> {
-    if let Some(map) = read_rrexif_sidecar(Path::new(path))
-        && let Some(val_str) = map.get("ExposureTime").or(map.get("ShutterSpeedValue"))
-    {
-        let cleaned = val_str.replace(" s", "");
-        if cleaned.contains('/') {
-            let parts: Vec<&str> = cleaned.split('/').collect();
-            if parts.len() == 2
-                && let (Ok(num), Ok(den)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>())
-                && den != 0.0
-            {
-                return Some(num / den);
-            }
-        } else if let Ok(val) = cleaned.parse::<f32>() {
-            return Some(val);
+    if let Some(map) = read_rrexif_sidecar(Path::new(path)) {
+        if let Some(val_str) = map.get("ExposureTime")
+            && let Some(secs) = parse_exposure_seconds_str(val_str)
+        {
+            return Some(secs);
+        }
+        if let Some(val_str) = map.get("ShutterSpeedValue")
+            && let Some(secs) = parse_apex_shutter_str(val_str)
+        {
+            return Some(secs);
         }
     }
 
@@ -235,50 +267,43 @@ pub fn read_exposure_time_secs(path: &str, file_bytes: &[u8]) -> Option<f32> {
         && let Some(meta) = read_raw_metadata(file_bytes)
     {
         if let Some(r) = meta.exif.exposure_time {
-            return if r.d == 0 {
-                None
-            } else {
-                Some(r.n as f32 / r.d as f32)
-            };
-        } else if let Some(r) = meta.exif.shutter_speed_value {
-            return if r.d == 0 {
-                None
-            } else {
-                Some(r.n as f32 / r.d as f32)
-            };
+            return (r.d != 0 && r.n > 0).then_some(r.n as f32 / r.d as f32);
+        } else if let Some(r) = meta.exif.shutter_speed_value
+            && r.d != 0
+        {
+            let apex = r.n as f32 / r.d as f32;
+            if apex.is_finite() && (-10.0..=20.0).contains(&apex) {
+                let secs = 2.0f32.powf(-apex);
+                return (secs.is_finite() && secs > 0.0).then_some(secs);
+            }
         }
     }
 
     if let Some(exif) = read_exif(file_bytes) {
         if let Some(exposure) = exif.get_field(exif::Tag::ExposureTime, In::PRIMARY) {
             if let Value::Rational(ref r) = exposure.value {
-                if r.is_empty() {
-                    return None;
-                }
-
                 let val = r.first()?;
-
-                return if val.denom == 0 {
-                    None
-                } else {
-                    Some(val.num as f32 / val.denom as f32)
-                };
+                return (val.denom != 0 && val.num > 0).then_some(val.num as f32 / val.denom as f32);
             }
         } else if let Some(shutter_speed) =
             exif.get_field(exif::Tag::ShutterSpeedValue, In::PRIMARY)
-            && let Value::Rational(ref r) = shutter_speed.value
         {
-            if r.is_empty() {
-                return None;
-            }
-
-            let val = r.first()?;
-
-            return if val.denom == 0 {
-                None
-            } else {
-                Some(val.num as f32 / val.denom as f32)
+            let apex = match shutter_speed.value {
+                Value::SRational(ref r) => r
+                    .first()
+                    .and_then(|v| (v.denom != 0).then_some(v.num as f32 / v.denom as f32)),
+                Value::Rational(ref r) => r
+                    .first()
+                    .and_then(|v| (v.denom != 0).then_some(v.num as f32 / v.denom as f32)),
+                _ => None,
             };
+            if let Some(apex) = apex
+                && apex.is_finite()
+                && (-10.0..=20.0).contains(&apex)
+            {
+                let secs = 2.0f32.powf(-apex);
+                return (secs.is_finite() && secs > 0.0).then_some(secs);
+            }
         }
     }
     None

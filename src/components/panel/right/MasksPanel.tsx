@@ -1957,10 +1957,61 @@ function SettingsPanel({
   const handleApplyPresetToMask = (presetAdjustments: Partial<Adjustments>) => {
     if (!container) return;
     const currentAdjustments = container.adjustments;
+    const globalAdj = useEditorStore.getState().adjustments;
+    const isGlobalToned =
+      Math.abs(globalAdj.contrast || 0) > 4 ||
+      Math.abs(globalAdj.vibrance || 0) > 6 ||
+      Math.abs(globalAdj.saturation || 0) > 6 ||
+      Math.abs(globalAdj.exposure || 0) > 0.05;
+    const scale = isGlobalToned ? 0.65 : 1.0;
+
+    const scaledPatch: Partial<Adjustments> = { ...presetAdjustments };
+    if (scale < 1.0) {
+      if (typeof scaledPatch.contrast === 'number') scaledPatch.contrast = Math.round(scaledPatch.contrast * scale);
+      if (typeof scaledPatch.saturation === 'number' && scaledPatch.saturation > -90) {
+        scaledPatch.saturation = Math.round(scaledPatch.saturation * scale);
+      }
+      if (typeof scaledPatch.vibrance === 'number' && scaledPatch.vibrance > -90) {
+        scaledPatch.vibrance = Math.round(scaledPatch.vibrance * scale);
+      }
+      if (typeof scaledPatch.clarity === 'number') scaledPatch.clarity = Math.round(scaledPatch.clarity * scale);
+      if (typeof scaledPatch.dehaze === 'number') scaledPatch.dehaze = Math.round(scaledPatch.dehaze * scale);
+    }
+
+    const mergedColorGrading = presetAdjustments.colorGrading
+      ? {
+          ...INITIAL_MASK_ADJUSTMENTS.colorGrading,
+          ...(currentAdjustments.colorGrading || {}),
+          ...presetAdjustments.colorGrading,
+          shadows: {
+            ...INITIAL_MASK_ADJUSTMENTS.colorGrading.shadows,
+            ...(presetAdjustments.colorGrading.shadows || {}),
+          },
+          midtones: {
+            ...INITIAL_MASK_ADJUSTMENTS.colorGrading.midtones,
+            ...(presetAdjustments.colorGrading.midtones || {}),
+          },
+          highlights: {
+            ...INITIAL_MASK_ADJUSTMENTS.colorGrading.highlights,
+            ...(presetAdjustments.colorGrading.highlights || {}),
+          },
+          global: {
+            ...INITIAL_MASK_ADJUSTMENTS.colorGrading.global,
+            ...(presetAdjustments.colorGrading.global || {}),
+          },
+        }
+      : currentAdjustments.colorGrading;
+
+    const mergedTools = mergeActiveTools(currentAdjustments, presetAdjustments);
+    if (presetAdjustments.colorGrading) {
+      mergedTools.colorGrading = true;
+    }
+
     const newMaskAdjustments = {
       ...currentAdjustments,
-      ...presetAdjustments,
-      activeTools: mergeActiveTools(currentAdjustments, presetAdjustments),
+      ...scaledPatch,
+      colorGrading: mergedColorGrading,
+      activeTools: mergedTools,
     };
     updateContainer(container.id, { adjustments: newMaskAdjustments });
   };
@@ -2252,6 +2303,12 @@ function SettingsPanel({
                   value={textPrompt}
                 />
               </div>
+              <p className="text-[10px] text-text-secondary/80 leading-snug">
+                {t(
+                  'editor.masks.settings.textPromptEnglishHint',
+                  'Tip: AI Text Mask uses English object names (e.g. sky, person, tree, carrot).',
+                )}
+              </p>
 
               {isTextMaskRunning ? (
                 <Button

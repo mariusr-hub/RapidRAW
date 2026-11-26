@@ -8,6 +8,7 @@ import Slider from '../../components/ui/Slider';
 import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import clsx from 'clsx';
 import { useEditorStore } from '../../store/useEditorStore';
+import { Invokes } from '../../types/invokes';
 
 interface BokehModalProps {
   isOpen: boolean;
@@ -20,6 +21,7 @@ interface BokehResult {
   blur_radius_px: number;
   specular_highlights_detected: number;
   preview_base64: string | null;
+  depth_map_base64?: string | null;
 }
 
 export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
@@ -46,6 +48,24 @@ export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
 
   useEffect(() => {
     if (isOpen) {
+      const adj = useEditorStore.getState().adjustments;
+      if (adj.tiltShiftEnabled) {
+        if (adj.tiltShiftCenterY !== undefined) setTiltCenterY(Math.round(adj.tiltShiftCenterY * 100));
+        if (adj.tiltShiftBandHeight !== undefined) setTiltBandHeight(Math.round(adj.tiltShiftBandHeight * 100));
+        if (adj.tiltShiftAngleDeg !== undefined) setTiltAngle(adj.tiltShiftAngleDeg);
+        if (adj.tiltShiftBlurRadius !== undefined) setTiltBlur(adj.tiltShiftBlurRadius);
+        if (adj.tiltShiftSpecularBoost !== undefined) setTiltSpecular(adj.tiltShiftSpecularBoost);
+      }
+      if (adj.lensBlurEnabled) {
+        if (adj.lensBlurAmount !== undefined) {
+          setAperture(Number((16 - (adj.lensBlurAmount / 100) * 14.8).toFixed(1)));
+        }
+        if (adj.lensBlurDiffusion !== undefined) setSpecularBoost(adj.lensBlurDiffusion);
+        if (adj.lensBlurMinDepth !== undefined && adj.lensBlurMaxDepth !== undefined) {
+          setFocalDistance(Math.round((adj.lensBlurMinDepth + adj.lensBlurMaxDepth) / 2));
+          setDepthRange(Math.max(5, Math.round(adj.lensBlurMaxDepth - adj.lensBlurMinDepth)));
+        }
+      }
       if (activeTab === 'bokeh') {
         runBokehSimulation(aperture, bokehShape, specularBoost, focalDistance, depthRange);
       } else {
@@ -61,12 +81,13 @@ export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
     const reqId = ++bokehSeqRef.current;
     setIsProcessing(true);
     try {
-      const res = await invoke<BokehResult>('simulate_optical_bokeh', {
+      const res = await invoke<BokehResult>(Invokes.SimulateOpticalBokeh, {
         apertureFStop: fStop,
         bokehShape: shape,
         specularBoost: spec,
         focalDistance: focusDist / 100,
         depthRange: dRange / 100,
+        jsAdjustments: useEditorStore.getState().adjustments,
       });
       if (reqId !== bokehSeqRef.current) return;
       setResult(res);
@@ -84,12 +105,13 @@ export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
     const reqId = ++tiltSeqRef.current;
     setIsProcessing(true);
     try {
-      const resB64 = await invoke<string>('simulate_tilt_shift', {
+      const resB64 = await invoke<string>(Invokes.SimulateTiltShift, {
         centerYNorm: cy / 100,
         bandHeightNorm: band / 100,
         angleDeg: angle,
         blurAmount: blur,
         specularBoost: spec,
+        jsAdjustments: useEditorStore.getState().adjustments,
       });
       if (reqId !== tiltSeqRef.current) return;
       setTiltResultB64(resB64);
@@ -154,24 +176,34 @@ export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
   };
 
   const handleApply = () => {
-    const currentAdjustments = useEditorStore.getState().adjustments;
+    const { adjustments: currentAdjustments, selectedImage } = useEditorStore.getState();
     if (activeTab === 'bokeh') {
       const mappedShape: 'circle' | 'hexagon' | 'octagon' =
         bokehShape === 'circular' ? 'circle' : bokehShape === 'sevenBlade' ? 'hexagon' : 'octagon';
       const nextAdjustments = {
         ...currentAdjustments,
         lensBlurEnabled: true,
+        lensBlurDepthMap: currentAdjustments.lensBlurDepthMap || result?.depth_map_base64 || null,
         lensBlurAmount: Math.round(Math.min(100, Math.max(0, ((16 - aperture) / 14.8) * 100))),
         lensBlurDiffusion: specularBoost,
         lensBlurShape: mappedShape,
         lensBlurMinDepth: Math.max(0, Math.round(focalDistance - depthRange / 2)),
         lensBlurMaxDepth: Math.min(100, Math.round(focalDistance + depthRange / 2)),
+        activeTools: {
+          ...(currentAdjustments.activeTools || {}),
+          lensBlur: true,
+        },
       };
       setEditor((state) => ({
         adjustments: nextAdjustments,
         finalPreviewUrl: result?.preview_base64 ?? state.finalPreviewUrl,
       }));
       useEditorStore.getState().pushHistory(nextAdjustments, 'Optical Bokeh');
+      if (selectedImage?.path) {
+        invoke(Invokes.QueueAiJobs, { paths: [selectedImage.path] }).catch((err) => {
+          console.warn('Failed to queue AI depth job:', err);
+        });
+      }
       onClose();
     } else if (activeTab === 'tiltShift') {
       const nextAdjustments = {
@@ -190,6 +222,25 @@ export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
       useEditorStore.getState().pushHistory(nextAdjustments, 'Tilt-Shift');
       onClose();
     }
+  };
+
+  const activeAdjustments = useEditorStore((state) => state.adjustments);
+  const canDisableActive =
+    (activeTab === 'bokeh' && !!activeAdjustments.lensBlurEnabled) ||
+    (activeTab === 'tiltShift' && !!activeAdjustments.tiltShiftEnabled);
+
+  const handleDisableEffect = () => {
+    const currentAdjustments = useEditorStore.getState().adjustments;
+    if (activeTab === 'bokeh') {
+      const nextAdjustments = { ...currentAdjustments, lensBlurEnabled: false };
+      setEditor({ adjustments: nextAdjustments });
+      useEditorStore.getState().pushHistory(nextAdjustments, 'Disable Optical Bokeh');
+    } else {
+      const nextAdjustments = { ...currentAdjustments, tiltShiftEnabled: false };
+      setEditor({ adjustments: nextAdjustments });
+      useEditorStore.getState().pushHistory(nextAdjustments, 'Disable Tilt-Shift');
+    }
+    onClose();
   };
 
   if (!isOpen) return null;
@@ -589,6 +640,15 @@ export const BokehModal: React.FC<BokehModalProps> = ({ isOpen, onClose }) => {
 
           {/* Footer */}
           <div className="flex justify-end items-center gap-2 px-6 py-4 bg-bg-secondary/40 border-t border-border-color">
+            {canDisableActive && (
+              <button
+                type="button"
+                onClick={handleDisableEffect}
+                className="mr-auto px-3 py-2 rounded-md text-red-400 hover:bg-red-500/10 border border-red-500/30 transition-colors text-xs font-medium cursor-pointer"
+              >
+                {activeTab === 'bokeh' ? 'Disable Optical Bokeh' : 'Disable Tilt-Shift'}
+              </button>
+            )}
             <button
               type="button"
               onClick={onClose}

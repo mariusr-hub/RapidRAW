@@ -5,13 +5,15 @@ import { Check, ChevronDown, Flower2, Heart, Loader2, Sparkles, Sun, Zap } from 
 import { toast } from 'react-toastify';
 import Slider from '../ui/Slider';
 import Button from '../ui/Button';
-import { Adjustments, BasicAdjustment } from '../../utils/adjustments';
+import { Adjustments, BasicAdjustment, getActiveTools, setToolActive } from '../../utils/adjustments';
 import { useEffect, useRef, useState, useMemo, memo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { areSectionPropsEqual } from '../../utils/adjustments';
 import { Invokes } from '../../types/invokes';
 import { useEditorStore } from '../../store/useEditorStore';
 import { useSettingsStore } from '../../store/useSettingsStore';
+import { useUIStore } from '../../store/useUIStore';
+import { G2vCalibrationResult, StarSeparationExportResult } from '../../enhanced/types/astro';
 import ReferencePresetsRibbon from './ReferencePresetsRibbon';
 import LightsSubPipeline from './LightsSubPipeline';
 import SupercontrastCurve from './SupercontrastCurve';
@@ -35,7 +37,7 @@ type AstroScene = 'master' | 'milkyWay' | 'starryLandscape' | 'deepSky' | 'moonl
 
 interface BasicAdjustmentsProps {
   adjustments: Adjustments;
-  setAdjustments(adjustments: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)): any;
+  setAdjustments(adjustments: Partial<Adjustments> | ((prev: Adjustments) => Adjustments), label?: string): any;
   isForMask?: boolean;
   onDragStateChange?: (isDragging: boolean) => void;
   appSettings?: any;
@@ -228,6 +230,7 @@ function BasicAdjustments({
 
   const selectedImage = useEditorStore((state) => state.selectedImage);
   const handleSettingsChange = useSettingsStore((state) => state.handleSettingsChange);
+  const pendingQuickAction = useUIStore((state) => state.pendingQuickAction);
   const autoAnalyzeOnOpen = appSettings?.autoAnalyzeOnOpen === true;
 
   useEffect(() => {
@@ -271,10 +274,7 @@ function BasicAdjustments({
     try {
       const res: any = await invoke(Invokes.ApplyAiSkySculpt, { preset, intensity: 100 });
       if (res && res.mask_adjustments) {
-        const current = useEditorStore.getState().adjustments;
-        const next = { ...current, ...res.mask_adjustments };
-        setAdjustments(res.mask_adjustments);
-        useEditorStore.getState().pushHistory(next, 'Sky Sculpt');
+        setAdjustments((prev: Adjustments) => ({ ...prev, ...res.mask_adjustments }), 'Sky Sculpt');
         setDetectedSceneBadge(`Sky Sculpted: ${res.preset_name}`);
       }
     } catch (err) {
@@ -282,15 +282,16 @@ function BasicAdjustments({
     }
   };
 
-  const handleAutoEnhance = useCallback(async () => {
+  const handleAutoEnhance = useCallback(async (sceneOverride?: string) => {
     onDragStateChange?.(true);
     try {
       setIsAutoAnalyzing(true);
       const res: any = await invoke(Invokes.AnalyzeAndPolishActiveImage, {
         intensity: 100,
-        autoStraighten: true,
+        autoStraighten: false,
         toneStyle: 'filmic',
         skinProtection: true,
+        sceneOverride: typeof sceneOverride === 'string' ? sceneOverride : null,
       });
       if (res && res.adjustments) {
         setDetectedSceneBadge(res.sceneName || null);
@@ -309,11 +310,13 @@ function BasicAdjustments({
             (adj.lumaNoiseReduction || 0) > 0 ? `Denoise (${adj.lumaNoiseReduction}%)` : 'No Noise (Bypassed)',
         });
         const current = useEditorStore.getState().adjustments;
-        const next = { ...current, ...adj };
-        setAdjustments((prev: Partial<Adjustments>) => ({
-          ...prev,
-          ...adj,
-        }));
+        setAdjustments(
+          (prev: Adjustments) => ({
+            ...prev,
+            ...adj,
+          }),
+          'Smart Tone',
+        );
         useEditorStore.getState().setEditor({
           pendingAutoEdit: {
             path: selectedImage?.path ?? '',
@@ -321,7 +324,6 @@ function BasicAdjustments({
             previousAdjustments: current,
           },
         });
-        useEditorStore.getState().pushHistory(next, 'Smart Tone');
       }
     } catch (err) {
       console.error('Semantic AI polish error:', err);
@@ -340,7 +342,7 @@ function BasicAdjustments({
           if (typeof results.dehaze === 'number') patch.dehaze = results.dehaze;
           if (typeof results.vibrance === 'number') patch.vibrance = results.vibrance;
           if (typeof results.vignetteAmount === 'number') patch.vignetteAmount = results.vignetteAmount;
-          setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, ...patch }));
+          setAdjustments((prev: Adjustments) => ({ ...prev, ...patch }), 'Auto Enhance');
           useEditorStore.getState().setEditor({
             pendingAutoEdit: {
               path: selectedImage?.path ?? '',
@@ -348,7 +350,6 @@ function BasicAdjustments({
               previousAdjustments: current,
             },
           });
-          useEditorStore.getState().pushHistory({ ...current, ...patch }, 'Auto Enhance');
         }
       } catch (e) {
         console.error('Fallback auto enhance error:', e);
@@ -357,12 +358,13 @@ function BasicAdjustments({
       setIsAutoAnalyzing(false);
       onDragStateChange?.(false);
     }
-  }, [onDragStateChange, setAdjustments]);
+  }, [onDragStateChange, selectedImage?.path, setAdjustments]);
 
   const handleAutoEnhanceRef = useRef(handleAutoEnhance);
   handleAutoEnhanceRef.current = handleAutoEnhance;
 
   useEffect(() => {
+    if (isForMask) return;
     const onSmartDiag = (evt: Event) => {
       const detail = (evt as CustomEvent).detail;
       if (!detail?.adjustments) return;
@@ -382,16 +384,72 @@ function BasicAdjustments({
           (adj.lumaNoiseReduction || 0) > 0 ? `Denoise (${adj.lumaNoiseReduction}%)` : 'No Noise (Bypassed)',
       });
     };
-    const onQuickSmartTone = () => {
-      handleAutoEnhanceRef.current();
-    };
     window.addEventListener('rapidraw-smart-diag', onSmartDiag);
-    window.addEventListener('rapidraw-quick-smart-tone', onQuickSmartTone);
     return () => {
       window.removeEventListener('rapidraw-smart-diag', onSmartDiag);
-      window.removeEventListener('rapidraw-quick-smart-tone', onQuickSmartTone);
     };
-  }, []);
+  }, [isForMask]);
+
+  useEffect(() => {
+    if (isForMask || !pendingQuickAction) return;
+    if (
+      pendingQuickAction !== 'smart-tone' &&
+      pendingQuickAction !== 'color-contrast' &&
+      pendingQuickAction !== 'diffusion' &&
+      pendingQuickAction !== 'supercontrast'
+    ) {
+      return;
+    }
+    const action = useUIStore.getState().consumeQuickAction();
+    if (!action) return;
+
+    if (action === 'smart-tone') {
+      handleAutoEnhanceRef.current();
+    } else if (action === 'color-contrast') {
+      setAdjustments((prev: Adjustments) => {
+        let tools = setToolActive(getActiveTools(prev), 'color', true);
+        tools = setToolActive(tools, 'details', true);
+        return {
+          ...prev,
+          vibrance: Math.min(100, (prev.vibrance || 0) + 18),
+          saturation: Math.min(100, (prev.saturation || 0) + 4),
+          clarity: Math.min(100, (prev.clarity || 0) + 8),
+          activeTools: tools,
+        };
+      }, 'Quick Color Contrast');
+    } else if (action === 'diffusion') {
+      setAdjustments((prev: Adjustments) => {
+        let tools = setToolActive(getActiveTools(prev), 'basic', true);
+        tools = setToolActive(tools, 'effects', true);
+        return {
+          ...prev,
+          ortonSpread: Math.max(prev.ortonSpread || 0, 0.22),
+          glowAmount: Math.max(prev.glowAmount || 0, 18),
+          highlights: Math.max(-100, (prev.highlights || 0) - 12),
+          activeTools: tools,
+        };
+      }, 'Quick Light Diffusion');
+    } else if (action === 'supercontrast') {
+      setIsSupercontrastOpen(true);
+      const current = useEditorStore.getState().adjustments;
+      if (
+        Math.abs(current.supercontrastShadows ?? 0) < 1e-4 &&
+        Math.abs(current.supercontrastMidtones ?? 0) < 1e-4 &&
+        Math.abs(current.supercontrastHighlights ?? 0) < 1e-4
+      ) {
+        setAdjustments(
+          (prev: Adjustments) => ({
+            ...prev,
+            supercontrastShadows: 18,
+            supercontrastMidtones: 12,
+            supercontrastHighlights: -15,
+            activeTools: setToolActive(getActiveTools(prev), 'basic', true),
+          }),
+          'Quick Tonal Dynamics',
+        );
+      }
+    }
+  }, [isForMask, pendingQuickAction, setAdjustments]);
 
   useEffect(() => {
     if (!isForMask && autoAnalyzeOnOpen && selectedImage?.isReady && selectedImage.path) {
@@ -881,18 +939,46 @@ function BasicAdjustments({
     });
   };
 
-  const handleRemoveLightPollution = async () => {
+  const handleRemoveLightPollution = async (modeOverride?: 'poly' | 'rbf') => {
+    if (isForMask) return;
     try {
       setIsAstroMenuOpen(false);
+      const current = useEditorStore.getState().adjustments;
+      if (current.astroLpEnabled && !modeOverride) {
+        setAdjustments({ astroLpEnabled: false }, 'Restore Light Pollution');
+        return;
+      }
+      const lpMode = modeOverride ?? (current.astroLpMode as 'poly' | 'rbf' | undefined) ?? 'rbf';
       await invoke(Invokes.RemoveActiveLightPollutionGradient, {
-        preservePedestal: 0.02,
+        preservePedestal: current.astroLpPreservePedestal ?? 0.02,
+        mode: lpMode,
+        smoothing: current.astroLpSmoothing ?? 0.15,
+        strength: current.astroLpStrength ?? 1.0,
       });
-      setAdjustments((prev: Partial<Adjustments>) => ({
-        ...prev,
-        exposure: prev.exposure || 0,
-      }));
     } catch (err) {
       console.error('Failed to remove light pollution gradient:', err);
+      toast.error(`Light-pollution extraction failed: ${err}`);
+    }
+  };
+
+  const handlePhotometricG2vCalibration = async () => {
+    if (isForMask) return;
+    setIsAstroMenuOpen(false);
+    try {
+      const res = await invoke<G2vCalibrationResult>(Invokes.ComputeActiveG2vCalibration);
+      toast.success(res.message || `Photometric G2V calibrated (${res.starCount} stars).`);
+    } catch (err) {
+      toast.error(`G2V calibration failed: ${err}`);
+    }
+  };
+
+  const handleExportStarLayers = async () => {
+    if (isForMask) return;
+    try {
+      const res = await invoke<StarSeparationExportResult>(Invokes.ExportStarSeparationLayers);
+      toast.success(res.message || `Exported Starless & Stars TIFFs (${res.engine}).`);
+    } catch (err) {
+      toast.error(`Star separation export failed: ${err}`);
     }
   };
 
@@ -943,10 +1029,10 @@ function BasicAdjustments({
           <div className="grid grid-cols-5 gap-1">
             <button
               type="button"
-              onClick={handleAutoEnhance}
+              onClick={() => handleAutoEnhance()}
               disabled={isAutoAnalyzing}
               className="flex items-center justify-center gap-1 py-1.5 px-1 rounded-md bg-surface hover:bg-surface-secondary border border-border-color/50 text-text-primary hover:text-amber-400 font-medium text-[11px] min-w-0 transition-all shadow-xs disabled:opacity-50"
-              title="1-Click Universal AI Polish: Detects scene, balances dynamic range, and auto-levels horizon."
+              title="1-Click Universal AI Polish: Detects scene and balances tone, color & detail."
             >
               {isAutoAnalyzing ? (
                 <Loader2 size={12} className="animate-spin text-amber-400 shrink-0" />
@@ -1127,13 +1213,61 @@ function BasicAdjustments({
                   >
                     <span className="truncate">Night Sky Auto (AI Polish)</span>
                   </button>
+                  <div className="px-2.5 py-1 flex items-center justify-between gap-1 text-[10px] text-text-secondary">
+                    <span>LP Solver:</span>
+                    <div className="flex rounded bg-surface border border-border-color/40 overflow-hidden">
+                      {(['poly', 'rbf'] as const).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => handleRemoveLightPollution(m)}
+                          className={clsx(
+                            'px-1.5 py-0.5 uppercase transition-colors',
+                            (adjustments.astroLpMode ?? 'poly') === m && adjustments.astroLpEnabled
+                              ? 'bg-accent/25 text-accent font-semibold'
+                              : 'hover:bg-surface-secondary',
+                          )}
+                        >
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                   <button
                     type="button"
-                    onClick={handleRemoveLightPollution}
+                    onClick={() => handleRemoveLightPollution()}
                     className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-left hover:bg-surface/80 text-amber-400 font-medium transition-colors"
-                    title="Extracts and subtracts 2D polynomial background light pollution gradient"
+                    title="Extracts and subtracts background light pollution gradient"
                   >
-                    <span className="truncate">Remove Light Pollution</span>
+                    <span className="truncate">
+                      {adjustments.astroLpEnabled ? '✓ Light Pollution Removed (Reset)' : 'Remove Light Pollution'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handlePhotometricG2vCalibration}
+                    className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-left hover:bg-surface/80 text-sky-300 font-medium transition-colors"
+                    title="Calibrate star population color balance via G2V aperture photometry"
+                  >
+                    <span className="truncate">Photometric G2V Calibrate</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isForMask) return;
+                      setIsAstroMenuOpen(false);
+                      const nextEnabled = !adjustments.astroStarlessEnabled;
+                      setAdjustments(
+                        { astroStarlessEnabled: nextEnabled },
+                        nextEnabled ? 'Enable Star / Starless Pro' : 'Disable Star / Starless Pro',
+                      );
+                    }}
+                    className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-left hover:bg-surface/80 text-purple-300 font-medium transition-colors"
+                    title="Separate stars and nebulosity for non-destructive star reduction & nebula boost"
+                  >
+                    <span className="truncate">
+                      {adjustments.astroStarlessEnabled ? '✓ Star / Starless Pro Active' : 'Star / Starless Pro'}
+                    </span>
                   </button>
                 </div>
               )}
@@ -1186,6 +1320,92 @@ function BasicAdjustments({
             </div>
           </div>
 
+          {!isForMask && adjustments.astroLpEnabled && adjustments.astroLpMode === 'rbf' && (
+            <div className="p-2 rounded-md bg-card-active border border-amber-500/30 flex flex-col gap-1.5">
+              <div className="flex items-center justify-between text-[11px] font-semibold text-amber-300">
+                <span>RBF Gradient Extraction</span>
+                <button
+                  type="button"
+                  onClick={() => setAdjustments({ astroLpEnabled: false }, 'Disable RBF Light Pollution')}
+                  className="text-[10px] text-text-secondary hover:text-text-primary"
+                >
+                  Disable
+                </button>
+              </div>
+              <Slider
+                label="RBF Smoothing"
+                min={0.02}
+                max={1.0}
+                step={0.01}
+                defaultValue={0.15}
+                value={adjustments.astroLpSmoothing ?? 0.15}
+                onChange={(e: any) =>
+                  setAdjustments({ astroLpSmoothing: parseFloat(e.target.value) }, 'Adjust RBF Smoothing')
+                }
+                onDragStateChange={onDragStateChange}
+              />
+              <Slider
+                label="LP Removal Strength"
+                min={0.0}
+                max={1.5}
+                step={0.05}
+                defaultValue={1.0}
+                value={adjustments.astroLpStrength ?? 1.0}
+                onChange={(e: any) =>
+                  setAdjustments({ astroLpStrength: parseFloat(e.target.value) }, 'Adjust LP Strength')
+                }
+                onDragStateChange={onDragStateChange}
+              />
+            </div>
+          )}
+
+          {!isForMask && adjustments.astroStarlessEnabled && (
+            <div className="p-2 rounded-md bg-card-active border border-purple-500/30 flex flex-col gap-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-semibold text-purple-300">
+                <span>Star / Starless Pro</span>
+                <Button size="sm" className="text-[10px] py-0.5 px-2" onClick={handleExportStarLayers}>
+                  Export TIFF Layers
+                </Button>
+              </div>
+              <Slider
+                label="Star Mix (%)"
+                min={0}
+                max={100}
+                step={1}
+                defaultValue={100}
+                value={adjustments.astroStarMix ?? 100}
+                onChange={(e: any) =>
+                  setAdjustments({ astroStarMix: parseFloat(e.target.value) }, 'Adjust Star Mix')
+                }
+                onDragStateChange={onDragStateChange}
+              />
+              <Slider
+                label="Star Reduction (%)"
+                min={0}
+                max={100}
+                step={1}
+                defaultValue={0}
+                value={adjustments.astroStarReduction ?? 0}
+                onChange={(e: any) =>
+                  setAdjustments({ astroStarReduction: parseFloat(e.target.value) }, 'Adjust Star Reduction')
+                }
+                onDragStateChange={onDragStateChange}
+              />
+              <Slider
+                label="Nebula Boost (%)"
+                min={0}
+                max={100}
+                step={1}
+                defaultValue={0}
+                value={adjustments.astroNebulaBoost ?? 0}
+                onChange={(e: any) =>
+                  setAdjustments({ astroNebulaBoost: parseFloat(e.target.value) }, 'Adjust Nebula Boost')
+                }
+                onDragStateChange={onDragStateChange}
+              />
+            </div>
+          )}
+
           <div className="p-2 rounded-md bg-card-active border border-border-color/50 flex flex-col gap-1.5">
             <div className="flex items-center justify-between gap-1 flex-wrap">
               <span className="text-[11px] font-semibold text-amber-300">
@@ -1208,6 +1428,41 @@ function BasicAdjustments({
                 />
                 Auto-Analyze on Open
               </label>
+            </div>
+
+            <div className="flex flex-wrap gap-1">
+              {(
+                [
+                  { key: undefined, label: 'Auto' },
+                  { key: 'portrait', label: 'Portrait' },
+                  { key: 'macro', label: 'Macro' },
+                  { key: 'architecture', label: 'Arch' },
+                  { key: 'nightsky', label: 'NightSky' },
+                  { key: 'landscape', label: 'Landscape' },
+                  { key: 'hdr', label: 'HDR' },
+                  { key: 'panorama', label: 'Pano' },
+                ] as const
+              ).map(({ key, label }) => {
+                const activeName = (smartDiag?.sceneName || detectedSceneBadge || '').toLowerCase();
+                const isSelected = key ? activeName.includes(key === 'nightsky' ? 'night' : key === 'architecture' ? 'arch' : key) : !activeName;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    disabled={isAutoAnalyzing}
+                    onClick={() => handleAutoEnhance(key)}
+                    className={clsx(
+                      'px-1.5 py-0.5 rounded text-[10px] font-medium border transition-colors cursor-pointer disabled:opacity-50',
+                      isSelected
+                        ? 'bg-amber-500/20 border-amber-500/60 text-amber-300'
+                        : 'bg-surface/60 border-border-color/40 text-text-secondary hover:text-text-primary',
+                    )}
+                    title={`Apply ${label} Auto Profile (Tonal/Color/Detail)`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
             </div>
 
             {smartDiag && (

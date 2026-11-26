@@ -176,6 +176,57 @@ pub fn apply_hdr_preset_tone_curve(
     out
 }
 
+#[tauri::command]
+pub async fn validate_hdr_brackets(paths: Vec<String>) -> Result<BracketHealthReport, String> {
+    if paths.is_empty() {
+        return Err("No images provided".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut apertures = Vec::with_capacity(paths.len());
+        let mut exposure_times = Vec::with_capacity(paths.len());
+        let mut clipped_fractions = Vec::with_capacity(paths.len());
+
+        for path in &paths {
+            let (source_path, _) = crate::library::sidecars::parse_virtual_path(path);
+            let path_str = source_path.to_string_lossy();
+            let mut f_num_opt = None;
+            let mut exp_t_opt = None;
+
+            if let Some(map) = crate::metadata::exif_processing::read_rrexif_sidecar(&source_path) {
+                f_num_opt = map
+                    .get("FNumber")
+                    .and_then(|s| s.trim_start_matches("f/").trim().parse::<f32>().ok());
+                exp_t_opt = crate::metadata::exif_processing::read_exposure_time_secs(&path_str, &[]);
+            }
+            if f_num_opt.is_none() || exp_t_opt.is_none() {
+                if let Ok(mapped) = crate::library::file_ops::read_file_mapped(&source_path) {
+                    if f_num_opt.is_none() {
+                        f_num_opt = crate::metadata::exif_processing::read_f_number(&path_str, &mapped);
+                    }
+                    if exp_t_opt.is_none() {
+                        exp_t_opt =
+                            crate::metadata::exif_processing::read_exposure_time_secs(&path_str, &mapped);
+                    }
+                }
+            }
+            apertures.push(f_num_opt.unwrap_or(8.0));
+            exposure_times.push(exp_t_opt.unwrap_or(0.01));
+            clipped_fractions.push(0.0);
+        }
+
+        let mut report = validate_bracket_health(&apertures, &exposure_times, &clipped_fractions);
+        if report.is_perfect {
+            report.status_message = format!(
+                "EXIF Bracket Check: {:.1} EV dynamic range, locked aperture.",
+                report.dynamic_range_ev
+            );
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|e| format!("HDR bracket validation task failed: {}", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

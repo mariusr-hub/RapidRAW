@@ -14,6 +14,7 @@ use tauri::{Emitter, Manager};
 
 const MODEL_TAG: &str = "nind-v7";
 const BM3D_TAG: &str = "bm3d-v4";
+const RAW_PRE_DEMOSAIC_TAG: &str = "raw_pre_demosaic_v1";
 const BM3D_INTENSITY: f32 = 0.15;
 
 static CACHE: BaseCache = BaseCache::new(
@@ -41,14 +42,16 @@ pub fn is_enabled(adjustments: &serde_json::Value) -> bool {
 pub enum DenoiseMethod {
     Nind,
     Bm3d,
+    RawPreDemosaic,
 }
 
 impl DenoiseMethod {
-    const ALL: [Self; 2] = [Self::Nind, Self::Bm3d];
+    const ALL: [Self; 3] = [Self::Nind, Self::Bm3d, Self::RawPreDemosaic];
 
     pub fn from_adjustments(adjustments: &serde_json::Value) -> Self {
         match adjustments["aiDenoiseMethod"].as_str() {
             Some("bm3d") => Self::Bm3d,
+            Some("raw_pre_demosaic") | Some("rawPreDemosaic") => Self::RawPreDemosaic,
             _ => Self::Nind,
         }
     }
@@ -57,6 +60,7 @@ impl DenoiseMethod {
         match self {
             Self::Nind => MODEL_TAG,
             Self::Bm3d => BM3D_TAG,
+            Self::RawPreDemosaic => RAW_PRE_DEMOSAIC_TAG,
         }
     }
 }
@@ -412,6 +416,7 @@ fn emit_denoise_progress(
 fn run_denoiser_with_control(
     app_handle: &tauri::AppHandle,
     path: &str,
+    method: DenoiseMethod,
     base: &DynamicImage,
     session: Option<&Session>,
     _on_progress: &(dyn Fn(f32) + Sync),
@@ -420,6 +425,47 @@ fn run_denoiser_with_control(
     let cancel = Arc::clone(&state.ai_denoise_cancel);
     if cancel.load(Ordering::Relaxed) {
         return Err("AI denoise cancelled".to_string());
+    }
+
+    if method == DenoiseMethod::RawPreDemosaic && crate::decode::formats::is_raw_file(path) {
+        let _ = app_handle.emit(
+            "ai-denoise-progress",
+            serde_json::json!({
+                "path": path,
+                "progress": 0.1f32,
+                "stage": "Running Bayer 4-ch GAT pre-demosaic denoise...",
+                "provider": "CPU (Bayer GAT)",
+            }),
+        );
+        let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
+        if let Ok(bytes) = crate::library::file_ops::read_file_mapped(Path::new(path)) {
+            let (make, model) = crate::metadata::exif_processing::read_camera_make_model(path, &bytes)
+                .unwrap_or_default();
+            let iso = crate::metadata::exif_processing::read_iso(path, &bytes).unwrap_or(400);
+            let cam_key = crate::enhanced::local_priors::normalize_camera_key(&make, &model);
+            let (read_noise, shot_noise) =
+                if let Some(bucket) = crate::enhanced::local_priors::lookup_iso_noise_profile(&cam_key, iso) {
+                    (bucket.read_noise, bucket.shot_noise)
+                } else {
+                    let prof = crate::enhanced::denoising::get_sensor_noise_profile(&make, &model);
+                    (prof.base_read_noise, prof.shot_noise_coeff)
+                };
+            let opts = crate::ai::raw_denoise::RawDenoiseOptions {
+                strength: 0.45,
+                read_noise,
+                shot_noise,
+                model_path: settings.raw_denoise_model_path.clone(),
+            };
+            match crate::ai::raw_denoise::denoise_raw_bytes_pre_demosaic(&bytes, &opts, Some(&cancel)) {
+                Ok(out) => return Ok(out),
+                Err(err) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(err);
+                    }
+                    log::warn!("RawPreDemosaic fallback to BM3D for '{}': {}", path, err);
+                }
+            }
+        }
     }
 
     let source = base.to_rgb32f();
@@ -489,7 +535,7 @@ fn run_denoiser_with_control(
                     "provider": "CPU (BM3D)",
                 }),
             );
-            crate::ai::bm3d::denoise(&source, BM3D_INTENSITY, &|p| {
+            crate::ai::bm3d::denoise_with_cancel(&source, BM3D_INTENSITY, Some(&cancel), &|p| {
                 let _ = app_handle.emit(
                     "ai-denoise-progress",
                     serde_json::json!({
@@ -499,7 +545,7 @@ fn run_denoiser_with_control(
                         "provider": "CPU (BM3D)",
                     }),
                 );
-            })
+            })?
         }
     };
 
@@ -572,7 +618,7 @@ pub fn ensure_generated(
         true,
         session,
         move |session, base, progress| {
-            run_denoiser_with_control(&run_handle, &run_path, base, session.as_ref(), progress)
+            run_denoiser_with_control(&run_handle, &run_path, method, base, session.as_ref(), progress)
         },
     );
 }
@@ -607,7 +653,7 @@ pub fn generate_for_base(
         key,
         load_session(app_handle.clone(), path.to_string(), method),
         move |session, base, progress| {
-            run_denoiser_with_control(&run_handle, &run_path, base, session.as_ref(), progress)
+            run_denoiser_with_control(&run_handle, &run_path, method, base, session.as_ref(), progress)
         },
     )
 }
@@ -615,6 +661,8 @@ pub fn generate_for_base(
 #[tauri::command]
 pub fn cancel_ai_denoise(state: tauri::State<'_, AppState>) {
     state.ai_denoise_cancel.store(true, Ordering::SeqCst);
+    state.hdr_cancellation_token.store(true, Ordering::SeqCst);
+    state.panorama_cancellation_token.store(true, Ordering::SeqCst);
 }
 
 #[tauri::command]

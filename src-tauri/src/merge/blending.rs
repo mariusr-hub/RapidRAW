@@ -157,3 +157,82 @@ impl MultiBandBlender {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multiband_wraparound_matches_left_and_right_edges() {
+        let width = 64usize;
+        let height = 16usize;
+        let bands = 2usize;
+        let align = MultiBandBlender::alignment(bands); // 4
+        let halo = 2 * align; // 8
+        let ext_width = width + 2 * halo;
+
+        let run_periodic = |seam_shift: usize| {
+            let mut img_a = Raster::new(ext_width, height, 3);
+            let mut img_b = Raster::new(ext_width, height, 3);
+            let mut w_a = vec![0.0f32; ext_width * height];
+            let mut w_b = vec![0.0f32; ext_width * height];
+
+            for y in 0..height {
+                for gx in 0..ext_width {
+                    let wx = ((gx as isize - halo as isize).rem_euclid(width as isize)) as usize;
+                    let shifted = (wx + width - seam_shift) % width;
+                    let phase = (shifted as f32 / width as f32) * std::f32::consts::TAU;
+                    let base = 0.5 + 0.1 * phase.cos();
+                    let va = [base + 0.15, base, base - 0.10];
+                    let vb = [base - 0.15, base, base + 0.10];
+                    let idx = (y * ext_width + gx) * 3;
+                    img_a.data[idx..idx + 3].copy_from_slice(&va);
+                    img_b.data[idx..idx + 3].copy_from_slice(&vb);
+                    let use_a = shifted < width / 2;
+                    w_a[y * ext_width + gx] = if use_a { 1.0 } else { 0.0 };
+                    w_b[y * ext_width + gx] = if use_a { 0.0 } else { 1.0 };
+                }
+            }
+
+            let mut blender = MultiBandBlender::new(ext_width, height, bands);
+            blender.feed(&img_a, &w_a, 0, 0);
+            blender.feed(&img_b, &w_b, 0, 0);
+            blender.finish()
+        };
+
+        // Case 1: Continuous wrap across x=0 <-> x=width-1 (seam at width/2) -> edges must match
+        let continuous = run_periodic(width / 4);
+        for y in 0..height {
+            let left = continuous.pixel(halo, y);
+            let right = continuous.pixel(halo + width - 1, y);
+            for c in 0..3 {
+                assert!(
+                    (left[c] - right[c]).abs() < 0.015,
+                    "Continuous wrap mismatch at row {} ch {}: left={} right={}",
+                    y,
+                    c,
+                    left[c],
+                    right[c]
+                );
+            }
+        }
+
+        // Case 2: Seam placed directly at x=0 <-> x=width-1 must match the same seam shifted into the interior
+        let wrap_seam = run_periodic(0);
+        let interior_seam = run_periodic(width / 2);
+        for y in 0..height {
+            let wrap_p0 = wrap_seam.pixel(halo, y);
+            let int_p0 = interior_seam.pixel(halo + width / 2, y);
+            for c in 0..3 {
+                assert!(
+                    (wrap_p0[c] - int_p0[c]).abs() < 1e-3,
+                    "Wrap seam differs from interior seam at row {} ch {}: wrap={} interior={}",
+                    y,
+                    c,
+                    wrap_p0[c],
+                    int_p0[c]
+                );
+            }
+        }
+    }
+}

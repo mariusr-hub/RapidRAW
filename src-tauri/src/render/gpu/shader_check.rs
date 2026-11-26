@@ -129,3 +129,63 @@ fn shaders_compile_on_gpu_backends() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
+
+#[test]
+fn test_wgsl_shader_compiles_with_tetrahedral_hsl_and_soft_proof() {
+    let main_src = crate::render::gpu::pipelines::output_shader_source(
+        crate::render::gpu::processor::RenderOutputPrecision::EightBit,
+    );
+    let disp_src = crate::render::color_space::with_shader_prelude(include_str!("../../shaders/display.wgsl"));
+    assert!(main_src.contains("hsl_mode: u32"));
+    assert!(main_src.contains("hsl_skin_lock: f32"));
+    assert!(main_src.contains("fn apply_hsl_tetrahedral"));
+    assert!(main_src.contains("fn compute_skin_lock_weight"));
+    assert!(disp_src.contains("soft_proof_oog_opacity: f32"));
+
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    descriptor.backends = match default_backend() {
+        "dx12" => wgpu::Backends::DX12,
+        "metal" => wgpu::Backends::METAL,
+        _ => wgpu::Backends::VULKAN,
+    };
+    let instance = wgpu::Instance::new(descriptor);
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    })) else {
+        println!("[shader_check] no GPU adapter in test env, skipping device compile");
+        return;
+    };
+    let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("WGSL Module Check Device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: adapter.limits(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    })) else {
+        println!("[shader_check] could not open GPU device, skipping device compile");
+        return;
+    };
+
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&errors);
+    device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
+        sink.lock().unwrap_or_else(|e| e.into_inner()).push(err.to_string());
+    }));
+
+    let _main_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("shader.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(main_src.into()),
+    });
+    let _disp_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("display.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(disp_src.into()),
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let errs = errors.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(errs.is_empty(), "WGSL shader module errors: {}", errs.join("\n"));
+}

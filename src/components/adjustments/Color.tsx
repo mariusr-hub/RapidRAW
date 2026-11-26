@@ -1,6 +1,9 @@
-import { useState, useMemo, memo, CSSProperties, ReactNode } from 'react';
-import { Pipette, Sliders } from 'lucide-react';
+import { useState, useEffect, useMemo, memo, CSSProperties, ReactNode } from 'react';
+import { Pipette, Sliders, Upload } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
+import { toast } from 'react-toastify';
 import { useTranslation } from 'react-i18next';
 import Slider, { SliderChangeEvent } from '../ui/Slider';
 import ColorWheel from '../ui/ColorWheel';
@@ -40,6 +43,8 @@ import {
 import { TextColors, TextWeights } from '../../types/typography';
 import { useUIStore } from '../../store/useUIStore';
 import { HSL_MIXER_BANDS, HslMixerBand, HslMixerProperty } from '../../utils/hslMixer';
+import { Invokes } from '../../types/invokes';
+import { CameraProfileInfo } from '../../enhanced/types/color';
 
 interface ColorProps {
   color: string;
@@ -49,7 +54,7 @@ interface ColorProps {
 
 interface ColorPanelProps {
   adjustments: Adjustments;
-  setAdjustments(adjustments: Partial<Adjustments>): any;
+  setAdjustments(adjustments: Partial<Adjustments> | ((prev: Adjustments) => Adjustments), label?: string): any;
   appSettings: AppSettings | null;
   asShotWhiteBalance?: WhiteBalance;
   isForMask?: boolean;
@@ -742,8 +747,41 @@ function ColorPanel({
   const { t } = useTranslation();
   const handleSettingsChange = useSettingsStore((state) => state.handleSettingsChange);
   const [activeColor, setActiveColor] = useState('reds');
+  const [cameraProfiles, setCameraProfiles] = useState<CameraProfileInfo[]>([]);
   const hiddenTools = getHiddenAdjustmentTools(appSettings?.adjustmentLayout);
   const toolOrder = getAdjustmentToolOrder('color', appSettings?.adjustmentLayout?.toolOrder);
+
+  useEffect(() => {
+    if (isForMask) return;
+    let active = true;
+    invoke<CameraProfileInfo[]>(Invokes.ListCameraProfiles)
+      .then((list) => {
+        if (active) setCameraProfiles(list || []);
+      })
+      .catch((err) => console.warn('ListCameraProfiles failed:', err));
+    return () => {
+      active = false;
+    };
+  }, [isForMask]);
+
+  const handleImportCameraProfile = async () => {
+    if (isForMask) return;
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'Camera Profiles', extensions: ['dcp', 'icc', 'icm'] }],
+      });
+      if (typeof selected === 'string') {
+        const info = await invoke<CameraProfileInfo>(Invokes.ImportCameraProfile, { sourcePath: selected });
+        const refreshed = await invoke<CameraProfileInfo[]>(Invokes.ListCameraProfiles);
+        setCameraProfiles(refreshed || []);
+        setAdjustments({ cameraProfileId: info.id }, `Camera Profile: ${info.name}`);
+        toast.success(`Imported camera profile "${info.name}"`);
+      }
+    } catch (err) {
+      toast.error(`Profile import failed: ${err}`);
+    }
+  };
 
   const HSL_COLORS = useMemo<Array<ColorProps>>(
     () =>
@@ -1170,6 +1208,48 @@ function ColorPanel({
                   )}
                 </motion.div>
               </AnimatePresence>
+
+              {!isForMask && (
+                <div className="mt-3 pt-2.5 border-t border-white/10 flex flex-col gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                    <span className="text-text-secondary">Color Volume</span>
+                    <div className="flex rounded bg-surface border border-border-color/40 overflow-hidden">
+                      {(['classic', 'tetrahedral'] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() =>
+                            setAdjustments(
+                              { hslMode: mode },
+                              mode === 'tetrahedral' ? 'HSL Tetrahedral 3D' : 'HSL Classic',
+                            )
+                          }
+                          className={
+                            (adjustments.hslMode ?? 'classic') === mode
+                              ? 'px-2 py-0.5 bg-accent/25 text-accent font-medium capitalize'
+                              : 'px-2 py-0.5 text-text-secondary hover:text-text-primary capitalize'
+                          }
+                        >
+                          {mode === 'tetrahedral' ? '3D Tetrahedral' : 'Classic'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <Slider
+                    label="Skin-Vector Lock (%)"
+                    min={0}
+                    max={100}
+                    step={1}
+                    defaultValue={0}
+                    resetKey="hslSkinLock"
+                    value={adjustments.hslSkinLock ?? 0}
+                    onChange={(e: SliderChangeEvent) =>
+                      setAdjustments({ hslSkinLock: Number(e.target.value) })
+                    }
+                    onDragStateChange={onDragStateChange}
+                  />
+                </div>
+              )}
             </div>
           )}
         </AdjustmentSubSection>
@@ -1181,6 +1261,31 @@ function ColorPanel({
           order={toolOrder.indexOf('colorCalibration')}
           title={t('adjustments.color.calibration.title')}
         >
+          <div className="mb-3 pb-2.5 border-b border-white/10 flex items-center gap-1.5">
+            <select
+              value={adjustments.cameraProfileId ?? ''}
+              onChange={(e) =>
+                setAdjustments({ cameraProfileId: e.target.value }, 'Select Camera Profile')
+              }
+              className="flex-1 min-w-0 bg-surface border border-border-color/50 rounded px-2 py-1 text-xs text-text-primary outline-none"
+              title="Select DCP / ICC Camera Profile"
+            >
+              <option value="">Camera Standard (Embedded)</option>
+              {cameraProfiles.map((prof) => (
+                <option key={prof.id} value={prof.id}>
+                  {`${prof.name} (${prof.format})`}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={handleImportCameraProfile}
+              className="p-1.5 rounded bg-surface hover:bg-card-active border border-border-color/50 text-text-secondary hover:text-text-primary transition-colors"
+              title="Import .dcp or .icc Camera Profile"
+            >
+              <Upload size={13} />
+            </button>
+          </div>
           <ColorCalibrationPanel
             adjustments={adjustments}
             setAdjustments={setAdjustments}

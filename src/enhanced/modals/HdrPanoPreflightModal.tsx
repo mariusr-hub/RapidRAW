@@ -20,24 +20,37 @@ export interface HdrPanoGroupingReport {
   detectedBracketSize: number;
 }
 
+type PreflightProjection = 'cylindrical' | 'spherical' | 'planar' | 'panini' | 'stereographic';
+
 interface HdrPanoPreflightModalProps {
   isOpen: boolean;
   paths: string[];
+  initialProjection?: PreflightProjection;
+  initialBoundaryWarp?: number;
   onClose: () => void;
-  onProceed: (projection: 'cylindrical' | 'spherical' | 'planar' | 'panini' | 'stereographic', boundaryWarp: number) => void;
+  onProceed: (projection: PreflightProjection, boundaryWarp: number) => void;
 }
 
 export const HdrPanoPreflightModal: React.FC<HdrPanoPreflightModalProps> = ({
   isOpen,
   paths,
+  initialProjection = 'cylindrical',
+  initialBoundaryWarp = 0,
   onClose,
   onProceed,
 }) => {
   const { t } = useTranslation();
   const [report, setReport] = useState<HdrPanoGroupingReport | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [projection, setProjection] = useState<'cylindrical' | 'spherical' | 'planar' | 'panini' | 'stereographic'>('cylindrical');
-  const [boundaryWarp, setBoundaryWarp] = useState<number>(0.5);
+  const [projection, setProjection] = useState<PreflightProjection>(initialProjection);
+  const [boundaryWarp, setBoundaryWarp] = useState<number>(initialBoundaryWarp);
+
+  useEffect(() => {
+    if (isOpen) {
+      setProjection(initialProjection);
+      setBoundaryWarp(initialBoundaryWarp);
+    }
+  }, [isOpen, initialProjection, initialBoundaryWarp]);
 
   useEffect(() => {
     if (!isOpen || paths.length === 0) {
@@ -66,15 +79,26 @@ export const HdrPanoPreflightModal: React.FC<HdrPanoPreflightModalProps> = ({
 
   return (
     <AnimatePresence>
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+      <div
+        className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (e.target === e.currentTarget) {
+            onClose();
+          }
+        }}
+      >
         <motion.div
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0, scale: 0.95 }}
-          className="relative w-full max-w-2xl bg-neutral-900 border border-neutral-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]"
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          className="relative w-full max-w-2xl bg-neutral-900 border border-neutral-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800 bg-neutral-950/60">
+          <div className="shrink-0 flex items-center justify-between px-5 py-3 border-b border-neutral-800 bg-neutral-950/60">
             <div className="flex items-center gap-2.5">
               <div className="p-2 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400">
                 <Sparkles size={18} />
@@ -239,7 +263,7 @@ export const HdrPanoPreflightModal: React.FC<HdrPanoPreflightModalProps> = ({
           </div>
 
           {/* Footer */}
-          <div className="flex items-center justify-between px-6 py-4 border-t border-neutral-800 bg-neutral-950/60">
+          <div className="shrink-0 flex items-center justify-between gap-2 px-5 py-3 border-t border-neutral-800 bg-neutral-950/60">
             <Button variant="secondary" onClick={onClose} size="sm">
               Cancel
             </Button>

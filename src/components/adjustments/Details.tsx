@@ -404,7 +404,7 @@ function DetailsPanel({
                     <button
                       type="button"
                       onClick={() => {
-                        invoke(Invokes.CancelAiDenoise).catch(() => {});
+                        invoke(Invokes.CancelAiDenoise).catch((err) => console.warn('Cancel failed:', err));
                         setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, aiDenoiseEnabled: false }));
                       }}
                       className="mt-1 inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] bg-surface border border-border-color/60 hover:bg-card-active text-text-secondary hover:text-text-primary transition-colors cursor-pointer"
@@ -498,6 +498,17 @@ function DetailsPanel({
                 <Text variant={TextVariants.small} className="text-accent">
                   {aiModelDownloadStatus || `${Math.round(aiUpscaleProgress * 100)}%`}
                 </Text>
+                <button
+                  type="button"
+                  onClick={() => {
+                    invoke(Invokes.CancelAiDenoise).catch((err) => console.warn('Cancel failed:', err));
+                    setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, aiUpscaleEnabled: false }));
+                  }}
+                  className="mt-1 inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] bg-surface border border-border-color/60 hover:bg-card-active text-text-secondary hover:text-text-primary transition-colors cursor-pointer"
+                >
+                  <X size={12} />
+                  <span>Cancel</span>
+                </button>
               </div>
             ) : (
               <Slider

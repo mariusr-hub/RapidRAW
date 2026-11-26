@@ -306,6 +306,69 @@ pub fn calculate_auto_adjustments(
     let results = perform_auto_analysis(&loaded_image.image, exposure);
     let mut json = auto_results_to_json(&results, mode.unwrap_or_default());
 
+    let display_preview =
+        crate::enhanced::semantic_auto_polish::prepare_display_preview_for_analysis(
+            &loaded_image.image,
+            exposure,
+        );
+    let (scene, _conf) = crate::enhanced::semantic_auto_polish::detect_semantic_scene_with_hint(
+        &display_preview,
+        Some(&loaded_image.path),
+    );
+    let scene_key = format!("{:?}", scene);
+
+    match scene {
+        crate::enhanced::semantic_auto_polish::SemanticScene::Panorama => {
+            json["vignetteAmount"] = json!(0.0);
+            json["centré"] = json!(0.0);
+            if let Some(c) = json.get("clarity").and_then(|v| v.as_f64()) {
+                json["clarity"] = json!(c.max(10.0));
+            }
+        }
+        crate::enhanced::semantic_auto_polish::SemanticScene::NightSky => {
+            if let Some(e) = json.get("exposure").and_then(|v| v.as_f64()) {
+                json["exposure"] = json!(e.clamp(-0.15, 0.35));
+            }
+            json["sharpnessThreshold"] = json!(60.0);
+            json["colorNoiseReduction"] = json!(48.0);
+            json["lumaNoiseReduction"] = json!(30.0);
+        }
+        crate::enhanced::semantic_auto_polish::SemanticScene::Hdr => {
+            json["toneMapper"] = json!("agx");
+            if let Some(hl) = json.get("highlights").and_then(|v| v.as_f64()) {
+                json["highlights"] = json!(hl.min(-28.0));
+            }
+            if let Some(sh) = json.get("shadows").and_then(|v| v.as_f64()) {
+                json["shadows"] = json!(sh.max(22.0));
+            }
+        }
+        crate::enhanced::semantic_auto_polish::SemanticScene::Portrait => {
+            if let Some(c) = json.get("clarity").and_then(|v| v.as_f64()) {
+                json["clarity"] = json!(c.min(0.0));
+            }
+            if let Some(v) = json.get("vibrance").and_then(|v| v.as_f64()) {
+                json["vibrance"] = json!(v.min(14.0));
+            }
+            json["skinShield"] = json!(0.95);
+            json["sharpnessThreshold"] = json!(28.0);
+        }
+        crate::enhanced::semantic_auto_polish::SemanticScene::Macro => {
+            json["bokehMaskProtection"] = json!(45);
+            json["sharpnessThreshold"] = json!(38.0);
+            json["chromaticAberrationRedCyan"] = json!(-6.0);
+            json["chromaticAberrationBlueYellow"] = json!(4.0);
+        }
+        crate::enhanced::semantic_auto_polish::SemanticScene::Architecture => {
+            if let Some(c) = json.get("clarity").and_then(|v| v.as_f64()) {
+                json["clarity"] = json!(c.max(16.0));
+            }
+            if let Some(d) = json.get("dehaze").and_then(|v| v.as_f64()) {
+                json["dehaze"] = json!(d.max(10.0));
+            }
+        }
+        _ => {}
+    }
+
     let (source_path, _) = crate::library::sidecars::parse_virtual_path(&loaded_image.path);
     let cam_key = if let Ok(bytes) = std::fs::read(&source_path)
         && let Some((make, model)) =
@@ -318,12 +381,16 @@ pub fn calculate_auto_adjustments(
     crate::enhanced::semantic_auto_polish::apply_learned_auto_prior_to_json(
         &mut json,
         &cam_key,
-        "general",
+        &scene_key,
     );
     crate::enhanced::semantic_auto_polish::verify_adjustments_on_linear_preview(
         &loaded_image.image,
         &mut json,
-        true,
+        matches!(
+            scene,
+            crate::enhanced::semantic_auto_polish::SemanticScene::Portrait
+                | crate::enhanced::semantic_auto_polish::SemanticScene::General
+        ),
     );
 
     Ok(json)

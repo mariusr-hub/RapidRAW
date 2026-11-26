@@ -34,6 +34,14 @@ export default function NightSkyDropzone() {
 
   const handleApplyAdcActive = async () => {
     if (!selectedImage || isApplyingAdc) return;
+    const editorStore = useEditorStore.getState();
+    if (editorStore.adjustments.astroAdcEnabled) {
+      const next = { ...editorStore.adjustments, astroAdcEnabled: false };
+      editorStore.setEditor({ adjustments: next });
+      editorStore.pushHistory(next, 'Disable Atmospheric Dispersion Correction');
+      toast.info('ADC atmospheric dispersion alignment disabled');
+      return;
+    }
     setIsApplyingAdc(true);
     try {
       const msg = await invoke<string>(Invokes.ApplyAdcActive);
@@ -393,6 +401,18 @@ export default function NightSkyDropzone() {
           <div className="w-full bg-surface/80 rounded-full h-1.5 overflow-hidden">
             <div className="bg-accent h-full w-full animate-pulse" />
           </div>
+          <button
+            type="button"
+            onClick={() => {
+              invoke(Invokes.CancelAstroStack).catch((err) => console.warn('Cancel failed:', err));
+              setUI((s) => ({
+                nightSkyState: { ...s.nightSkyState, isProcessing: false, progressMessage: null },
+              }));
+            }}
+            className="self-end px-2.5 py-1 rounded text-[11px] bg-surface hover:bg-card-active text-text-secondary hover:text-text-primary border border-border-color/50 transition-colors cursor-pointer"
+          >
+            Cancel
+          </button>
         </div>
       )}
 

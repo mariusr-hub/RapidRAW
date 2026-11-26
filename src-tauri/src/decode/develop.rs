@@ -72,6 +72,7 @@ pub struct Finish {
     pub orientation: Orientation,
     pub denoise: f32,
     pub sharpen: f32,
+    pub recover_highlights: bool,
 }
 
 #[repr(C)]
@@ -266,10 +267,12 @@ fn layout(w: u32, h: u32, finish: &Finish) -> Layout {
     let denoise = finish.denoise > 0.0;
     let sharpen_samples = oh.div_ceil(16) * ow.div_ceil(5);
     let sharpen = finish.sharpen > 0.0 && sharpen_samples > 0;
-    let highlights = finish.camera.is_some();
+    let color = finish.camera.is_some();
+    let highlights = color && finish.recover_highlights;
 
     let mut flags = 0;
-    flags |= if highlights { HIGHLIGHTS | COLOR } else { 0 };
+    flags |= if highlights { HIGHLIGHTS } else { 0 };
+    flags |= if color { COLOR } else { 0 };
     flags |= if denoise { DENOISE } else { 0 };
     flags |= if sharpen { SHARPEN } else { 0 };
 
@@ -564,6 +567,7 @@ pub fn enhance(image: DynamicImage, denoise: f32, sharpen: f32) -> DynamicImage 
             orientation: Orientation::Normal,
             denoise: denoise.max(0.0),
             sharpen: sharpen.max(0.0),
+            recover_highlights: false,
         },
     );
     DynamicImage::ImageRgb32F(enhanced)

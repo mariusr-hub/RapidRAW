@@ -8,8 +8,6 @@
 //! - Privacy Guard: EXIF & GPS location sanitizer
 
 use crate::library::sidecars::parse_virtual_path;
-use crate::library::file_ops::{read_file_mapped};
-use crate::decode::image_loader::load_base_image_from_bytes;
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -17,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvancedExportConfig {
@@ -170,7 +168,8 @@ pub fn execute_advanced_batch_export(
     crate::ai::jobs::reserve(&config.paths);
     let start_time = std::time::Instant::now();
     let out_dir = PathBuf::from(&config.output_dir);
-    if !out_dir.exists() {
+    let out_dir_existed = out_dir.exists();
+    if !out_dir_existed {
         let _ = fs::create_dir_all(&out_dir);
     }
 
@@ -179,6 +178,7 @@ pub fn execute_advanced_batch_export(
     let success_count = Arc::new(AtomicUsize::new(0));
     let fail_count = Arc::new(AtomicUsize::new(0));
     let progress_count = Arc::new(AtomicUsize::new(0));
+    let created_files: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let _ = app_handle.emit(
         "advanced-export-progress",
@@ -194,8 +194,14 @@ pub fn execute_advanced_batch_export(
     let config_arc = Arc::new(config.clone());
     let success_clone = success_count.clone();
     let fail_clone = fail_count.clone();
+    let app_state = app_handle.state::<crate::app::state::AppState>();
+    app_state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+    let cancel_token = app_state.ai_denoise_cancel.clone();
 
     config.paths.par_iter().for_each(|path_str| {
+        if cancel_token.load(Ordering::Relaxed) {
+            return;
+        }
         let stem = Path::new(path_str)
             .file_stem()
             .unwrap_or_default()
@@ -244,39 +250,35 @@ pub fn execute_advanced_batch_export(
                 }
 
                 // 3. Encode into target format
+                let target_path = match config_arc.format.to_lowercase().as_str() {
+                    "tiff" | "tif" => out_dir.join(format!("{}.tif", stem)),
+                    "png" => out_dir.join(format!("{}.png", stem)),
+                    "webp" => out_dir.join(format!("{}.webp", stem)),
+                    _ => out_dir.join(format!("{}.jpg", stem)),
+                };
                 let out_file = match config_arc.format.to_lowercase().as_str() {
-                    "tiff" | "tif" => {
-                        let target_path = out_dir.join(format!("{}.tif", stem));
-                        base_image
-                            .to_rgba8()
-                            .save_with_format(&target_path, image::ImageFormat::Tiff)
-                            .is_ok()
-                    }
-                    "png" => {
-                        let target_path = out_dir.join(format!("{}.png", stem));
-                        base_image
-                            .to_rgba8()
-                            .save_with_format(&target_path, image::ImageFormat::Png)
-                            .is_ok()
-                    }
-                    "webp" => {
-                        let target_path = out_dir.join(format!("{}.webp", stem));
-                        base_image
-                            .to_rgb8()
-                            .save_with_format(&target_path, image::ImageFormat::WebP)
-                            .is_ok()
-                    }
-                    _ => {
-                        // JPEG default
-                        let target_path = out_dir.join(format!("{}.jpg", stem));
-                        base_image
-                            .to_rgb8()
-                            .save_with_format(&target_path, image::ImageFormat::Jpeg)
-                            .is_ok()
-                    }
+                    "tiff" | "tif" => base_image
+                        .to_rgba8()
+                        .save_with_format(&target_path, image::ImageFormat::Tiff)
+                        .is_ok(),
+                    "png" => base_image
+                        .to_rgba8()
+                        .save_with_format(&target_path, image::ImageFormat::Png)
+                        .is_ok(),
+                    "webp" => base_image
+                        .to_rgb8()
+                        .save_with_format(&target_path, image::ImageFormat::WebP)
+                        .is_ok(),
+                    _ => base_image
+                        .to_rgb8()
+                        .save_with_format(&target_path, image::ImageFormat::Jpeg)
+                        .is_ok(),
                 };
 
             if out_file {
+                if let Ok(mut g) = created_files.lock() {
+                    g.push(target_path);
+                }
                 success_clone.fetch_add(1, Ordering::SeqCst);
                 processed = true;
             }
@@ -302,6 +304,19 @@ pub fn execute_advanced_batch_export(
             }),
         );
     });
+
+    if cancel_token.load(Ordering::Relaxed) {
+        if let Ok(files) = created_files.lock() {
+            for f in files.iter() {
+                let _ = fs::remove_file(f);
+            }
+        }
+        if !out_dir_existed {
+            let _ = fs::remove_dir(&out_dir);
+        }
+        crate::ai::jobs::release(&config.paths);
+        return Err("Batch export cancelled by user — partial files rolled back".to_string());
+    }
 
     let succ = success_count.load(Ordering::SeqCst);
     let fail = fail_count.load(Ordering::SeqCst);
@@ -518,7 +533,7 @@ pub fn process_single_recipe(
 pub fn execute_multi_recipe_batch_export(
     config: MultiRecipeExportConfig,
     app_handle: AppHandle,
-    _state: State<crate::app::state::AppState>,
+    state: State<crate::app::state::AppState>,
 ) -> Result<ExportBatchSummary, String> {
     if config.paths.is_empty() || config.recipes.is_empty() {
         return Err("Paths and at least one recipe are required".to_string());
@@ -526,6 +541,10 @@ pub fn execute_multi_recipe_batch_export(
 
     let _priority_guard = crate::enhanced::stability::BackgroundPriorityGuard::new();
     let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("multi_recipe_export");
+
+    state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let written_files = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
 
     let start_time = std::time::Instant::now();
     let base_out = PathBuf::from(&config.base_output_dir);
@@ -545,9 +564,16 @@ pub fn execute_multi_recipe_batch_export(
     let config_arc = Arc::new(config);
     let success_clone = success_count.clone();
     let fail_clone = fail_count.clone();
+    let written_clone = written_files.clone();
+    let cancelled_clone = cancelled.clone();
 
     // Parallel processing across photos
     config_arc.paths.par_iter().for_each(|path_str| {
+        if state.ai_denoise_cancel.load(Ordering::SeqCst) {
+            cancelled_clone.store(true, Ordering::SeqCst);
+            return;
+        }
+
         let (source_path, _) = parse_virtual_path(path_str);
         let stem = Path::new(path_str)
             .file_stem()
@@ -555,35 +581,34 @@ pub fn execute_multi_recipe_batch_export(
             .to_string_lossy()
             .to_string();
 
-        if let Ok(file_bytes) = read_file_mapped(&source_path) {
-            if let Ok(base_image) = load_base_image_from_bytes(
-                &file_bytes,
-                &source_path.to_string_lossy(),
-                false,
-                &settings,
-                None,
-            ) {
-                // Rayon branch: execute all recipes concurrently from the single decoded base_image!
-                config_arc.recipes.par_iter().for_each(|recipe| {
-                    match process_single_recipe(
-                        &base_image,
-                        &stem,
-                        Some(&source_path.to_string_lossy()),
-                        recipe,
-                        &base_out,
-                    ) {
-                        Ok(_) => {
-                            success_clone.fetch_add(1, Ordering::SeqCst);
+        if let Ok(base_image) =
+            crate::export::render_edited_image_for_batch(path_str, &settings, &app_handle)
+        {
+            // Rayon branch: execute all recipes concurrently from the single rendered base_image!
+            config_arc.recipes.par_iter().for_each(|recipe| {
+                if state.ai_denoise_cancel.load(Ordering::SeqCst) {
+                    cancelled_clone.store(true, Ordering::SeqCst);
+                    return;
+                }
+                match process_single_recipe(
+                    &base_image,
+                    &stem,
+                    Some(&source_path.to_string_lossy()),
+                    recipe,
+                    &base_out,
+                ) {
+                    Ok(written_path) => {
+                        if let Ok(mut list) = written_clone.lock() {
+                            list.push(written_path);
                         }
-                        Err(e) => {
-                            log::warn!("Multi-recipe '{}' failed for {}: {}", recipe.name, stem, e);
-                            fail_clone.fetch_add(1, Ordering::SeqCst);
-                        }
+                        success_clone.fetch_add(1, Ordering::SeqCst);
                     }
-                });
-            } else {
-                fail_clone.fetch_add(config_arc.recipes.len(), Ordering::SeqCst);
-            }
+                    Err(e) => {
+                        log::warn!("Multi-recipe '{}' failed for {}: {}", recipe.name, stem, e);
+                        fail_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
         } else {
             fail_clone.fetch_add(config_arc.recipes.len(), Ordering::SeqCst);
         }
@@ -607,6 +632,15 @@ pub fn execute_multi_recipe_batch_export(
             }),
         );
     });
+
+    if cancelled.load(Ordering::SeqCst) {
+        if let Ok(files) = written_files.lock() {
+            for f in files.iter() {
+                let _ = fs::remove_file(f);
+            }
+        }
+        return Err("Multi-recipe batch export cancelled and rolled back".to_string());
+    }
 
     let succ = success_count.load(Ordering::SeqCst);
     let fail = fail_count.load(Ordering::SeqCst);

@@ -28,6 +28,8 @@ pub enum SemanticScene {
     Overcast,
     NightSky,
     Macro,
+    Hdr,
+    Panorama,
     General,
 }
 
@@ -42,7 +44,27 @@ impl SemanticScene {
             SemanticScene::Overcast => "☁️ Overcast & Moody",
             SemanticScene::NightSky => "🪐 Night Sky & Astro",
             SemanticScene::Macro => "🌸 Macro & Close-up",
+            SemanticScene::Hdr => "☀️ High Dynamic Range (HDR)",
+            SemanticScene::Panorama => "🏞️ Wide Panorama",
             SemanticScene::General => "✨ Universal Balanced",
+        }
+    }
+
+    pub fn from_str_opt(s: Option<&str>) -> Option<Self> {
+        let lower = s?.trim().to_lowercase();
+        match lower.as_str() {
+            "portrait" => Some(SemanticScene::Portrait),
+            "animal" => Some(SemanticScene::Animal),
+            "architecture" | "arch" => Some(SemanticScene::Architecture),
+            "landscape" => Some(SemanticScene::Landscape),
+            "sunset" => Some(SemanticScene::Sunset),
+            "overcast" => Some(SemanticScene::Overcast),
+            "nightsky" | "night_sky" | "night" | "astro" => Some(SemanticScene::NightSky),
+            "macro" => Some(SemanticScene::Macro),
+            "hdr" => Some(SemanticScene::Hdr),
+            "panorama" | "pano" => Some(SemanticScene::Panorama),
+            "general" | "universal" => Some(SemanticScene::General),
+            _ => None,
         }
     }
 }
@@ -127,11 +149,43 @@ fn compute_fast_sharpness(thumb: &image::RgbImage) -> f32 {
     (var.max(0.0).sqrt() as f32).clamp(0.0, 100.0)
 }
 
+/// Converts a linear working-space or encoded image into a <= 1024px display-referred sRGB8 preview
+/// with baseline exposure applied so scene classifiers never misread linear RAW files as dark/NightSky.
+pub fn prepare_display_preview_for_analysis(image: &DynamicImage, exposure_ev: f32) -> DynamicImage {
+    let downscaled = crate::render::image_processing::downscale_f32_image(image, 1024, 1024);
+    let exposed = crate::render::image_processing::apply_exposure(downscaled, exposure_ev);
+    let to_srgb = crate::render::color_space::working_to_srgb();
+    let transfer = crate::render::color_space::srgb_transfer();
+    let linear_buf = exposed.to_rgb32f();
+    let (w, h) = linear_buf.dimensions();
+    let mut out = image::RgbImage::new(w, h);
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        let p = linear_buf.get_pixel(x, y).0;
+        let srgb = (to_srgb * glam::Vec3::from_array(p)).clamp(glam::Vec3::ZERO, glam::Vec3::ONE);
+        *px = image::Rgb([
+            (transfer.encode(srgb.x) * 255.0).round().clamp(0.0, 255.0) as u8,
+            (transfer.encode(srgb.y) * 255.0).round().clamp(0.0, 255.0) as u8,
+            (transfer.encode(srgb.z) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ]);
+    }
+    DynamicImage::ImageRgb8(out)
+}
+
 /// Analyzes an image thumbnail to determine its dominant photographic scene and subject type
 pub fn detect_semantic_scene(image: &DynamicImage) -> (SemanticScene, f32) {
+    detect_semantic_scene_with_hint(image, None)
+}
+
+pub fn detect_semantic_scene_with_hint(image: &DynamicImage, path_hint: Option<&str>) -> (SemanticScene, f32) {
     let (width, height) = image.dimensions();
     if width < 32 || height < 32 {
         return (SemanticScene::General, 0.5);
+    }
+
+    let aspect = (width as f32 / height as f32).max(height as f32 / width as f32);
+    let hint_lower = path_hint.unwrap_or("").to_lowercase();
+    if aspect >= 2.15 || hint_lower.contains("_pano") || hint_lower.contains("panorama") {
+        return (SemanticScene::Panorama, if aspect >= 2.15 { 0.94 } else { 0.85 });
     }
 
     let thumb = image.thumbnail(320, 320).to_rgb8();
@@ -144,6 +198,9 @@ pub fn detect_semantic_scene(image: &DynamicImage) -> (SemanticScene, f32) {
     let mut deep_dark_pixels = 0.0f32;
     let mut high_contrast_edges = 0.0f32;
     let mut macro_center_detail = 0.0f32;
+    let mut shadow_dr_pixels = 0.0f32;
+    let mut highlight_dr_pixels = 0.0f32;
+    let mut midtone_dr_pixels = 0.0f32;
 
     let center_x1 = tw / 4;
     let center_x2 = tw * 3 / 4;
@@ -159,9 +216,16 @@ pub fn detect_semantic_scene(image: &DynamicImage) -> (SemanticScene, f32) {
 
             let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
-            // Night Sky detection
+            // Night Sky & Dynamic Range distribution checks
             if luma < 25.0 {
                 deep_dark_pixels += 1.0;
+            }
+            if luma < 28.0 {
+                shadow_dr_pixels += 1.0;
+            } else if luma > 225.0 {
+                highlight_dr_pixels += 1.0;
+            } else if luma >= 64.0 && luma <= 192.0 {
+                midtone_dr_pixels += 1.0;
             }
 
             // Green / Foliage detection
@@ -200,6 +264,18 @@ pub fn detect_semantic_scene(image: &DynamicImage) -> (SemanticScene, f32) {
     let dark_ratio = deep_dark_pixels / total_pixels;
     let edge_ratio = high_contrast_edges / total_pixels;
     let center_edge_ratio = macro_center_detail / (total_pixels * 0.25);
+    let shadow_dr_ratio = shadow_dr_pixels / total_pixels;
+    let highlight_dr_ratio = highlight_dr_pixels / total_pixels;
+    let midtone_dr_ratio = midtone_dr_pixels / total_pixels;
+
+    if hint_lower.contains("_hdr")
+        || (shadow_dr_ratio > 0.08 && highlight_dr_ratio > 0.08 && midtone_dr_ratio > 0.35)
+    {
+        return (
+            SemanticScene::Hdr,
+            if hint_lower.contains("_hdr") { 0.92 } else { 0.80 },
+        );
+    }
 
     // Rule-based classifier with high confidence scoring
     if dark_ratio > 0.45 && sunset_ratio < 0.05 {
@@ -262,6 +338,8 @@ pub fn generate_semantic_adjustments(
         SemanticScene::Overcast => (35.0, 10.0, 0.0),
         SemanticScene::NightSky => (5.0, 5.0, 0.0),
         SemanticScene::Macro => (15.0, 10.0, 0.0),
+        SemanticScene::Hdr => (20.0, 10.0, 0.0),
+        SemanticScene::Panorama => (25.0, 10.0, 0.0),
         SemanticScene::General => (35.0, 10.0, 0.0),
     };
     let governed_exp = compute_governed_exposure(base.exposure as f32, governor, min_strength, preprocess_ev) as f64;
@@ -367,10 +445,31 @@ pub fn generate_semantic_adjustments(
             highlights = (highlights - 24.0 * mult as f64).min(-20.0);
             whites = (whites + 12.0 * mult as f64).max(10.0);
             shadows = (shadows + 20.0 * mult as f64).max(16.0);
-            clarity = (clarity + 22.0 * mult as f64).max(18.0);
+            clarity = (clarity + 18.0 * mult as f64).max(14.0);
             sharpening = 40.0 * mult as f64;
-            sharpness_threshold = (32.0 * mult as f64).max(28.0);
+            sharpness_threshold = (38.0 * mult as f64).max(32.0);
             vibrance = (vibrance + 14.0 * mult as f64).max(12.0);
+        }
+        SemanticScene::Hdr => {
+            contrast = (contrast + 8.0 * mult as f64).clamp(-10.0, 20.0);
+            highlights = (highlights - 32.0 * mult as f64).min(-28.0);
+            shadows = (shadows + 28.0 * mult as f64).max(22.0);
+            whites = (whites + 6.0 * mult as f64).clamp(-10.0, 15.0);
+            blacks = (blacks - 8.0 * mult as f64).min(-6.0);
+            clarity = (clarity + 14.0 * mult as f64).max(10.0);
+            vibrance = (vibrance + 15.0 * mult as f64).max(12.0);
+            sharpening = 32.0 * mult as f64;
+        }
+        SemanticScene::Panorama => {
+            contrast = (contrast + 12.0 * mult as f64).max(12.0);
+            highlights = (highlights - 24.0 * mult as f64).min(-18.0);
+            shadows = (shadows + 18.0 * mult as f64).max(14.0);
+            whites = (whites + 12.0 * mult as f64).max(10.0);
+            blacks = (blacks - 12.0 * mult as f64).min(-10.0);
+            clarity = (clarity + 14.0 * mult as f64).max(12.0);
+            dehaze = (dehaze + 12.0 * mult as f64).max(10.0);
+            vibrance = (vibrance + 14.0 * mult as f64).max(12.0);
+            sharpening = 34.0 * mult as f64;
         }
         SemanticScene::General => {
             sharpening = 30.0 * mult as f64;
@@ -421,6 +520,23 @@ pub fn generate_semantic_adjustments(
             "noiseReduction": true
         }
     });
+
+    if matches!(scene, SemanticScene::Portrait) {
+        json["skinShield"] = serde_json::json!(0.95);
+        json["sharpnessThreshold"] = serde_json::json!((sharpness_threshold).max(28.0));
+    } else if matches!(scene, SemanticScene::Macro) {
+        json["bokehMaskProtection"] = serde_json::json!(45);
+        json["structure"] = serde_json::json!(16.0 * mult as f64);
+        json["chromaticAberrationRedCyan"] = serde_json::json!(-6.0 * mult as f64);
+        json["chromaticAberrationBlueYellow"] = serde_json::json!(4.0 * mult as f64);
+    } else if matches!(scene, SemanticScene::Architecture) {
+        json["structure"] = serde_json::json!(14.0 * mult as f64);
+    } else if matches!(scene, SemanticScene::Hdr) {
+        json["toneMapper"] = serde_json::json!("agx");
+    } else if matches!(scene, SemanticScene::Panorama) {
+        json["vignetteAmount"] = serde_json::json!(0.0);
+        json["centré"] = serde_json::json!(0.0);
+    }
 
     if let Some(angle) = horizon_angle {
         if angle.abs() > 0.3 && angle.abs() < 10.0 {
@@ -671,24 +787,38 @@ pub fn analyze_and_polish_active_image(
     auto_straighten: Option<bool>,
     tone_style: Option<String>,
     skin_protection: Option<bool>,
+    scene_override: Option<String>,
+    app_handle: AppHandle,
     state: State<AppState>,
 ) -> Result<SemanticAnalysisResult, String> {
     let intensity_val = intensity.unwrap_or(100.0);
-    let straighten = auto_straighten.unwrap_or(true);
+    let straighten = auto_straighten.unwrap_or(false);
     let style = ToneCurveStyle::from_str_opt(tone_style.as_deref());
     let protect_skin = skin_protection.unwrap_or(true);
 
-    let (image_arc, path_str) = {
+    let (image_arc, path_str, is_raw, as_shot) = {
         let orig_guard = state.original_image.lock().map_err(|e| e.to_string())?;
         let loaded = orig_guard
             .as_ref()
             .ok_or_else(|| "No active image loaded".to_string())?;
-        (Arc::clone(&loaded.image), loaded.path.clone())
+        (Arc::clone(&loaded.image), loaded.path.clone(), loaded.is_raw, loaded.as_shot)
     };
 
-    let (scene, confidence) = detect_semantic_scene(&image_arc);
-    let base_analysis = perform_auto_analysis(&image_arc, 0.0);
-    let (submode, mist_guard) = detect_nature_submode(&image_arc, scene);
+    let render = crate::render::options::resolve_render_options_from_handle(&app_handle, is_raw);
+    let baseline_ev = crate::render::adjustment_utils::effective_baseline_exposure(
+        &serde_json::json!({}),
+        as_shot,
+        render.baseline,
+    );
+    let display_preview = prepare_display_preview_for_analysis(&image_arc, baseline_ev);
+
+    let (scene, confidence) = if let Some(forced) = SemanticScene::from_str_opt(scene_override.as_deref()) {
+        (forced, 1.0)
+    } else {
+        detect_semantic_scene_with_hint(&display_preview, Some(&path_str))
+    };
+    let base_analysis = perform_auto_analysis(&image_arc, baseline_ev);
+    let (submode, mist_guard) = detect_nature_submode(&display_preview, scene);
 
     let horizon_angle = if straighten {
         let horizon = detect_horizon_angle(&image_arc);
@@ -806,6 +936,19 @@ pub fn analyze_night_sky_active_image(
     })
 }
 
+fn rollback_sidecar_snapshots(snapshots: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
+    for (path, prior) in snapshots.iter().rev() {
+        match prior {
+            Some(bytes) => {
+                let _ = fs::write(path, bytes);
+            }
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn batch_polish_photoshoot(
     paths: Vec<String>,
@@ -816,17 +959,19 @@ pub async fn batch_polish_photoshoot(
     tone_style: Option<String>,
     skin_protection: Option<bool>,
     app_handle: AppHandle,
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<BatchPolishSummary, String> {
     if paths.is_empty() {
         return Err("No photos provided for batch polish".to_string());
     }
+    state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+    let cancel_token = state.ai_denoise_cancel.clone();
 
     let _sleep_guard = crate::enhanced::sleep_lock::SleepLockGuard::new("batch_polish_photoshoot");
     let start_time = std::time::Instant::now();
     let intensity_val = intensity.unwrap_or(100.0);
     let do_harmonize = harmonize.unwrap_or(true);
-    let straighten = auto_straighten.unwrap_or(true);
+    let straighten = auto_straighten.unwrap_or(false);
     let sync_xmp = enable_xmp_sync.unwrap_or(false);
     let style = ToneCurveStyle::from_str_opt(tone_style.as_deref());
     let protect_skin = skin_protection.unwrap_or(true);
@@ -853,6 +998,9 @@ pub async fn batch_polish_photoshoot(
         let pre_scanned: Vec<Option<PreScannedImage>> = paths_clone
             .par_iter()
             .map(|path_str| {
+                if cancel_token.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let (source_path, _) = parse_virtual_path(path_str);
                 let file_bytes = match read_file_mapped(&source_path) {
                     Ok(b) => b,
@@ -876,9 +1024,10 @@ pub async fn batch_polish_photoshoot(
                     }
                 };
 
-                let thumb = image.thumbnail(256, 256).to_rgb8();
+                let display_preview = prepare_display_preview_for_analysis(&image, 0.0);
+                let thumb = display_preview.thumbnail(256, 256).to_rgb8();
                 let sharpness = compute_fast_sharpness(&thumb);
-                let (scene, _) = detect_semantic_scene(&image);
+                let (scene, _) = detect_semantic_scene_with_hint(&display_preview, Some(path_str));
                 let base_analysis = perform_auto_analysis(&image, 0.0);
 
                 let mut sum_luma = 0.0f32;
@@ -969,9 +1118,16 @@ pub async fn batch_polish_photoshoot(
         let mut breakdown: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut success_count = 0;
 
-        // Stage 3: Harmonized Adjustment Generation & Sidecar Sync
+        if cancel_token.load(Ordering::Relaxed) {
+            return Err("Batch polish cancelled by user".to_string());
+        }
+
+        // Stage 3: Harmonized Adjustment Generation in memory
+        let staged_writes: std::sync::Mutex<Vec<(std::path::PathBuf, std::path::PathBuf, serde_json::Value, String)>> =
+            std::sync::Mutex::new(Vec::new());
+
         clusters.par_iter().for_each(|cluster| {
-            if cluster.is_empty() {
+            if cluster.is_empty() || cancel_token.load(Ordering::Relaxed) {
                 return;
             }
 
@@ -1000,6 +1156,9 @@ pub async fn batch_polish_photoshoot(
             let anchor_contrast = anchor_adj["contrast"].as_f64().unwrap_or(0.0);
 
             for item in cluster {
+                if cancel_token.load(Ordering::Relaxed) {
+                    return;
+                }
                 let (_, sidecar_path) = parse_virtual_path(&item.path_str);
                 let (source_path, _) = parse_virtual_path(&item.path_str);
 
@@ -1025,19 +1184,8 @@ pub async fn batch_polish_photoshoot(
                     item_adj["contrast"] = serde_json::json!(0.60 * anchor_contrast + 0.40 * local_contrast);
                 }
 
-                // Write sidecar JSON
-                let mut metadata = load_sidecar(&sidecar_path);
-                metadata.adjustments = item_adj.clone();
-
-                if let Ok(json_string) = serde_json::to_string_pretty(&metadata) {
-                    if let Some(parent) = sidecar_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::write(&sidecar_path, json_string);
-                }
-
-                if sync_xmp {
-                    sync_metadata_to_xmp(&source_path, &sidecar_path, &metadata, false);
+                if let Ok(mut guard) = staged_writes.lock() {
+                    guard.push((source_path, sidecar_path, item_adj, item.path_str.clone()));
                 }
 
                 let done = processed_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1061,15 +1209,43 @@ pub async fn batch_polish_photoshoot(
             }
         });
 
+        if cancel_token.load(Ordering::Relaxed) {
+            return Err("Batch polish cancelled by user".to_string());
+        }
+
+        // Atomic commit with snapshot rollback on cancel
+        let staged = staged_writes.into_inner().unwrap_or_default();
+        let mut prior_snapshots: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(staged.len());
+
+        for (source_path, sidecar_path, item_adj, _) in &staged {
+            if cancel_token.load(Ordering::Relaxed) {
+                rollback_sidecar_snapshots(&prior_snapshots);
+                return Err("Batch polish cancelled by user — changes rolled back".to_string());
+            }
+            let prev = fs::read(sidecar_path).ok();
+            prior_snapshots.push((sidecar_path.clone(), prev));
+            let mut metadata = load_sidecar(sidecar_path);
+            metadata.adjustments = item_adj.clone();
+            if let Ok(json_string) = serde_json::to_string_pretty(&metadata) {
+                if let Some(parent) = sidecar_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(sidecar_path, json_string);
+            }
+            if sync_xmp {
+                sync_metadata_to_xmp(source_path, sidecar_path, &metadata, false);
+            }
+        }
+
         for item in &valid_scanned {
             success_count += 1;
             *breakdown.entry(item.scene.display_name().to_string()).or_insert(0) += 1;
         }
 
-        (breakdown, success_count, total_clusters)
+        Ok::<_, String>((breakdown, success_count, total_clusters))
     })
     .await
-    .map_err(|e| format!("Batch polish task failed: {}", e))?;
+    .map_err(|e| format!("Batch polish task failed: {}", e))??;
 
     let elapsed = start_time.elapsed().as_millis() as u64;
 
@@ -1280,6 +1456,123 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn test_linear_mid_grey_not_misclassified_as_night_sky() {
+        let linear_grey = DynamicImage::ImageRgb32F(image::Rgb32FImage::from_fn(64, 64, |_x, _y| {
+            image::Rgb([0.18, 0.18, 0.18])
+        }));
+        let display_preview = prepare_display_preview_for_analysis(&linear_grey, 0.0);
+        let (scene, _conf) = detect_semantic_scene_with_hint(&display_preview, None);
+        assert_ne!(
+            scene,
+            SemanticScene::NightSky,
+            "Linear 0.18 mid-grey RAW preview must not be misclassified as NightSky"
+        );
+    }
+
+    #[test]
+    fn test_scene_detection_and_adjustments_invariants() {
+        // Panorama: wide aspect ratio or path hint
+        let wide_img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 64, |_x, _y| {
+            image::Rgb([120, 140, 160])
+        }));
+        let (pano_scene, _) = detect_semantic_scene_with_hint(&wide_img, Some("mountain_pano.dng"));
+        assert_eq!(pano_scene, SemanticScene::Panorama);
+
+        // HDR: path hint
+        let normal_img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(128, 128, |x, y| {
+            let v = if (x + y) % 2 == 0 { 40 } else { 210 };
+            image::Rgb([v, v, v])
+        }));
+        let (hdr_scene, _) = detect_semantic_scene_with_hint(&normal_img, Some("sunset_hdr_merge.dng"));
+        assert_eq!(hdr_scene, SemanticScene::Hdr);
+
+        let base = perform_auto_analysis(&normal_img, 0.0);
+        let scenes = [
+            SemanticScene::Panorama,
+            SemanticScene::Hdr,
+            SemanticScene::NightSky,
+            SemanticScene::Portrait,
+            SemanticScene::Macro,
+            SemanticScene::Architecture,
+            SemanticScene::Landscape,
+        ];
+        let defaults: serde_json::Value =
+            serde_json::from_str(include_str!("../../../src/utils/defaultAdjustments.json")).unwrap();
+        let default_obj = defaults.as_object().unwrap();
+
+        for scene in scenes {
+            let adj = generate_semantic_adjustments(
+                scene,
+                &base,
+                100.0,
+                Some(1.0),
+                Some(ToneCurveStyle::FilmicDynamic),
+                Some(true),
+            );
+            let obj = adj.as_object().expect("adjustments must be an object");
+            assert!(!obj.is_empty(), "adjustments for {:?} should not be empty", scene);
+            for (k, v) in obj {
+                assert!(
+                    default_obj.contains_key(k),
+                    "Key '{}' for {:?} must exist in defaultAdjustments.json",
+                    k,
+                    scene
+                );
+                if let Some(num) = v.as_f64() {
+                    assert!(num.is_finite(), "Value for '{}' in {:?} must be finite", k, scene);
+                }
+            }
+        }
+
+        // Panorama default (no horizon_angle) should not write rotation
+        let pano_adj = generate_semantic_adjustments(
+            SemanticScene::Panorama,
+            &base,
+            100.0,
+            None,
+            Some(ToneCurveStyle::NaturalSoft),
+            Some(false),
+        );
+        assert!(pano_adj.get("dehaze").is_some());
+        assert!(pano_adj.get("rotation").is_none());
+
+        // NightSky should preserve dark sky and enable luma/color noise reduction
+        let night_adj = generate_semantic_adjustments(
+            SemanticScene::NightSky,
+            &base,
+            100.0,
+            None,
+            Some(ToneCurveStyle::FilmicDynamic),
+            Some(false),
+        );
+        assert!(night_adj["lumaNoiseReduction"].as_f64().unwrap() > 0.0);
+        assert!(night_adj["colorNoiseReduction"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_rollback_sidecar_snapshots_restores_and_deletes() {
+        let dir = std::env::temp_dir().join(format!("rapidraw_rollback_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let existing_file = dir.join("existing.rrdata");
+        let created_file = dir.join("created.rrdata");
+
+        fs::write(&existing_file, b"original-bytes").unwrap();
+        let snapshots = vec![
+            (existing_file.clone(), Some(b"original-bytes".to_vec())),
+            (created_file.clone(), None),
+        ];
+
+        fs::write(&existing_file, b"modified-bytes").unwrap();
+        fs::write(&created_file, b"new-bytes").unwrap();
+
+        rollback_sidecar_snapshots(&snapshots);
+
+        assert_eq!(fs::read(&existing_file).unwrap(), b"original-bytes");
+        assert!(!created_file.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

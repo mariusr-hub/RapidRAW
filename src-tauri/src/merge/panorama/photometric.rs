@@ -89,6 +89,7 @@ fn collect_samples(
     images: &[&Raster],
     a: usize,
     b: usize,
+    max_channel: f32,
 ) -> Vec<Sample> {
     let (ca, cb) = (&cameras[a], &cameras[b]);
     let (ra, rb) = (ca.radius_norm(), cb.radius_norm());
@@ -116,7 +117,7 @@ fn collect_samples(
             };
             let usable = |v: &[f32; 3], k: f32| {
                 luminance(v) > MIN_LUMINANCE
-                    && v.iter().all(|&c| c > 1e-5 && c < MAX_CHANNEL)
+                    && v.iter().all(|&c| c.is_finite() && c > 1e-5 && c < max_channel)
                     && k < MAX_LOCAL_CONTRAST
             };
             if !usable(&va, ka) || !usable(&vb, kb) {
@@ -232,11 +233,11 @@ fn solve(
     Some((gains, vignetting))
 }
 
-fn vignetting_is_plausible(v: &[f64; 3]) -> bool {
+fn vignetting_is_plausible(v: &[f64; 3], min_factor: f64, max_factor: f64) -> bool {
     (0..=20).all(|i| {
         let r2 = (i as f64 / 20.0).powi(2);
         let factor = (r2 * (v[0] + r2 * (v[1] + r2 * v[2]))).exp();
-        (MIN_VIGNETTING_FACTOR..=MAX_VIGNETTING_FACTOR).contains(&factor)
+        (min_factor..=max_factor).contains(&factor)
     })
 }
 
@@ -246,12 +247,28 @@ pub fn estimate_photometric(
     images: &[&Raster],
     pairs: &[(usize, usize)],
 ) -> Photometric {
+    estimate_photometric_with_options(cameras, lens, images, pairs, false)
+}
+
+pub fn estimate_photometric_with_options(
+    cameras: &[Camera],
+    lens: &Lens,
+    images: &[&Raster],
+    pairs: &[(usize, usize)],
+    is_hdr: bool,
+) -> Photometric {
     let count = cameras.len();
+    let max_channel = if is_hdr { 32.0 } else { MAX_CHANNEL };
+    let (min_vig, max_vig) = if is_hdr {
+        (0.55, MAX_VIGNETTING_FACTOR)
+    } else {
+        (MIN_VIGNETTING_FACTOR, MAX_VIGNETTING_FACTOR)
+    };
     let samples: Vec<Sample> = pairs
         .par_iter()
         .flat_map_iter(|&(a, b)| {
-            let mut s = collect_samples(cameras, lens, images, a, b);
-            s.extend(collect_samples(cameras, lens, images, b, a));
+            let mut s = collect_samples(cameras, lens, images, a, b, max_channel);
+            s.extend(collect_samples(cameras, lens, images, b, a, max_channel));
             s
         })
         .collect();
@@ -260,7 +277,7 @@ pub fn estimate_photometric(
     }
 
     let vignetting_solution =
-        solve(&samples, count, true).filter(|(_, v)| vignetting_is_plausible(v));
+        solve(&samples, count, true).filter(|(_, v)| vignetting_is_plausible(v, min_vig, max_vig));
     let Some((mut gains, vignetting)) =
         vignetting_solution.or_else(|| solve(&samples, count, false))
     else {
@@ -270,6 +287,19 @@ pub fn estimate_photometric(
     for c in 0..3 {
         let mean = gains.iter().map(|g| g[c]).sum::<f64>() / count as f64;
         gains.iter_mut().for_each(|g| g[c] -= mean);
+    }
+    if is_hdr {
+        for g in gains.iter_mut() {
+            let mean_g = (g[0] + g[1] + g[2]) / 3.0;
+            for c in 0..3 {
+                let delta = (g[c] - mean_g).clamp(-0.12, 0.12);
+                g[c] = (mean_g + delta).clamp(-0.55, 0.55);
+            }
+        }
+        for c in 0..3 {
+            let mean = gains.iter().map(|g| g[c]).sum::<f64>() / count as f64;
+            gains.iter_mut().for_each(|g| g[c] -= mean);
+        }
     }
     Photometric {
         log_gains: gains
@@ -281,5 +311,50 @@ pub fn estimate_photometric(
             vignetting[1] as f32,
             vignetting[2] as f32,
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{Matrix3, Rotation3};
+
+    #[test]
+    fn test_hdr_photometric_accepts_bright_sky_above_one_and_clamps_chroma_drift() {
+        let cam_a = Camera {
+            rotation: Matrix3::identity(),
+            focal: 200.0,
+            width: 200.0,
+            height: 200.0,
+        };
+        let cam_b = Camera {
+            rotation: Rotation3::from_axis_angle(&nalgebra::Vector3::y_axis(), 0.12).into_inner(),
+            focal: 200.0,
+            width: 200.0,
+            height: 200.0,
+        };
+        let cameras = [cam_a, cam_b];
+        let lens = Lens::default();
+        let img_a = Raster::from_data(200, 200, 3, [2.5f32, 2.5, 2.5].repeat(200 * 200));
+        let img_b = Raster::from_data(200, 200, 3, [2.75f32, 2.75, 2.75].repeat(200 * 200));
+        let images = [&img_a, &img_b];
+        let pairs = [(0usize, 1usize)];
+
+        // SDR photometric rejects > 0.9 channels and falls back to identity
+        let sdr_photo = estimate_photometric_with_options(&cameras, &lens, &images, &pairs, false);
+        assert_eq!(sdr_photo.log_gains[0], [0.0; 3]);
+
+        // HDR photometric accepts > 1.0 sky radiance and equalizes the 1.1x ratio
+        let hdr_photo = estimate_photometric_with_options(&cameras, &lens, &images, &pairs, true);
+        let corr_a = hdr_photo.correction(0, 0.0);
+        let corr_b = hdr_photo.correction(1, 0.0);
+        let ratio = corr_a[1] / corr_b[1];
+        assert!(
+            (ratio - 1.1).abs() < 0.03,
+            "Expected HDR photometric gain ratio ~1.10, got {} (corr_a={:?}, corr_b={:?})",
+            ratio,
+            corr_a,
+            corr_b
+        );
     }
 }

@@ -1022,9 +1022,15 @@ export const AdvancedExportModal: React.FC<AdvancedExportModalProps> = ({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={onClose}
-                disabled={isExporting}
-                className="px-4 py-2 rounded-md text-text-secondary hover:bg-surface transition-colors text-sm disabled:opacity-50"
+                onClick={() => {
+                  if (isExporting) {
+                    invoke('cancel_ai_denoise').catch((err) => console.warn('Cancel failed:', err));
+                    setIsExporting(false);
+                    return;
+                  }
+                  onClose();
+                }}
+                className="px-4 py-2 rounded-md text-text-secondary hover:bg-surface transition-colors text-sm cursor-pointer"
               >
                 {result ? 'Done' : 'Cancel'}
               </button>

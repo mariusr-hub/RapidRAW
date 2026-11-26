@@ -70,7 +70,7 @@ pub fn curate_hero_shots(
     paths: Vec<String>,
     auto_rate_winner: Option<bool>,
     app_handle: AppHandle,
-    _state: State<crate::app::state::AppState>,
+    state: State<crate::app::state::AppState>,
 ) -> Result<HeroCuratorSummary, String> {
     if paths.is_empty() {
         return Err("No photos provided for hero curation".to_string());
@@ -91,9 +91,14 @@ pub fn curate_hero_shots(
         }),
     );
 
+    state.ai_denoise_cancel.store(false, Ordering::SeqCst);
+    let cancel_token = state.ai_denoise_cancel.clone();
     let mut scores: Vec<HeroShotScore> = paths
         .par_iter()
-        .map(|path_str| {
+        .filter_map(|path_str| {
+            if cancel_token.load(Ordering::Relaxed) {
+                return None;
+            }
             let (source_path, _) = parse_virtual_path(path_str);
             let file_name = Path::new(path_str)
                 .file_name()
@@ -142,7 +147,7 @@ pub fn curate_hero_shots(
                 }),
             );
 
-            HeroShotScore {
+            Some(HeroShotScore {
                 file_path: path_str.clone(),
                 file_name,
                 overall_score: overall,
@@ -150,9 +155,12 @@ pub fn curate_hero_shots(
                 eye_face_clarity_score: clarity,
                 exposure_balance_score: exposure_bal,
                 is_winner: false,
-            }
+            })
         })
         .collect();
+    if cancel_token.load(Ordering::Relaxed) {
+        return Err("Hero curation cancelled by user".to_string());
+    }
 
     // Find winner
     scores.sort_by(|a, b| b.overall_score.partial_cmp(&a.overall_score).unwrap_or(std::cmp::Ordering::Equal));

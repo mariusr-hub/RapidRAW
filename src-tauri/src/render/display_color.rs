@@ -233,6 +233,155 @@ impl MonitorProfile {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SoftProofConfig {
+    pub enabled: bool,
+    pub target: String,
+    pub intent: String,
+    pub oog_warning: bool,
+    pub custom_icc_path: Option<String>,
+}
+
+pub fn build_soft_proof_lut(
+    frame_space: OutputColorSpace,
+    monitor: &MonitorColor,
+    config: &SoftProofConfig,
+) -> Result<Option<ColorLut>, String> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    let intent = if config.intent.eq_ignore_ascii_case("perceptual") {
+        RenderingIntent::Perceptual
+    } else {
+        RenderingIntent::RelativeColorimetric
+    };
+
+    let custom_target = config
+        .custom_icc_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| ColorProfile::new_from_slice(&bytes).ok());
+
+    let (target_profile, target_space_opt) = if let Some(prof) = custom_target {
+        (prof, None)
+    } else {
+        let sp = match config.target.to_ascii_lowercase().as_str() {
+            "displayp3" | "display_p3" | "p3" => OutputColorSpace::DisplayP3,
+            "adobergb" | "adobe_rgb" | "adobergb1998" => OutputColorSpace::AdobeRgb,
+            "rec2020" | "rec_2020" | "bt2020" => OutputColorSpace::Rec2020,
+            _ => OutputColorSpace::Srgb,
+        };
+        (sp.profile(), Some(sp))
+    };
+
+    let shaper = TransferCurve::gamma(LUT_SHAPER_GAMMA);
+    let src_profile = frame_space.profile_with_curve(shaper);
+    let monitor_out_profile = match monitor {
+        MonitorColor::Profile(mp) => mp.profile.clone(),
+        _ => frame_space.profile(),
+    };
+
+    let layout_for_profile = |prof: &ColorProfile| -> Layout {
+        match prof.color_space {
+            DataColorSpace::Cmyk => Layout::Rgba,
+            _ => Layout::Rgb,
+        }
+    };
+    let target_layout = layout_for_profile(&target_profile);
+
+    let to_target = src_profile
+        .create_transform_f32(
+            Layout::Rgb,
+            &target_profile,
+            target_layout,
+            TransformOptions {
+                rendering_intent: intent,
+                ..TransformOptions::default()
+            },
+        )
+        .map_err(|e| format!("Soft-proof forward transform error: {}", e))?;
+
+    let to_monitor = target_profile
+        .create_transform_f32(
+            target_layout,
+            &monitor_out_profile,
+            Layout::Rgb,
+            TransformOptions {
+                rendering_intent: RenderingIntent::RelativeColorimetric,
+                ..TransformOptions::default()
+            },
+        )
+        .map_err(|e| format!("Soft-proof monitor transform error: {}", e))?;
+
+    let size = LUT_SIZE as usize;
+    let step = 1.0 / (size - 1) as f32;
+    let nodes = size * size * size;
+    let mut source = Vec::with_capacity(nodes * 3);
+    for index in 0..nodes {
+        let r = (index % size) as f32 * step;
+        let g = ((index / size) % size) as f32 * step;
+        let b = (index / (size * size)) as f32 * step;
+        source.extend_from_slice(&[r, g, b]);
+    }
+
+    let target_channels = if target_layout == Layout::Rgba { 4 } else { 3 };
+    let mut proof_buf = vec![0.0f32; nodes * target_channels];
+    to_target
+        .transform(&source, &mut proof_buf)
+        .map_err(|e| format!("Soft-proof transform failed: {}", e))?;
+
+    let mut mon_buf = vec![0.0f32; nodes * 3];
+    to_monitor
+        .transform(&proof_buf, &mut mon_buf)
+        .map_err(|e| format!("Soft-proof display transform failed: {}", e))?;
+
+    // Check round-trip color shift back to frame working space + gamut bounds to mark OOG texels
+    let frame_working = frame_space.working_matrix().inverse();
+    let texels: Vec<[f16; 4]> = (0..nodes)
+        .map(|i| {
+            let mon_rgb = &mon_buf[i * 3..i * 3 + 3];
+            let src_sh = &source[i * 3..i * 3 + 3];
+            let oog = if let Some(sp) = target_space_opt {
+                let lin_frame = Vec3::new(
+                    shaper.decode(src_sh[0]),
+                    shaper.decode(src_sh[1]),
+                    shaper.decode(src_sh[2]),
+                );
+                let working = frame_working * lin_frame;
+                crate::render::color_space::is_out_of_gamut_for_space(
+                    working.to_array(),
+                    sp,
+                    0.025,
+                )
+            } else {
+                // For CMYK/custom ICC profiles, flag significant perceptual roundtrip compression
+                let dr = (shaper.decode(src_sh[0]) - TransferCurve::SRGB.decode(mon_rgb[0].clamp(0.0, 1.0))).abs();
+                let dg = (shaper.decode(src_sh[1]) - TransferCurve::SRGB.decode(mon_rgb[1].clamp(0.0, 1.0))).abs();
+                let db = (shaper.decode(src_sh[2]) - TransferCurve::SRGB.decode(mon_rgb[2].clamp(0.0, 1.0))).abs();
+                dr.max(dg).max(db) > 0.08
+            };
+            let [r, g, b] = [
+                f16::from_f32(mon_rgb[0].clamp(0.0, 1.0)),
+                f16::from_f32(mon_rgb[1].clamp(0.0, 1.0)),
+                f16::from_f32(mon_rgb[2].clamp(0.0, 1.0)),
+            ];
+            let a = f16::from_f32(if oog { 1.0 } else { 0.0 });
+            [r, g, b, a]
+        })
+        .collect();
+
+    Ok(Some(ColorLut {
+        texels,
+        curve: frame_space.curve(),
+        shaper,
+        executor: to_monitor,
+    }))
+}
+
 pub struct ColorLut {
     pub texels: Vec<[f16; 4]>,
     pub curve: TransferCurve,

@@ -3,7 +3,7 @@ use super::camera::{
     estimate_focal_from_homographies, focal_from_35mm, initialize_rotations, pair_errors,
     pair_residual, straighten,
 };
-use super::photometric::{Photometric, estimate_photometric};
+use super::photometric::{Photometric, estimate_photometric_with_options};
 use crate::merge::features::FeatureSet;
 use crate::merge::homography::{Correspondence, estimate_homography, fit_homography};
 use crate::merge::matching::{candidate_pairs, match_features};
@@ -256,6 +256,14 @@ pub fn align_images(
     images: &[AlignmentImage],
     progress: &dyn Fn(String),
 ) -> Result<Alignment, String> {
+    align_images_with_options(images, false, progress)
+}
+
+pub fn align_images_with_options(
+    images: &[AlignmentImage],
+    is_hdr: bool,
+    progress: &dyn Fn(String),
+) -> Result<Alignment, String> {
     progress("Finding image matches...".to_string());
     let features: Vec<&FeatureSet> = images.iter().map(|i| i.features).collect();
     let candidates = candidate_pairs(&features);
@@ -304,6 +312,7 @@ pub fn align_images(
     let mut options = BundleOptions {
         shared_focal: single_lens,
         estimate_distortion: false,
+        estimate_k2: false,
         huber_threshold: HUBER_DETECTION_PIXELS * mean_scale,
     };
     let pruning_threshold = PAIR_ERROR_DETECTION_PIXELS * mean_scale;
@@ -320,6 +329,7 @@ pub fn align_images(
     if single_lens && total_points >= MIN_DISTORTION_POINTS {
         progress("Estimating lens distortion...".to_string());
         options.estimate_distortion = true;
+        options.estimate_k2 = total_points >= MIN_DISTORTION_POINTS * 2;
         optimize(
             &mut cameras,
             &mut lens,
@@ -344,7 +354,7 @@ pub fn align_images(
     progress("Compensating exposure and vignetting...".to_string());
     let levels: Vec<&Raster> = selected.iter().map(|i| i.photometric_level).collect();
     let pair_indices: Vec<(usize, usize)> = observations.iter().map(|o| (o.a, o.b)).collect();
-    let photometric = estimate_photometric(&cameras, &lens, &levels, &pair_indices);
+    let photometric = estimate_photometric_with_options(&cameras, &lens, &levels, &pair_indices, is_hdr);
 
     Ok(Alignment {
         included,

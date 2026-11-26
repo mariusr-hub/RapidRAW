@@ -120,12 +120,28 @@ fn prepare_reduced_base_image<'a>(
 ) -> Result<Cow<'a, DynamicImage>> {
     let denoised = crate::ai::denoise::apply_ai_denoise(base_image, path, adjustments);
     let upscaled = crate::ai::upscale::apply_ai_upscale(base_image, denoised, path, adjustments);
+    let profiled = crate::decode::camera_profile::apply_camera_profile_if_enabled(upscaled, adjustments);
     let prepared = crate::adjustments::negative_conversion::apply_negative_conversion(
-        upscaled,
+        profiled,
         is_raw_file(path),
         adjustments,
     );
-    composite_patches_cow(prepared, full_dims, path, adjustments)
+    let composited = composite_patches_cow(prepared, full_dims, path, adjustments)?;
+    let dust_healed =
+        crate::enhanced::defect_repair::apply_sensor_dust_heal_if_enabled(composited, adjustments);
+    let defringed =
+        crate::enhanced::denoising::apply_chromatic_defringe_if_enabled(dust_healed, adjustments);
+    let tilt_shifted =
+        crate::enhanced::bokeh_simulator::apply_tilt_shift_if_enabled(defringed, adjustments);
+    let astro_lp =
+        crate::enhanced::astro_stacking::apply_astro_lp_if_enabled(tilt_shifted, adjustments);
+    let astro_pcc =
+        crate::enhanced::astro_stacking::apply_astro_pcc_if_enabled(astro_lp, adjustments);
+    let astro_adc =
+        crate::enhanced::astro_stacking::apply_astro_adc_if_enabled(astro_pcc, adjustments);
+    let astro_stars =
+        crate::enhanced::astro_starless::apply_astro_star_separation_if_enabled(astro_adc, adjustments);
+    Ok(astro_stars)
 }
 
 pub fn load_base_image_from_bytes(

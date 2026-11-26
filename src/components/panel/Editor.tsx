@@ -2913,7 +2913,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
                 invoke(Invokes.RecordAutoEditRejection, {
                   path: selectedImage?.path ?? null,
                   scene,
-                }).catch(() => {});
+                }).catch((err) => console.warn('RecordAutoEditRejection failed:', err));
               }}
               className="px-2.5 py-1 rounded-full bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/40 transition-colors font-medium"
             >

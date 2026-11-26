@@ -136,6 +136,88 @@ pub fn encode_tiff_with_metadata(
     Ok(buffer.into_inner())
 }
 
+pub fn encode_compressed_tiff_with_metadata(
+    image: &DynamicImage,
+    samples: TiffSamples,
+    metadata: Option<&Metadata>,
+    icc_profile: Option<&[u8]>,
+    dpi: Option<u16>,
+) -> Result<Vec<u8>, String> {
+    let (width, height) = image.dimensions();
+    let mut buffer = Cursor::new(Vec::new());
+    let mut encoder = TiffEncoder::new(&mut buffer)
+        .map_err(|e| format!("Failed to create TIFF encoder: {}", e))?
+        .with_compression(tiff::encoder::Compression::Deflate(
+            tiff::encoder::DeflateLevel::default(),
+        ))
+        .with_predictor(tiff::encoder::Predictor::Horizontal);
+
+    let exif_ifd = write_sub_ifd(&mut encoder, metadata, ExifTagGroup::EXIF)?;
+    let gps_ifd = write_sub_ifd(&mut encoder, metadata, ExifTagGroup::GPS)?;
+
+    match samples {
+        TiffSamples::Eight => {
+            let pixels = image
+                .as_rgb8()
+                .map_or_else(|| Cow::Owned(image.to_rgb8()), Cow::Borrowed);
+            let mut image_encoder = encoder
+                .new_image::<RGB8>(width, height)
+                .map_err(|e| format!("Failed to start TIFF image: {}", e))?;
+            write_main_ifd(
+                image_encoder.encoder(),
+                metadata,
+                exif_ifd,
+                gps_ifd,
+                icc_profile,
+            )?;
+            set_resolution(&mut image_encoder, dpi);
+            image_encoder
+                .write_data(pixels.as_raw())
+                .map_err(|e| format!("Failed to write TIFF pixel data: {}", e))?;
+        }
+        TiffSamples::Sixteen => {
+            let pixels = image
+                .as_rgb16()
+                .map_or_else(|| Cow::Owned(image.to_rgb16()), Cow::Borrowed);
+            let mut image_encoder = encoder
+                .new_image::<RGB16>(width, height)
+                .map_err(|e| format!("Failed to start TIFF image: {}", e))?;
+            write_main_ifd(
+                image_encoder.encoder(),
+                metadata,
+                exif_ifd,
+                gps_ifd,
+                icc_profile,
+            )?;
+            set_resolution(&mut image_encoder, dpi);
+            image_encoder
+                .write_data(pixels.as_raw())
+                .map_err(|e| format!("Failed to write TIFF pixel data: {}", e))?;
+        }
+        TiffSamples::ThirtyTwoFloat => {
+            let pixels = image
+                .as_rgb32f()
+                .map_or_else(|| Cow::Owned(image.to_rgb32f()), Cow::Borrowed);
+            let mut image_encoder = encoder
+                .new_image::<RGB32Float>(width, height)
+                .map_err(|e| format!("Failed to start TIFF image: {}", e))?;
+            write_main_ifd(
+                image_encoder.encoder(),
+                metadata,
+                exif_ifd,
+                gps_ifd,
+                icc_profile,
+            )?;
+            set_resolution(&mut image_encoder, dpi);
+            image_encoder
+                .write_data(pixels.as_raw())
+                .map_err(|e| format!("Failed to write TIFF pixel data: {}", e))?;
+        }
+    }
+
+    Ok(buffer.into_inner())
+}
+
 fn write_sub_ifd<W: Write + Seek>(
     encoder: &mut TiffEncoder<W>,
     metadata: Option<&Metadata>,
