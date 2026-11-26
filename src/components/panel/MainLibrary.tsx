@@ -505,7 +505,7 @@ export default function MainLibrary(props: MainLibraryProps) {
                       {'Spiders protect their nest. Photo by '}
                       <button
                         type="button"
-                        onClick={() => open('https://500px.com/p/mariusphoto')}
+                        onClick={() => open('https://www.gettyimages.com/search/2/image?artistexact=Marius%20Rimkevicius')}
                         className="hover:underline text-text-primary font-medium cursor-pointer"
                       >
                         Marius R.

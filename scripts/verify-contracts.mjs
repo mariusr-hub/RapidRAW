@@ -849,8 +849,59 @@ for (const pair of IPC_RETURN_PAIRS) {
 }
 console.log(`Checked ${IPC_RETURN_PAIRS.length} IPC return-struct pairs.`);
 
+// =========================================================================
+// 19. Adjustment-Key Synchronization Check (defaultAdjustments <-> TS <-> Rust)
+// =========================================================================
+console.log('\n=== 19. Adjustment-Key Synchronization Check ===');
+const NON_COPYABLE_ADJUSTMENT_KEYS = new Set([
+  'activeTools',
+  'aiPatches',
+  'baselineExposure',
+  'lensBlurDepthMap',
+  'relightNormalMap',
+  'fogDepthMap',
+  'motionBlurDepthMap',
+  'lensDistortionParams',
+  'showClipping',
+]);
+const enhancedTs = fs.readFileSync(path.join(TS_SRC, 'types', 'enhanced.ts'), 'utf8');
+const adjIfaceMatch = adjustmentsTs.match(/export interface Adjustments[^{]*\{([\s\S]*?)\r?\n\}/);
+const enhIfaceMatch = enhancedTs.match(/export interface EnhancedAdjustments[^{]*\{([\s\S]*?)\r?\n\}/);
+const tsIfaceKeys = new Set();
+for (const body of [adjIfaceMatch ? adjIfaceMatch[1] : '', enhIfaceMatch ? enhIfaceMatch[1] : '']) {
+  for (const km of body.matchAll(/^\s*([A-Za-z0-9_\u00C0-\u024F]+)\??\s*:/gm)) {
+    tsIfaceKeys.add(km[1]);
+  }
+}
+const rustAvailKeys = allAvailMatch
+  ? new Set([...allAvailMatch[1].matchAll(/"([a-zA-Z0-9_\u00C0-\u024F]+)"/g)].map((x) => x[1]))
+  : new Set();
+
+if (tsIfaceKeys.size === 0 || rustAvailKeys.size === 0) {
+  console.error('ADJUSTMENT SYNC: Could not parse TS Adjustments/EnhancedAdjustments or Rust all_available_adjustments()');
+  errors++;
+} else {
+  for (const k of defaultAdj) {
+    if (!tsIfaceKeys.has(k)) {
+      console.error(
+        `ADJUSTMENT SYNC: "${k}" in defaultAdjustments.json is missing from TS Adjustments / EnhancedAdjustments interface`,
+      );
+      errors++;
+    }
+    if (!NON_COPYABLE_ADJUSTMENT_KEYS.has(k) && !rustAvailKeys.has(k)) {
+      console.error(
+        `ADJUSTMENT SYNC: "${k}" in defaultAdjustments.json is missing from all_available_adjustments() in settings.rs (or NON_COPYABLE_ADJUSTMENT_KEYS)`,
+      );
+      errors++;
+    }
+  }
+  console.log(
+    `Checked ${defaultAdj.size} defaultAdjustments.json keys against TS interfaces (${tsIfaceKeys.size}) and Rust all_available_adjustments() (${rustAvailKeys.size}).`,
+  );
+}
+
 if (errors > 0) {
   console.error(`\nContract verification FAILED with ${errors} error(s).`);
   process.exit(1);
 }
-console.log('\nAll 18 contract checks PASSED.');
+console.log('\nAll 19 contract checks PASSED.');
