@@ -1091,6 +1091,9 @@ fn composite_patches_cow<'a>(
                     visible: true,
                     invert: patch_info.invert,
                     opacity: 100.0,
+                    feather: 0.0,
+                    expand: 0.0,
+                    contrast: 0.0,
                     adjustments: Value::Null,
                     sub_masks: patch_info.sub_masks,
                 };

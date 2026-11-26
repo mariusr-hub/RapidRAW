@@ -644,6 +644,99 @@ pub(crate) fn extract_linear_bayer_cfa(file_bytes: &[u8]) -> Result<LinearBayerF
     })
 }
 
+/// Extracts a 6x6 X-Trans CFA plane, runs caller-supplied pre-demosaic denoising on the aligned
+/// normalized linear sensels, writes denoised values back into the integer RAW buffer, and develops
+/// via RapidRAW's native Markesteijn pipeline.
+pub(crate) fn denoise_xtrans_raw_with_markesteijn(
+    file_bytes: &[u8],
+    denoise_fn: impl FnOnce(&[f32], usize, usize) -> Vec<f32>,
+) -> Result<ImageBuffer<Rgb<f32>, Vec<f32>>> {
+    let source = RawSource::new_from_slice(file_bytes);
+    let decoder = rawler::get_decoder(&source)?;
+    let orientation = metadata_orientation(decoder.as_ref(), &source).unwrap_or(Orientation::Normal);
+    let mut raw_image: RawImage = decoder.raw_image(&source, &RawDecodeParams::default(), false)?;
+    raw_image.wb_coeffs = crate::decode::multi_exposure::neutralize_wb_if_multiexposure(
+        raw_image.wb_coeffs,
+        file_bytes,
+    );
+
+    let RawPhotometricInterpretation::Cfa(config) = &raw_image.photometric else {
+        return Err(anyhow!("RAW file does not contain a mosaic CFA"));
+    };
+    if raw_image.cpp != 1 || config.cfa.width != 6 || config.cfa.height != 6 {
+        return Err(anyhow!("CFA layout is not a 6x6 X-Trans pattern"));
+    }
+
+    let domain = crate::decode::demosaic::active_domain(&raw_image, 64)
+        .ok_or_else(|| anyhow!("Invalid active X-Trans RAW domain"))?;
+    let x0 = domain.p.x.div_ceil(6) * 6;
+    let y0 = domain.p.y.div_ceil(6) * 6;
+    let width = ((domain.p.x + domain.d.w).saturating_sub(x0) / 6) * 6;
+    let height = ((domain.p.y + domain.d.h).saturating_sub(y0) / 6) * 6;
+    if width < 64 || height < 64 {
+        return Err(anyhow!("Active X-Trans region too small"));
+    }
+
+    let black = raw_image.blacklevel.as_bayer_array();
+    let white = white_level(&raw_image);
+    let stride = raw_image.width;
+
+    let mut cfa_f32 = vec![0.0f32; width * height];
+    {
+        let RawImageData::Integer(raw_u16) = &raw_image.data else {
+            return Err(anyhow!("Expected integer raw CFA samples"));
+        };
+        cfa_f32
+            .par_chunks_exact_mut(width)
+            .enumerate()
+            .for_each(|(dy, row)| {
+                let sy = y0 + dy;
+                let src_row = &raw_u16[sy * stride + x0..sy * stride + x0 + width];
+                let b0 = black[(sy & 1) * 2];
+                let b1 = black[(sy & 1) * 2 + 1];
+                let s0 = 1.0 / (white - b0).max(1.0);
+                let s1 = 1.0 / (white - b1).max(1.0);
+                for (dx, dst) in row.iter_mut().enumerate() {
+                    let (b, s) = if ((x0 + dx) & 1) == 0 { (b0, s0) } else { (b1, s1) };
+                    *dst = ((src_row[dx] as f32 - b) * s).max(0.0);
+                }
+            });
+    }
+
+    let denoised = denoise_fn(&cfa_f32, width, height);
+    if denoised.len() == cfa_f32.len()
+        && let RawImageData::Integer(raw_u16) = &mut raw_image.data
+    {
+        for dy in 0..height {
+            let sy = y0 + dy;
+            let dst_row = &mut raw_u16[sy * stride + x0..sy * stride + x0 + width];
+            let src_row = &denoised[dy * width..(dy + 1) * width];
+            let b0 = black[(sy & 1) * 2];
+            let b1 = black[(sy & 1) * 2 + 1];
+            for dx in 0..width {
+                let b = if ((x0 + dx) & 1) == 0 { b0 } else { b1 };
+                let val = (b + src_row[dx].max(0.0) * (white - b)).round();
+                dst_row[dx] = val.clamp(0.0, u16::MAX as f32) as u16;
+            }
+        }
+    }
+
+    let wb = cfa_white_balance(&raw_image).ok_or_else(|| anyhow!("Missing X-Trans WB"))?;
+    let camera_to_working =
+        CameraToWorking::new(&raw_image).ok_or_else(|| anyhow!("Missing CameraToWorking"))?;
+    let mosaic = crate::decode::demosaic::Mosaic::new(&raw_image, wb)
+        .ok_or_else(|| anyhow!("Failed to initialize X-Trans mosaic"))?;
+    let finish = Finish {
+        camera: Some(camera_to_working.camera(wb, HIGHLIGHT_HEADROOM)),
+        orientation: Orientation::Normal,
+        denoise: 0.0,
+        sharpen: 0.0,
+        recover_highlights: true,
+    };
+    let developed = mosaic.develop(Rect::new(Point::new(x0, y0), Dim2::new(width, height)), &finish, || Ok(()))?;
+    Ok(apply_orientation(DynamicImage::ImageRgb32F(developed), orientation).into_rgb32f())
+}
+
 pub fn read_as_shot(file_bytes: &[u8]) -> Option<AsShot> {
     let source = RawSource::new_from_slice(file_bytes);
     let decoder = rawler::get_decoder(&source).ok()?;

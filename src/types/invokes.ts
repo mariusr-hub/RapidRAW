@@ -192,4 +192,15 @@ export enum Invokes {
   ResetLocalPriors = 'reset_local_priors',
   RecordDustSpotRejection = 'record_dust_spot_rejection',
   RecordAutoEditRejection = 'record_auto_edit_rejection',
+  MatchBodyToFaceSkin = 'match_body_to_face_skin',
+  ScanPortraitBlemishes = 'scan_portrait_blemishes',
+}
+
+export interface SkinToneMatchResult {
+  found: boolean;
+  temperature: number;
+  tint: number;
+  saturation: number;
+  exposure: number;
+  faceCount: number;
 }

@@ -432,8 +432,20 @@ pub fn denoise_raw_bytes_pre_demosaic(
         return Err("RAW pre-demosaic denoise cancelled".to_string());
     }
 
-    let frame = extract_linear_bayer_cfa(file_bytes)
-        .map_err(|e| format!("Pre-demosaic RAW CFA extraction failed: {}", e))?;
+    let frame = match extract_linear_bayer_cfa(file_bytes) {
+        Ok(frame) => frame,
+        Err(bayer_err) => {
+            if let Ok(xtrans_rgb) =
+                crate::decode::raw_processing::denoise_xtrans_raw_with_markesteijn(
+                    file_bytes,
+                    |cfa, w, h| denoise_xtrans_36ch_gat(cfa, w, h, opts),
+                )
+            {
+                return Ok(xtrans_rgb);
+            }
+            return Err(format!("Pre-demosaic RAW CFA extraction failed: {}", bayer_err));
+        }
+    };
 
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err("RAW pre-demosaic denoise cancelled".to_string());
@@ -472,6 +484,116 @@ pub fn denoise_raw_bytes_pre_demosaic(
     let img = Rgb32FImage::from_raw(frame.width as u32, frame.height as u32, rgb_raw)
         .ok_or_else(|| "Failed to allocate pre-demosaic denoised RGB buffer".to_string())?;
     Ok(apply_orientation(DynamicImage::ImageRgb32F(img), frame.orientation).into_rgb32f())
+}
+
+/// Packs 6x6 X-Trans CFA samples into 36 phase-homogeneous sub-lattice planes.
+pub fn pack_xtrans_36ch(cfa: &[f32], width: usize, height: usize) -> (Vec<Vec<f32>>, usize, usize) {
+    let sw = width / 6;
+    let sh = height / 6;
+    if sw == 0 || sh == 0 || cfa.len() < width * height {
+        return (Vec::new(), 0, 0);
+    }
+    let mut planes = vec![vec![0.0f32; sw * sh]; 36];
+    for sy in 0..sh {
+        let by = sy * 6;
+        for sx in 0..sw {
+            let bx = sx * 6;
+            let dst_idx = sy * sw + sx;
+            for py in 0..6 {
+                let row = (by + py) * width + bx;
+                for px in 0..6 {
+                    planes[py * 6 + px][dst_idx] = cfa[row + px];
+                }
+            }
+        }
+    }
+    (planes, sw, sh)
+}
+
+/// Unpacks 36 phase-homogeneous planes back into a contiguous X-Trans CFA slice.
+pub fn unpack_xtrans_36ch(
+    planes: &[Vec<f32>],
+    sw: usize,
+    sh: usize,
+    width: usize,
+    height: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; width * height];
+    if planes.len() < 36 || sw == 0 || sh == 0 {
+        return out;
+    }
+    for sy in 0..sh {
+        let by = sy * 6;
+        for sx in 0..sw {
+            let bx = sx * 6;
+            let src_idx = sy * sw + sx;
+            for py in 0..6 {
+                let row = (by + py) * width + bx;
+                for px in 0..6 {
+                    if row + px < out.len() {
+                        out[row + px] = planes[py * 6 + px][src_idx];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Denoises single-channel linear X-Trans CFA data in 36-channel GAT variance-stabilized space.
+pub fn denoise_xtrans_36ch_gat(
+    cfa: &[f32],
+    width: usize,
+    height: usize,
+    opts: &RawDenoiseOptions,
+) -> Vec<f32> {
+    let (mut planes, sw, sh) = pack_xtrans_36ch(cfa, width, height);
+    if sw == 0 || sh == 0 {
+        return cfa.to_vec();
+    }
+
+    let alpha = opts.shot_noise.max(0.0);
+    let sigma2 = opts.read_noise.max(1e-5).powi(2);
+    let eff_strength = opts.strength.clamp(0.0, 1.5);
+    let level_mults = [1.05f32, 0.78f32, 0.50f32];
+
+    planes.par_iter_mut().for_each(|plane| {
+        for v in plane.iter_mut() {
+            *v = gat_forward(*v, alpha, sigma2);
+        }
+
+        let mut approx = plane.clone();
+        let mut details: Vec<Vec<f32>> = Vec::with_capacity(3);
+        let mut step = 1usize;
+        for _ in 0..3 {
+            let next = atrous_b3_step(&approx, sw, sh, step);
+            let mut detail = Vec::with_capacity(sw * sh);
+            for (a, n) in approx.iter().zip(next.iter()) {
+                detail.push(*a - *n);
+            }
+            details.push(detail);
+            approx = next;
+            step *= 2;
+        }
+
+        let sigma = estimate_mad_sigma(&details[0]);
+        for (lvl, detail) in details.iter_mut().enumerate() {
+            let thresh_sigma = sigma * eff_strength * level_mults[lvl];
+            wiener_shrink_level(detail, sw, sh, thresh_sigma);
+        }
+
+        let mut acc = approx;
+        for detail in &details {
+            for (o, &d) in acc.iter_mut().zip(detail.iter()) {
+                *o += d;
+            }
+        }
+        for (dst, &v) in plane.iter_mut().zip(acc.iter()) {
+            *dst = gat_inverse(v, alpha, sigma2);
+        }
+    });
+
+    unpack_xtrans_36ch(&planes, sw, sh, width, height)
 }
 
 #[cfg(test)]
@@ -528,5 +650,44 @@ mod tests {
                 unpacked[i]
             );
         }
+    }
+
+    #[test]
+    fn xtrans_36ch_pack_unpack_is_exact() {
+        let (w, h) = (24usize, 18usize);
+        let cfa: Vec<f32> = (0..(w * h))
+            .map(|i| ((i % 97) as f32) * 0.005 + (i / w) as f32 * 0.001)
+            .collect();
+        let (planes, sw, sh) = pack_xtrans_36ch(&cfa, w, h);
+        assert_eq!(planes.len(), 36);
+        assert_eq!((sw, sh), (4, 3));
+        let unpacked = unpack_xtrans_36ch(&planes, sw, sh, w, h);
+        assert_eq!(unpacked.len(), cfa.len());
+        for i in 0..cfa.len() {
+            assert!((unpacked[i] - cfa[i]).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn xtrans_36ch_gat_reduces_synthetic_noise() {
+        let (w, h) = (72usize, 72usize);
+        let clean = 0.25f32;
+        let mut noisy = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let sign = if ((x / 6) + (y / 6)) % 2 == 0 { 1.0 } else { -1.0 };
+                noisy[y * w + x] = (clean + sign * 0.04).max(0.0);
+            }
+        }
+        let opts = RawDenoiseOptions {
+            strength: 1.0,
+            read_noise: 0.02,
+            shot_noise: 0.002,
+            model_path: None,
+        };
+        let denoised = denoise_xtrans_36ch_gat(&noisy, w, h, &opts);
+        let err_before: f32 = noisy.iter().map(|v| (v - clean).abs()).sum::<f32>() / noisy.len() as f32;
+        let err_after: f32 = denoised.iter().map(|v| (v - clean).abs()).sum::<f32>() / denoised.len() as f32;
+        assert!(err_after < err_before, "expected noise reduction: {err_after} < {err_before}");
     }
 }

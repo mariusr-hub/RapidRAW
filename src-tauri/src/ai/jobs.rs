@@ -177,6 +177,13 @@ fn face_parts(params: &Value) -> Vec<String> {
         .collect()
 }
 
+fn face_person_index(params: &Value) -> Option<usize> {
+    params
+        .get("personIndex")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+}
+
 fn has_subject_box(params: &Value) -> bool {
     let coords: Vec<f64> = SUBJECT_BOX_KEYS
         .iter()
@@ -384,7 +391,10 @@ pub fn reconcile_ai_results(
                 && match kind {
                     MaskKind::Subject => same_subject_box(params, existing),
                     MaskKind::Text => text_prompt(params) == text_prompt(existing),
-                    MaskKind::Face => face_parts(params) == face_parts(existing),
+                    MaskKind::Face => {
+                        face_parts(params) == face_parts(existing)
+                            && face_person_index(params) == face_person_index(existing)
+                    }
                     _ => true,
                 }
         });
@@ -1112,6 +1122,7 @@ fn generate_mask(
             &cache_key,
             warped_image,
             &face_parts(&original),
+            face_person_index(&original),
             transform,
             ai_source.clone(),
         )

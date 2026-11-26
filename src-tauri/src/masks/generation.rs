@@ -54,7 +54,7 @@ fn default_opacity() -> f32 {
     100.0
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 #[serde(crate = "serde")]
 #[serde(rename_all = "camelCase")]
 pub struct MaskDefinition {
@@ -64,6 +64,12 @@ pub struct MaskDefinition {
     pub invert: bool,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
+    #[serde(default)]
+    pub feather: f32,
+    #[serde(default)]
+    pub expand: f32,
+    #[serde(default)]
+    pub contrast: f32,
     pub adjustments: Value,
     pub sub_masks: Vec<SubMask>,
 }
@@ -230,6 +236,14 @@ pub fn generate_mask_bitmap(
         }
     }
 
+    crate::masks::morphology::refine_mask_bitmap(
+        &mut final_mask,
+        mask_def.expand,
+        mask_def.feather,
+        mask_def.contrast,
+        scale,
+    );
+
     let invert = mask_def.invert;
     let opacity_multiplier = (mask_def.opacity / 100.0).clamp(0.0, 1.0);
     if invert || opacity_multiplier < 1.0 {
@@ -246,6 +260,7 @@ pub fn generate_mask_bitmap(
     Some(final_mask)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
 pub fn generate_mask_overlay(
     mut mask_def: serde_json::Value,
@@ -253,6 +268,7 @@ pub fn generate_mask_overlay(
     height: u32,
     scale: f32,
     crop_offset: (f32, f32),
+    overlay_mode: Option<String>,
     mut js_adjustments: Option<serde_json::Value>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Response, String> {
@@ -282,8 +298,26 @@ pub fn generate_mask_overlay(
         scaled_crop_offset,
         warped_image.as_deref(),
     ) {
-        let palette = [255u8, 0, 0].repeat(256);
-        let transparency: Vec<u8> = (0..=255u8).map(|i| (i as f32 * 0.5) as u8).collect();
+        let (palette, transparency): (Vec<u8>, Vec<u8>) = match overlay_mode.as_deref() {
+            Some("green") => (
+                [16u8, 215, 110].repeat(256),
+                (0..=255u8).map(|i| (i as f32 * 0.5) as u8).collect(),
+            ),
+            Some("bw") => (
+                (0..=255u8).flat_map(|i| [i, i, i]).collect(),
+                vec![235u8; 256],
+            ),
+            Some("unmasked") => (
+                [14u8, 14, 18].repeat(256),
+                (0..=255u8)
+                    .map(|i| ((255 - i) as f32 * 0.78) as u8)
+                    .collect(),
+            ),
+            _ => (
+                [255u8, 0, 0].repeat(256),
+                (0..=255u8).map(|i| (i as f32 * 0.5) as u8).collect(),
+            ),
+        };
 
         let mut buf = Vec::new();
         {

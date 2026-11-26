@@ -323,42 +323,227 @@ impl AiMaskModel {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SlotSnapshot {
+    idx: usize,
+    is_loaded: bool,
+    is_idle_unborrowed: bool,
+    last_used: std::time::Instant,
+    approx_mb: usize,
+    idle_secs: u64,
+}
+
+fn select_heavy_eviction_victims(
+    snapshots: &[SlotSnapshot],
+    incoming_idx: Option<usize>,
+    incoming_mb: usize,
+    cap_mb: usize,
+    max_heavy_slots: usize,
+) -> Vec<usize> {
+    if incoming_mb < 100 {
+        return Vec::new();
+    }
+    let mut heavy_count = 0usize;
+    let mut heavy_mb = 0usize;
+    let mut candidates = Vec::new();
+
+    for snap in snapshots {
+        if snap.approx_mb >= 100 && snap.is_loaded {
+            heavy_count += 1;
+            heavy_mb += snap.approx_mb;
+            if Some(snap.idx) != incoming_idx && snap.is_idle_unborrowed {
+                candidates.push(*snap);
+            }
+        }
+    }
+
+    if heavy_count + 1 <= max_heavy_slots && heavy_mb + incoming_mb <= cap_mb {
+        return Vec::new();
+    }
+
+    candidates.sort_by_key(|c| c.last_used);
+    let mut victims = Vec::new();
+    for c in candidates {
+        if heavy_count + 1 <= max_heavy_slots && heavy_mb + incoming_mb <= cap_mb {
+            break;
+        }
+        victims.push(c.idx);
+        heavy_count = heavy_count.saturating_sub(1);
+        heavy_mb = heavy_mb.saturating_sub(c.approx_mb);
+    }
+    victims
+}
+
+fn select_idle_eviction_victims(
+    snapshots: &[SlotSnapshot],
+    now: std::time::Instant,
+) -> Vec<usize> {
+    snapshots
+        .iter()
+        .filter(|snap| {
+            snap.is_loaded
+                && snap.is_idle_unborrowed
+                && now.saturating_duration_since(snap.last_used) >= Duration::from_secs(snap.idle_secs)
+        })
+        .map(|snap| snap.idx)
+        .collect()
+}
+
+struct ManagedSession {
+    session: Option<SharedSession>,
+    last_used: std::time::Instant,
+    approx_mb: usize,
+    idle_secs: u64,
+}
+
+impl ManagedSession {
+    fn new(approx_mb: usize, idle_secs: u64) -> Mutex<Self> {
+        Mutex::new(Self {
+            session: None,
+            last_used: std::time::Instant::now(),
+            approx_mb,
+            idle_secs,
+        })
+    }
+}
+
 pub struct AiModels {
     models_dir: PathBuf,
     use_gpu: bool,
     downloaded: Mutex<HashSet<AiMaskModel>>,
-    sam_encoder: Mutex<Option<SharedSession>>,
-    sam_decoder: Mutex<Option<SharedSession>>,
-    birefnet: Mutex<Option<SharedSession>>,
-    esam3_image_encoder: Mutex<Option<SharedSession>>,
-    esam3_decoder: Mutex<Option<SharedSession>>,
-    esam3_text_encoder: Mutex<Option<SharedSession>>,
+    sam_encoder: Mutex<ManagedSession>,
+    sam_decoder: Mutex<ManagedSession>,
+    birefnet: Mutex<ManagedSession>,
+    esam3_image_encoder: Mutex<ManagedSession>,
+    esam3_decoder: Mutex<ManagedSession>,
+    esam3_text_encoder: Mutex<ManagedSession>,
     esam3_sky_prompt: Mutex<Option<Arc<Esam3Prompt>>>,
     esam3_face_prompt: Mutex<Option<Arc<Esam3Prompt>>>,
     clip_tokenizer: Mutex<Option<Arc<Tokenizer>>>,
-    face_landmarks: Mutex<Option<SharedSession>>,
-    face_segmenter: Mutex<Option<SharedSession>>,
-    depth_anything: Mutex<Option<SharedSession>>,
+    face_landmarks: Mutex<ManagedSession>,
+    face_segmenter: Mutex<ManagedSession>,
+    depth_anything: Mutex<ManagedSession>,
 }
 
 impl AiModels {
+    fn slots(&self) -> [&Mutex<ManagedSession>; 9] {
+        [
+            &self.sam_encoder,
+            &self.sam_decoder,
+            &self.birefnet,
+            &self.esam3_image_encoder,
+            &self.esam3_decoder,
+            &self.esam3_text_encoder,
+            &self.face_landmarks,
+            &self.face_segmenter,
+            &self.depth_anything,
+        ]
+    }
+
+    fn slot_snapshots(&self) -> Vec<SlotSnapshot> {
+        self.slots()
+            .iter()
+            .enumerate()
+            .map(|(idx, &slot_mutex)| {
+                let guard = slot_mutex.lock().unwrap();
+                let (is_loaded, is_idle_unborrowed) = match guard.session.as_ref() {
+                    Some(session) => (true, Arc::strong_count(session) == 1),
+                    None => (false, false),
+                };
+                SlotSnapshot {
+                    idx,
+                    is_loaded,
+                    is_idle_unborrowed,
+                    last_used: guard.last_used,
+                    approx_mb: guard.approx_mb,
+                    idle_secs: guard.idle_secs,
+                }
+            })
+            .collect()
+    }
+
+    fn total_ram_gb() -> u64 {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory() / (1024 * 1024 * 1024)
+    }
+
+    fn evict_heavy_sessions_for(&self, incoming_slot: &Mutex<ManagedSession>, incoming_mb: usize) {
+        if Self::total_ram_gb() > 20 || incoming_mb < 100 {
+            return;
+        }
+        let incoming_idx = self
+            .slots()
+            .iter()
+            .position(|&s| std::ptr::eq(s, incoming_slot));
+        let snapshots = self.slot_snapshots();
+        let victims = select_heavy_eviction_victims(&snapshots, incoming_idx, incoming_mb, 1100, 2);
+        let mut dropped = Vec::with_capacity(victims.len());
+        for idx in victims {
+            let mut guard = self.slots()[idx].lock().unwrap();
+            if let Some(session) = guard.session.as_ref()
+                && Arc::strong_count(session) == 1
+            {
+                dropped.push(guard.session.take());
+            }
+        }
+        drop(dropped);
+    }
+
+    pub fn evict_idle_sessions(&self) {
+        self.evict_idle_sessions_at(std::time::Instant::now());
+    }
+
+    fn evict_idle_sessions_at(&self, now: std::time::Instant) {
+        let snapshots = self.slot_snapshots();
+        let victims = select_idle_eviction_victims(&snapshots, now);
+        let mut dropped = Vec::with_capacity(victims.len());
+        for idx in victims {
+            let mut guard = self.slots()[idx].lock().unwrap();
+            if let Some(session) = guard.session.as_ref()
+                && Arc::strong_count(session) == 1
+                && now.saturating_duration_since(guard.last_used)
+                    >= Duration::from_secs(guard.idle_secs)
+            {
+                dropped.push(guard.session.take());
+            }
+        }
+        drop(dropped);
+    }
+
     fn session(
         &self,
-        slot: &Mutex<Option<SharedSession>>,
+        slot: &Mutex<ManagedSession>,
         filename: &str,
         use_gpu: bool,
     ) -> Result<SharedSession> {
-        let mut slot = slot.lock().unwrap();
-        if let Some(session) = slot.as_ref() {
-            return Ok(Arc::clone(session));
+        let approx_mb = {
+            let mut guard = slot.lock().unwrap();
+            if let Some(session) = guard.session.as_ref().map(Arc::clone) {
+                guard.last_used = std::time::Instant::now();
+                return Ok(session);
+            }
+            guard.approx_mb
+        };
+
+        if approx_mb >= 100 {
+            self.evict_heavy_sessions_for(slot, approx_mb);
         }
+
         let session = Arc::new(Mutex::new(build_session(
             &self.models_dir.join(filename),
             SessionKind::OneShot,
             self.use_gpu && use_gpu,
             None,
         )?));
-        *slot = Some(Arc::clone(&session));
+
+        let mut guard = slot.lock().unwrap();
+        if let Some(existing) = guard.session.as_ref().map(Arc::clone) {
+            guard.last_used = std::time::Instant::now();
+            return Ok(existing);
+        }
+        guard.session = Some(Arc::clone(&session));
+        guard.last_used = std::time::Instant::now();
         Ok(session)
     }
 
@@ -409,6 +594,13 @@ impl AiModels {
 
     pub fn face_segmenter(&self) -> Result<SharedSession> {
         self.session(&self.face_segmenter, FACE_SEGMENTER_FILENAME, false)
+    }
+
+    pub fn has_model_on_disk(&self, model: AiMaskModel) -> bool {
+        model
+            .assets(self.gpu_inference())
+            .iter()
+            .all(|asset| self.models_dir.join(asset.filename).exists())
     }
 
     pub fn esam3_sky_prompt(&self) -> Result<Arc<Esam3Prompt>> {
@@ -878,19 +1070,31 @@ pub async fn get_or_init_ai_models(
                 models_dir: get_models_dir(app_handle)?,
                 use_gpu: gpu_acceleration_enabled(app_handle),
                 downloaded: Mutex::new(HashSet::new()),
-                sam_encoder: Mutex::new(None),
-                sam_decoder: Mutex::new(None),
-                birefnet: Mutex::new(None),
-                esam3_image_encoder: Mutex::new(None),
-                esam3_decoder: Mutex::new(None),
-                esam3_text_encoder: Mutex::new(None),
+                sam_encoder: ManagedSession::new(360, 90),
+                sam_decoder: ManagedSession::new(20, 180),
+                birefnet: ManagedSession::new(450, 90),
+                esam3_image_encoder: ManagedSession::new(380, 90),
+                esam3_decoder: ManagedSession::new(25, 180),
+                esam3_text_encoder: ManagedSession::new(140, 90),
                 esam3_sky_prompt: Mutex::new(None),
                 esam3_face_prompt: Mutex::new(None),
                 clip_tokenizer: Mutex::new(None),
-                face_landmarks: Mutex::new(None),
-                face_segmenter: Mutex::new(None),
-                depth_anything: Mutex::new(None),
+                face_landmarks: ManagedSession::new(12, 300),
+                face_segmenter: ManagedSession::new(18, 180),
+                depth_anything: ManagedSession::new(110, 90),
             });
+            let weak_models = Arc::downgrade(&models);
+            let _ = std::thread::Builder::new()
+                .name("ai-session-reaper".to_string())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(30));
+                        let Some(models) = weak_models.upgrade() else {
+                            break;
+                        };
+                        models.evict_idle_sessions();
+                    }
+                });
             ai_state_mutex
                 .lock()
                 .unwrap()
@@ -1215,4 +1419,70 @@ fn denoise_crop_as_slice() -> ort::Result<(Model, Vec<Output>)> {
             output_type,
         }],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn snap(
+        idx: usize,
+        is_loaded: bool,
+        is_idle_unborrowed: bool,
+        age_secs: u64,
+        approx_mb: usize,
+        idle_secs: u64,
+        now: Instant,
+    ) -> SlotSnapshot {
+        SlotSnapshot {
+            idx,
+            is_loaded,
+            is_idle_unborrowed,
+            last_used: now - Duration::from_secs(age_secs),
+            approx_mb,
+            idle_secs,
+        }
+    }
+
+    #[test]
+    fn heavy_lru_evicts_oldest_idle_heavy_slot_on_cap_overflow() {
+        let now = Instant::now();
+        // Slots: 0=sam_encoder(360, incoming), 2=birefnet(450, loaded age 20s), 3=esam3_img(380, loaded age 5s)
+        let snapshots = vec![
+            snap(0, false, false, 0, 360, 90, now),
+            snap(1, true, true, 60, 20, 180, now),
+            snap(2, true, true, 20, 450, 90, now),
+            snap(3, true, true, 5, 380, 90, now),
+        ];
+        let victims = select_heavy_eviction_victims(&snapshots, Some(0), 360, 1100, 2);
+        // 2+1 = 3 > max 2 (and 450+380+360 = 1190 > 1100): evicts oldest heavy slot (2) only
+        assert_eq!(victims, vec![2]);
+    }
+
+    #[test]
+    fn heavy_lru_skips_actively_borrowed_slot() {
+        let now = Instant::now();
+        let snapshots = vec![
+            snap(0, false, false, 0, 360, 90, now),
+            snap(2, true, false, 40, 450, 90, now), // borrowed (Arc::strong_count > 1)
+            snap(3, true, true, 10, 380, 90, now),  // idle
+        ];
+        let victims = select_heavy_eviction_victims(&snapshots, Some(0), 360, 1100, 2);
+        assert_eq!(victims, vec![3]);
+    }
+
+    #[test]
+    fn idle_reaper_honors_per_tier_timeouts() {
+        let now = Instant::now();
+        let snapshots = vec![
+            snap(2, true, true, 95, 450, 90, now),   // heavy expired (>90s)
+            snap(1, true, true, 120, 20, 180, now),  // light active (<180s)
+            snap(4, true, true, 185, 25, 180, now),  // light expired (>180s)
+            snap(6, true, true, 250, 12, 300, now),  // face_landmarks kept until 300s
+            snap(7, true, false, 400, 18, 180, now), // borrowed -> protected
+        ];
+        let victims = select_idle_eviction_victims(&snapshots, now);
+        assert_eq!(victims, vec![2, 4]);
+    }
 }

@@ -125,6 +125,9 @@ fn raw_patch_mask(
         visible: patch_definition.visible,
         invert: patch_definition.invert,
         opacity: 100.0,
+        feather: 0.0,
+        expand: 0.0,
+        contrast: 0.0,
         adjustments: Value::Null,
         sub_masks: patch_definition.sub_masks.clone(),
     };
@@ -505,6 +508,9 @@ pub async fn invoke_generative_replace_with_mask_def(
         visible: patch_definition.visible,
         invert: patch_definition.invert,
         opacity: 100.0,
+        feather: 0.0,
+        expand: 0.0,
+        contrast: 0.0,
         adjustments: serde_json::Value::Null,
         sub_masks: patch_definition.sub_masks.clone(),
     };
@@ -532,7 +538,7 @@ pub async fn invoke_generative_replace_with_mask_def(
         return Err("Task cancelled".to_string());
     }
 
-    let (final_patch, patch_x, patch_y) = if use_fast_inpaint {
+    let (mut final_patch, patch_x, patch_y) = if use_fast_inpaint {
         let lama_model =
             models::get_or_init_lama_model(&app_handle, &state.ai_state, &state.ai_init_lock)
                 .await
@@ -622,6 +628,8 @@ pub async fn invoke_generative_replace_with_mask_def(
     if cancel_flag.as_ref().is_some_and(|t| t.is_cancelled()) {
         return Err("Task cancelled".to_string());
     }
+
+    match_patch_lab_and_grain(&source_image, &mut final_patch, (patch_x, patch_y), &blend_mask);
 
     encode_generated_patch(
         &source_image,
@@ -1156,4 +1164,261 @@ pub async fn generate_retouch_patch(
         true,
     )
     .map(|v| v.to_string())
+}
+
+fn rgb_u8_to_cie_lab(r: u8, g: u8, b: u8) -> [f32; 3] {
+    let lin = |u: u8| -> f32 {
+        let s = u as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (lr, lg, lb) = (lin(r), lin(g), lin(b));
+    let x = (0.4124564 * lr + 0.3575761 * lg + 0.1804375 * lb) / 0.95047;
+    let y = 0.2126729 * lr + 0.7151522 * lg + 0.0721750 * lb;
+    let z = (0.0193339 * lr + 0.1191920 * lg + 0.9503041 * lb) / 1.08883;
+    let f = |t: f32| -> f32 {
+        if t > 0.008856452 {
+            t.cbrt()
+        } else {
+            7.787037 * t + 16.0 / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn cie_lab_to_rgb_u8(lab: [f32; 3]) -> [u8; 3] {
+    let fy = (lab[0] + 16.0) / 116.0;
+    let fx = lab[1] / 500.0 + fy;
+    let fz = fy - lab[2] / 200.0;
+    let finv = |t: f32| -> f32 {
+        if t > 0.20689655 {
+            t * t * t
+        } else {
+            (t - 16.0 / 116.0) / 7.787037
+        }
+    };
+    let x = 0.95047 * finv(fx);
+    let y = finv(fy);
+    let z = 1.08883 * finv(fz);
+
+    let rl = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    let gl = -0.9692660 * x + 1.8760108 * y + 0.0415560 * z;
+    let bl = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    let enc = |c: f32| -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let s = if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (s.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    [enc(rl), enc(gl), enc(bl)]
+}
+
+fn lab_mean_std(samples: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    let n = samples.len().max(1) as f32;
+    let mut mean = [0.0f32; 3];
+    for s in samples {
+        for c in 0..3 {
+            mean[c] += s[c];
+        }
+    }
+    for c in 0..3 {
+        mean[c] /= n;
+    }
+    let mut var = [0.0f32; 3];
+    for s in samples {
+        for c in 0..3 {
+            let d = s[c] - mean[c];
+            var[c] += d * d;
+        }
+    }
+    let std = [
+        (var[0] / n).sqrt().max(1.0),
+        (var[1] / n).sqrt().max(0.5),
+        (var[2] / n).sqrt().max(0.5),
+    ];
+    (mean, std)
+}
+
+/// Measures an 8 px annular boundary ring around `blend_mask`, softly aligns
+/// inpainted patch CIE Lab mean/std, and injects matching zero-mean micro-grain.
+pub(crate) fn match_patch_lab_and_grain(
+    source_image: &DynamicImage,
+    patch: &mut RgbaImage,
+    (patch_x, patch_y): (u32, u32),
+    blend_mask: &GrayImage,
+) {
+    let Ok((min_x, max_x, min_y, max_y)) = calculate_mask_bounds(blend_mask) else {
+        return;
+    };
+    let (img_w, img_h) = source_image.dimensions();
+    let (pw, ph) = patch.dimensions();
+    let bx0 = (min_x as u32).saturating_sub(8);
+    let by0 = (min_y as u32).saturating_sub(8);
+    let bx1 = ((max_x as u32) + 8).min(img_w - 1);
+    let by1 = ((max_y as u32) + 8).min(img_h - 1);
+    let bw = bx1 - bx0 + 1;
+    let bh = by1 - by0 + 1;
+    if bw < 3 || bh < 3 {
+        return;
+    }
+
+    let mask_crop = image::imageops::crop_imm(blend_mask, bx0, by0, bw, bh).to_image();
+    let dilated = grayscale_dilate(&mask_crop, 8);
+    let src_rgb = source_image.to_rgb8();
+
+    let mut ring_labs = Vec::new();
+    let mut patch_labs = Vec::new();
+    let mut ring_residuals = Vec::new();
+    let mut patch_residuals = Vec::new();
+
+    for ly in 1..bh.saturating_sub(1) {
+        for lx in 1..bw.saturating_sub(1) {
+            let gx = bx0 + lx;
+            let gy = by0 + ly;
+            let m = mask_crop.get_pixel(lx, ly)[0];
+            let d = dilated.get_pixel(lx, ly)[0];
+            if m == 0 && d > 0 {
+                let sp = src_rgb.get_pixel(gx, gy);
+                ring_labs.push(rgb_u8_to_cie_lab(sp[0], sp[1], sp[2]));
+                if gx + 1 < img_w && gy + 1 < img_h {
+                    let mut sum_l = 0.0f32;
+                    for oy in -1i32..=1 {
+                        for ox in -1i32..=1 {
+                            let np = src_rgb.get_pixel((gx as i32 + ox) as u32, (gy as i32 + oy) as u32);
+                            sum_l +=
+                                0.2126 * np[0] as f32 + 0.7152 * np[1] as f32 + 0.0722 * np[2] as f32;
+                        }
+                    }
+                    let lc = 0.2126 * sp[0] as f32 + 0.7152 * sp[1] as f32 + 0.0722 * sp[2] as f32;
+                    ring_residuals.push(lc - sum_l / 9.0);
+                }
+            } else if m > 16 {
+                let px = gx.wrapping_sub(patch_x);
+                let py = gy.wrapping_sub(patch_y);
+                if px >= 1 && py >= 1 && px + 1 < pw && py + 1 < ph {
+                    let pp = patch.get_pixel(px, py);
+                    patch_labs.push(rgb_u8_to_cie_lab(pp[0], pp[1], pp[2]));
+                    let all_interior = (-1i32..=1).all(|oy| {
+                        (-1i32..=1).all(|ox| {
+                            mask_crop.get_pixel((lx as i32 + ox) as u32, (ly as i32 + oy) as u32)[0]
+                                > 16
+                        })
+                    });
+                    if all_interior {
+                        let mut sum_l = 0.0f32;
+                        for oy in -1i32..=1 {
+                            for ox in -1i32..=1 {
+                                let np = patch
+                                    .get_pixel((px as i32 + ox) as u32, (py as i32 + oy) as u32);
+                                sum_l += 0.2126 * np[0] as f32
+                                    + 0.7152 * np[1] as f32
+                                    + 0.0722 * np[2] as f32;
+                            }
+                        }
+                        let lc = 0.2126 * pp[0] as f32
+                            + 0.7152 * pp[1] as f32
+                            + 0.0722 * pp[2] as f32;
+                        patch_residuals.push(lc - sum_l / 9.0);
+                    }
+                }
+            }
+        }
+    }
+
+    if ring_labs.len() < 16 || patch_labs.len() < 16 {
+        return;
+    }
+
+    let (ring_mean, ring_std) = lab_mean_std(&ring_labs);
+    let (patch_mean, patch_std) = lab_mean_std(&patch_labs);
+    let rms = |vals: &[f32]| -> f32 {
+        if vals.is_empty() {
+            return 0.0;
+        }
+        let sum_sq: f32 = vals.iter().map(|v| v * v).sum();
+        (sum_sq / vals.len() as f32).sqrt()
+    };
+    let ring_sigma = rms(&ring_residuals);
+    let patch_sigma = rms(&patch_residuals);
+    let missing_grain = (ring_sigma * ring_sigma - patch_sigma * patch_sigma)
+        .max(0.0)
+        .sqrt();
+
+    let scale = [0, 1, 2].map(|c| (ring_std[c] / patch_std[c]).clamp(0.75, 1.35));
+
+    for gy in by0..=by1 {
+        for gx in bx0..=bx1 {
+            let m = blend_mask.get_pixel(gx, gy)[0];
+            if m == 0 {
+                continue;
+            }
+            let px = gx.wrapping_sub(patch_x);
+            let py = gy.wrapping_sub(patch_y);
+            if px >= pw || py >= ph {
+                continue;
+            }
+            let alpha = m as f32 / 255.0;
+            let p = patch.get_pixel_mut(px, py);
+            let lab = rgb_u8_to_cie_lab(p[0], p[1], p[2]);
+            let adjusted = [0, 1, 2].map(|c| {
+                let mapped = ring_mean[c] + (lab[c] - patch_mean[c]) * scale[c];
+                lab[c] + (mapped - lab[c]) * 0.65 * alpha
+            });
+            let mut rgb = cie_lab_to_rgb_u8(adjusted);
+            if missing_grain >= 0.25 {
+                let n = gaussian_noise(gx, gy) * missing_grain * alpha;
+                for c in &mut rgb {
+                    *c = (*c as f32 + n).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            p.0[0] = rgb[0];
+            p.0[1] = rgb[1];
+            p.0[2] = rgb[2];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lab_boundary_and_grain_match_lifts_flat_dark_patch() {
+        let w = 48u32;
+        let h = 48u32;
+        let mut src = RgbImage::new(w, h);
+        let mut patch = RgbaImage::new(w, h);
+        let mut mask = GrayImage::new(w, h);
+
+        for y in 0..h {
+            for x in 0..w {
+                let n = if (x + y) % 2 == 0 { 8 } else { -8 };
+                let v = (170 + n) as u8;
+                src.put_pixel(x, y, Rgb([v, (v as i32 - 10) as u8, (v as i32 - 20) as u8]));
+                if (16..32).contains(&x) && (16..32).contains(&y) {
+                    mask.put_pixel(x, y, image::Luma([255]));
+                    patch.put_pixel(x, y, image::Rgba([95, 95, 95, 255]));
+                } else {
+                    patch.put_pixel(x, y, image::Rgba([v, (v as i32 - 10) as u8, (v as i32 - 20) as u8, 255]));
+                }
+            }
+        }
+
+        match_patch_lab_and_grain(&DynamicImage::ImageRgb8(src), &mut patch, (0, 0), &mask);
+        let center_vals: Vec<u8> = (18..30)
+            .map(|x| patch.get_pixel(x, 24)[0])
+            .collect();
+        let mean: f32 = center_vals.iter().map(|&v| v as f32).sum::<f32>() / center_vals.len() as f32;
+        assert!(mean > 115.0, "expected Lab mean shift upward, got {mean}");
+        let min_v = *center_vals.iter().min().unwrap();
+        let max_v = *center_vals.iter().max().unwrap();
+        assert!(max_v > min_v, "expected deterministic grain variation inside flat patch");
+    }
 }

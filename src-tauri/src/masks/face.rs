@@ -70,6 +70,8 @@ const RIGHT_IRIS: [usize; 5] = [468, 469, 470, 471, 472];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FacePart {
     FaceSkin,
+    UnderEye,
+    SkinShine,
     BodySkin,
     Eyebrows,
     EyeWhites,
@@ -84,6 +86,8 @@ impl FacePart {
     pub fn from_id(id: &str) -> Option<Self> {
         match id {
             "faceSkin" => Some(FacePart::FaceSkin),
+            "underEye" => Some(FacePart::UnderEye),
+            "skinShine" => Some(FacePart::SkinShine),
             "bodySkin" => Some(FacePart::BodySkin),
             "eyebrows" => Some(FacePart::Eyebrows),
             "eyeWhites" => Some(FacePart::EyeWhites),
@@ -342,7 +346,7 @@ pub fn analyze_faces(
     }
 
     let rgb = image.to_rgb8();
-    let faces = &mut analysis.faces;
+    let mut paired: Vec<(DetectedFace, (FaceFrame, Vec<f32>))> = Vec::new();
     for face_box in boxes {
         let mut fitted = None;
         for quarter in 0..4 {
@@ -358,7 +362,7 @@ pub fn analyze_faces(
         };
 
         let (center, size) = upright_extent(&landmarks, angle);
-        if faces.iter().any(|face| {
+        if paired.iter().any(|(face, _)| {
             (face.center[0] - center[0]).hypot(face.center[1] - center[1])
                 < DUPLICATE_FACE_DISTANCE * size.max(face.size)
         }) {
@@ -379,16 +383,27 @@ pub fn analyze_faces(
             angle,
         };
         let [_, _, body] = run_segmenter(segmenter_session, &rgb, &body_frame)?;
-        analysis.body.push((body_frame, body));
-        faces.push(DetectedFace {
-            landmarks,
-            center,
-            angle,
-            size,
-            segment_frame,
-            hair,
-            skin,
-        });
+        paired.push((
+            DetectedFace {
+                landmarks,
+                center,
+                angle,
+                size,
+                segment_frame,
+                hair,
+                skin,
+            },
+            (body_frame, body),
+        ));
+    }
+    paired.sort_by(|(a, _), (b, _)| {
+        a.center[0]
+            .total_cmp(&b.center[0])
+            .then_with(|| a.center[1].total_cmp(&b.center[1]))
+    });
+    for (face, body_entry) in paired {
+        analysis.faces.push(face);
+        analysis.body.push(body_entry);
     }
     if !analysis.faces.is_empty() {
         let frame = FaceFrame {
@@ -646,6 +661,38 @@ fn face_parts_mask(
         .map(|(&o, &i)| (o - i).max(0.0))
         .collect();
 
+    let face_skin_matte = parts.iter().any(|p| {
+        matches!(
+            p,
+            FacePart::FaceSkin | FacePart::UnderEye | FacePart::SkinShine
+        )
+    }).then(|| {
+        let oval = scaled_polygon(&select(&FACE_OVAL), OVAL_EXPANSION);
+        let oval = ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(
+            w as u32,
+            h as u32,
+            polygon_mask(w, h, &oval),
+        )
+        .unwrap();
+        let oval = imageops::blur(&oval, (size * OVAL_SOFTNESS).max(0.5)).into_raw();
+        let skin: Vec<f32> =
+            segment_probabilities(&face.segment_frame, &face.skin, w, h, x0, y0, scale)
+                .iter()
+                .zip(&oval)
+                .map(|(&s, &o)| s * o)
+                .collect();
+        let features = refine(
+            &work_rgb,
+            &pair(pair(brows.clone(), &eyes), &lips_outer),
+            fine_radius,
+        );
+        refine(&work_rgb, &sharpen(&skin), radius * 2)
+            .iter()
+            .zip(&features)
+            .map(|(&s, &f)| s * (1.0 - f))
+            .collect::<Vec<f32>>()
+    });
+
     let mut combined = vec![0.0; w * h];
     for &part in parts {
         let mask = match part {
@@ -676,44 +723,104 @@ fn face_parts_mask(
                 radius * 2,
             ),
             FacePart::BodySkin => continue,
-            FacePart::Hair => refine(
+            FacePart::Hair => from_gray(&fast_color_guided_filter(
                 &work_rgb,
-                &sharpen(&segment_probabilities(
-                    &face.segment_frame,
-                    &face.hair,
+                &to_gray(
+                    &sharpen(&segment_probabilities(
+                        &face.segment_frame,
+                        &face.hair,
+                        w,
+                        h,
+                        x0,
+                        y0,
+                        scale,
+                    )),
                     w,
                     h,
-                    x0,
-                    y0,
-                    scale,
-                )),
-                radius * 2,
-            ),
-            FacePart::FaceSkin => {
-                let oval = scaled_polygon(&select(&FACE_OVAL), OVAL_EXPANSION);
-                let oval = ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(
-                    w as u32,
-                    h as u32,
-                    polygon_mask(w, h, &oval),
-                )
-                .unwrap();
-                let oval = imageops::blur(&oval, (size * OVAL_SOFTNESS).max(0.5)).into_raw();
-                let skin: Vec<f32> =
-                    segment_probabilities(&face.segment_frame, &face.skin, w, h, x0, y0, scale)
-                        .iter()
-                        .zip(&oval)
-                        .map(|(&s, &o)| s * o)
-                        .collect();
-                let features = refine(
-                    &work_rgb,
-                    &pair(pair(brows.clone(), &eyes), &lips_outer),
-                    fine_radius,
-                );
-                refine(&work_rgb, &sharpen(&skin), radius * 2)
+                ),
+                6,
+                1e-4,
+            )),
+            FacePart::FaceSkin => face_skin_matte.clone().unwrap_or_default(),
+            FacePart::UnderEye => {
+                let skin = face_skin_matte.as_deref().unwrap_or(&[]);
+                let mean_pt = |indices: &[usize]| -> [f32; 2] {
+                    let n = indices.len().max(1) as f32;
+                    let sum = indices.iter().fold([0.0f32; 2], |acc, &i| {
+                        [acc[0] + points[i][0], acc[1] + points[i][1]]
+                    });
+                    [sum[0] / n, sum[1] / n]
+                };
+                let lc = mean_pt(&LEFT_EYE);
+                let rc = mean_pt(&RIGHT_EYE);
+                let iod = (lc[0] - rc[0]).hypot(lc[1] - rc[1]).max(size * 0.22);
+                let down = rotate([0.0, 1.0], face.angle);
+                let crescent = |lower_indices: &[usize]| -> Vec<f32> {
+                    let len = lower_indices.len();
+                    let mut poly = Vec::with_capacity(len * 2);
+                    for &idx in lower_indices {
+                        let p = points[idx];
+                        poly.push([p[0] + down[0] * (0.025 * iod), p[1] + down[1] * (0.025 * iod)]);
+                    }
+                    for (rev_k, &idx) in lower_indices.iter().rev().enumerate() {
+                        let k = len - 1 - rev_k;
+                        let phase = std::f32::consts::PI * (k as f32) / (len.saturating_sub(1).max(1) as f32);
+                        let depth = (0.06 + 0.08 * phase.sin()) * iod;
+                        let p = points[idx];
+                        poly.push([p[0] + down[0] * depth, p[1] + down[1] * depth]);
+                    }
+                    polygon_mask(w, h, &poly)
+                };
+                let raw_crescents = pair(crescent(&LEFT_EYE[..9]), &crescent(&RIGHT_EYE[..9]));
+                let gated: Vec<f32> = raw_crescents
                     .iter()
-                    .zip(&features)
-                    .map(|(&s, &f)| s * (1.0 - f))
-                    .collect()
+                    .enumerate()
+                    .map(|(i, &c)| {
+                        let s = skin.get(i).copied().unwrap_or(0.0);
+                        c * s * (1.0 - eyes[i]).max(0.0)
+                    })
+                    .collect();
+                from_gray(&fast_color_guided_filter(
+                    &work_rgb,
+                    &to_gray(&gated, w, h),
+                    4.max(fine_radius),
+                    REFINE_EPS,
+                ))
+            }
+            FacePart::SkinShine => {
+                let skin = face_skin_matte.as_deref().unwrap_or(&[]);
+                let blur_sigma = (size * 0.07).clamp(3.0, 18.0);
+                let luma_buf =
+                    ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(w as u32, h as u32, luma.clone())
+                        .unwrap();
+                let mean_luma = imageops::blur(&luma_buf, blur_sigma).into_raw();
+                let chroma: Vec<f32> = work_rgb
+                    .as_raw()
+                    .chunks_exact(3)
+                    .map(|px| {
+                        let max_c = px[0].max(px[1]).max(px[2]) as f32;
+                        let min_c = px[0].min(px[1]).min(px[2]) as f32;
+                        (max_c - min_c) / 255.0
+                    })
+                    .collect();
+                let chroma_buf =
+                    ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(w as u32, h as u32, chroma.clone())
+                        .unwrap();
+                let mean_chroma = imageops::blur(&chroma_buf, blur_sigma).into_raw();
+                let raw_shine: Vec<f32> = (0..(w * h))
+                    .map(|i| {
+                        let s = skin.get(i).copied().unwrap_or(0.0);
+                        if s < 0.1 {
+                            return 0.0;
+                        }
+                        let excess = ((luma[i] - mean_luma[i]) / mean_luma[i].max(0.18)).max(0.0);
+                        let desat = (mean_chroma[i] - chroma[i]).max(0.0) * 0.5;
+                        let score = ((excess + desat - 0.06) / 0.16).clamp(0.0, 1.0);
+                        let smooth = score * score * (3.0 - 2.0 * score);
+                        s * smooth
+                    })
+                    .collect();
+                refine(&work_rgb, &raw_shine, fine_radius)
             }
         };
         maximum(&mut combined, &mask);
@@ -769,19 +876,173 @@ fn segment_probabilities(
     values
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkinToneMatchResult {
+    pub found: bool,
+    pub temperature: f32,
+    pub tint: f32,
+    pub saturation: f32,
+    pub exposure: f32,
+    pub face_count: usize,
+}
+
+fn srgb_u8_to_cie_lab(r: u8, g: u8, b: u8) -> [f32; 3] {
+    let lin = |u: u8| -> f32 {
+        let s = u as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (lr, lg, lb) = (lin(r), lin(g), lin(b));
+    let x = (0.4124564 * lr + 0.3575761 * lg + 0.1804375 * lb) / 0.95047;
+    let y = 0.2126729 * lr + 0.7151522 * lg + 0.0721750 * lb;
+    let z = (0.0193339 * lr + 0.1191920 * lg + 0.9503041 * lb) / 1.08883;
+    let f = |t: f32| -> f32 {
+        if t > 0.008856452 {
+            t.cbrt()
+        } else {
+            7.787037 * t + 16.0 / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn trimmed_mean_lab(mut samples: Vec<[f32; 3]>) -> Option<[f32; 3]> {
+    if samples.len() < 40 {
+        return None;
+    }
+    samples.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let lo = samples.len() * 15 / 100;
+    let hi = (samples.len() * 85 / 100).max(lo + 1);
+    let slice = &samples[lo..hi];
+    let n = slice.len() as f32;
+    let mut sum = [0.0f32; 3];
+    for s in slice {
+        sum[0] += s[0];
+        sum[1] += s[1];
+        sum[2] += s[2];
+    }
+    Some([sum[0] / n, sum[1] / n, sum[2] / n])
+}
+
+pub fn compute_face_to_body_skin_delta(
+    image: &DynamicImage,
+    analysis: &FaceAnalysis,
+    person_index: Option<usize>,
+) -> SkinToneMatchResult {
+    let face_count = analysis.faces.len();
+    if face_count == 0 {
+        return SkinToneMatchResult {
+            found: false,
+            face_count: 0,
+            ..Default::default()
+        };
+    }
+
+    let face_mask = compose_face_mask(image, analysis, &[FacePart::FaceSkin], person_index);
+    let body_mask = compose_face_mask(image, analysis, &[FacePart::BodySkin], person_index);
+    compute_skin_delta_from_masks(image, &face_mask, &body_mask, face_count)
+}
+
+fn compute_skin_delta_from_masks(
+    image: &DynamicImage,
+    face_mask: &GrayImage,
+    body_mask: &GrayImage,
+    face_count: usize,
+) -> SkinToneMatchResult {
+    let rgb = image.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let stride = if w.max(h) > 1024 { 2 } else { 1 };
+
+    let mut face_samples = Vec::new();
+    let mut face_fallback = Vec::new();
+    let mut body_samples = Vec::new();
+
+    for y in (0..h).step_by(stride) {
+        for x in (0..w).step_by(stride) {
+            let f_val = face_mask.get_pixel(x, y)[0];
+            let b_val = body_mask.get_pixel(x, y)[0];
+            if f_val < 128 && b_val < 128 {
+                continue;
+            }
+            let p = rgb.get_pixel(x, y);
+            let lab = srgb_u8_to_cie_lab(p[0], p[1], p[2]);
+            if lab[0] <= 18.0 || lab[0] >= 92.0 {
+                continue;
+            }
+            if f_val >= 128 {
+                if b_val < 64 {
+                    face_samples.push(lab);
+                }
+                face_fallback.push(lab);
+            } else if b_val >= 128 && f_val < 32 {
+                body_samples.push(lab);
+            }
+        }
+    }
+
+    let face_list = if face_samples.len() >= 40 {
+        face_samples
+    } else {
+        face_fallback
+    };
+
+    let (Some(face_lab), Some(body_lab)) = (trimmed_mean_lab(face_list), trimmed_mean_lab(body_samples))
+    else {
+        return SkinToneMatchResult {
+            found: false,
+            face_count,
+            ..Default::default()
+        };
+    };
+
+    let delta_l = face_lab[0] - body_lab[0];
+    let delta_a = face_lab[1] - body_lab[1];
+    let delta_b = face_lab[2] - body_lab[2];
+    let chroma_face = face_lab[1].hypot(face_lab[2]);
+    let chroma_body = body_lab[1].hypot(body_lab[2]);
+
+    SkinToneMatchResult {
+        found: true,
+        temperature: (delta_b * 0.45).clamp(-25.0, 25.0),
+        tint: (delta_a * 0.45).clamp(-25.0, 25.0),
+        saturation: ((chroma_face / chroma_body.max(4.0) - 1.0) * 35.0).clamp(-20.0, 20.0),
+        exposure: (delta_l / 28.0).clamp(-0.65, 0.65),
+        face_count,
+    }
+}
+
 pub fn compose_face_mask(
     image: &DynamicImage,
     analysis: &FaceAnalysis,
     parts: &[FacePart],
+    person_index: Option<usize>,
 ) -> GrayImage {
     let (width, height) = image.dimensions();
     let mut mask = GrayImage::new(width, height);
+    if parts.is_empty() || analysis.faces.is_empty() {
+        return mask;
+    }
+    if let Some(idx) = person_index
+        && idx >= analysis.faces.len()
+    {
+        return mask;
+    }
+
     if parts.contains(&FacePart::BodySkin) {
         let scale = (BODY_WORK_SIZE / width.max(height) as f32).min(1.0);
         let w = ((width as f32 * scale).round() as usize).max(1);
         let h = ((height as f32 * scale).round() as usize).max(1);
         let mut body = vec![0.0; w * h];
-        for (frame, grid) in &analysis.body {
+        let body_slices: Vec<&(FaceFrame, Vec<f32>)> = match person_index {
+            Some(idx) => analysis.body.get(idx).into_iter().collect(),
+            None => analysis.body.iter().collect(),
+        };
+        for (frame, grid) in body_slices {
             maximum(
                 &mut body,
                 &segment_probabilities(frame, grid, w, h, 0, 0, scale),
@@ -804,13 +1065,16 @@ pub fn compose_face_mask(
     if parts.iter().all(|&part| part == FacePart::BodySkin) {
         return mask;
     }
-    let regions: Vec<_> = analysis
-        .faces
+
+    let selected_faces: Vec<&DetectedFace> = match person_index {
+        Some(idx) => analysis.faces.get(idx).into_iter().collect(),
+        None => analysis.faces.iter().collect(),
+    };
+    let regions: Vec<_> = selected_faces
         .iter()
         .map(|face| face_region(face, width, height))
         .collect();
-    let face_masks: Vec<GrayImage> = analysis
-        .faces
+    let face_masks: Vec<GrayImage> = selected_faces
         .par_iter()
         .zip(&regions)
         .map(|(face, &region)| face_parts_mask(image, face, parts, region))
@@ -822,4 +1086,43 @@ pub fn compose_face_mask(
         }
     }
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skin_tone_match_computes_expected_warmth_and_exposure_delta() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut rgb = RgbImage::new(w, h);
+        let mut face_mask = GrayImage::new(w, h);
+        let mut body_mask = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                if y < 32 {
+                    // Warmer brighter face skin
+                    rgb.put_pixel(x, y, image::Rgb([210, 165, 130]));
+                    face_mask.put_pixel(x, y, Luma([255]));
+                } else {
+                    // Cooler darker neck/arm skin
+                    rgb.put_pixel(x, y, image::Rgb([165, 135, 125]));
+                    body_mask.put_pixel(x, y, Luma([255]));
+                }
+            }
+        }
+        let img = DynamicImage::ImageRgb8(rgb);
+        let res = compute_skin_delta_from_masks(&img, &face_mask, &body_mask, 1);
+        assert!(res.found);
+        assert_eq!(res.face_count, 1);
+        assert!(res.exposure > 0.1, "expected positive exposure delta, got {}", res.exposure);
+        assert!(res.temperature > 2.0, "expected positive warmth delta, got {}", res.temperature);
+    }
+
+    #[test]
+    fn face_part_ids_include_under_eye_and_skin_shine() {
+        assert_eq!(FacePart::from_id("underEye"), Some(FacePart::UnderEye));
+        assert_eq!(FacePart::from_id("skinShine"), Some(FacePart::SkinShine));
+    }
 }

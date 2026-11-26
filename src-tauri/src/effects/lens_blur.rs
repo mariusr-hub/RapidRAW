@@ -505,3 +505,134 @@ pub fn encode(enc: &mut ComputeEncoder, job: &LensBlur, src: &Slot, dst: &Slot) 
         },
     );
 }
+
+/// Fuses an AI depth map with a foreground/subject matte (`BiRefNet`),
+/// snapping high-confidence foreground (`matte > 0.85`) toward subject median depth and applying
+/// joint bilateral edge guidance across the transition band (`0.15 < matte <= 0.85`).
+pub fn fuse_depth_with_foreground_matte(
+    depth: &mut GrayImage,
+    matte: &GrayImage,
+    guide_rgb: &image::DynamicImage,
+) {
+    let (w, h) = depth.dimensions();
+    if w < 4 || h < 4 {
+        return;
+    }
+
+    let resized_matte: std::borrow::Cow<'_, GrayImage> = if matte.dimensions() != (w, h) {
+        std::borrow::Cow::Owned(image::imageops::resize(
+            matte,
+            w,
+            h,
+            image::imageops::FilterType::Triangle,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(matte)
+    };
+
+    let guide = guide_rgb
+        .resize_exact(w, h, image::imageops::FilterType::Triangle)
+        .to_rgb8();
+    let depth_raw = depth.as_raw();
+    let matte_raw = resized_matte.as_raw();
+
+    let mut fg_depths: Vec<u8> = depth_raw
+        .iter()
+        .zip(matte_raw.iter())
+        .filter_map(|(&d, &m)| ((m as f32 / 255.0) > 0.85).then_some(d))
+        .collect();
+    if fg_depths.len() < 16 {
+        return;
+    }
+    fg_depths.sort_unstable();
+    let median_fg = fg_depths[fg_depths.len() / 2] as f32;
+
+    let mut snapped = vec![0.0f32; (w * h) as usize];
+    for i in 0..(w * h) as usize {
+        let m = matte_raw[i] as f32 / 255.0;
+        let d = depth_raw[i] as f32;
+        if m > 0.85 {
+            let blend = ((m - 0.85) / 0.05).clamp(0.0, 1.0);
+            snapped[i] = d * (1.0 - blend) + median_fg * blend;
+        } else {
+            snapped[i] = d;
+        }
+    }
+
+    let guide_raw = guide.as_raw();
+    let luma: Vec<f32> = guide_raw
+        .chunks_exact(3)
+        .map(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32)
+        .collect();
+
+    let mut out = snapped.clone();
+    const RADIUS: i32 = 3;
+    const INV_2_SPATIAL2: f32 = 1.0 / (2.0 * 3.0 * 3.0);
+    const INV_2_RANGE2: f32 = 1.0 / (2.0 * 24.0 * 24.0);
+
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let idx = (y as u32 * w + x as u32) as usize;
+            let m = matte_raw[idx] as f32 / 255.0;
+            if m <= 0.15 || m > 0.85 {
+                continue;
+            }
+            let lc = luma[idx];
+            let mut sum = 0.0f32;
+            let mut w_sum = 0.0f32;
+            for dy in -RADIUS..=RADIUS {
+                let yy = (y + dy).clamp(0, h as i32 - 1) as u32;
+                for dx in -RADIUS..=RADIUS {
+                    let xx = (x + dx).clamp(0, w as i32 - 1) as u32;
+                    let nidx = (yy * w + xx) as usize;
+                    let dl = luma[nidx] - lc;
+                    let ds2 = (dx * dx + dy * dy) as f32;
+                    let wt = (-ds2 * INV_2_SPATIAL2 - (dl * dl) * INV_2_RANGE2).exp();
+                    sum += snapped[nidx] * wt;
+                    w_sum += wt;
+                }
+            }
+            if w_sum > 1e-6 {
+                out[idx] = sum / w_sum;
+            }
+        }
+    }
+
+    for (dst, &val) in depth.as_mut().iter_mut().zip(out.iter()) {
+        *dst = val.round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuse_depth_snaps_foreground_and_preserves_edges() {
+        let w = 24u32;
+        let h = 24u32;
+        let mut depth = GrayImage::new(w, h);
+        let mut matte = GrayImage::new(w, h);
+        let mut rgb = image::RgbImage::new(w, h);
+
+        for y in 0..h {
+            for x in 0..w {
+                if x < 12 {
+                    depth.put_pixel(x, y, image::Luma([if (x + y) % 2 == 0 { 205 } else { 215 }]));
+                    matte.put_pixel(x, y, image::Luma([if x >= 10 { 140 } else { 245 }]));
+                    rgb.put_pixel(x, y, image::Rgb([220, 180, 150]));
+                } else {
+                    depth.put_pixel(x, y, image::Luma([40]));
+                    matte.put_pixel(x, y, image::Luma([if x <= 13 { 90 } else { 5 }]));
+                    rgb.put_pixel(x, y, image::Rgb([30, 50, 80]));
+                }
+            }
+        }
+
+        fuse_depth_with_foreground_matte(&mut depth, &matte, &image::DynamicImage::ImageRgb8(rgb));
+        let fg_val = depth.get_pixel(3, 12)[0];
+        assert!((204..=216).contains(&fg_val), "fg_val={fg_val}");
+        let bg_val = depth.get_pixel(20, 12)[0];
+        assert!(bg_val < 50, "bg_val={bg_val}");
+    }
+}

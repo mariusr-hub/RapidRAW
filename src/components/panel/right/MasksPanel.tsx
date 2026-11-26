@@ -40,8 +40,10 @@ import {
   SquaresIntersect,
   X,
   CloudSun,
+  Palette,
+  Sparkles,
 } from 'lucide-react';
-import { Invokes } from '../../../types/invokes';
+import { Invokes, SkinToneMatchResult } from '../../../types/invokes';
 
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import Switch from '../../ui/Switch';
@@ -89,7 +91,7 @@ import { TEXT_COLOR_KEYS, TextColors, TextVariants, TextWeights } from '../../..
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { selectAiModelDownloadStatus, useProcessStore } from '../../../store/useProcessStore';
-import { useAiMasking } from '../../../hooks/useAiMasking';
+import { getTransformAdjustments, useAiMasking } from '../../../hooks/useAiMasking';
 import { useEditorActions } from '../../../hooks/useEditorActions';
 import { isPanelVisible, useUIStore } from '../../../store/useUIStore';
 import { useWaveformControls } from '../../../hooks/useWaveformControls';
@@ -1227,6 +1229,8 @@ export default function MasksPanel() {
                       handleGenerateAiFaceMask={handleGenerateAiFaceMask}
                       handleCancelAiTask={handleCancelAiTask}
                       activeAiTasks={activeAiTasks}
+                      onSelectContainer={onSelectContainer}
+                      onSelectMask={onSelectMask}
                     />
                   </motion.div>
                 )}
@@ -1913,6 +1917,14 @@ function SubMaskRow({
   );
 }
 
+const PORTRAIT_PRO_SPECS = [
+  { name: 'Skin Soften', parts: ['faceSkin', 'bodySkin'], opacity: 85, adj: { texture: -18, clarity: -12 } },
+  { name: 'Under-Eye', parts: ['underEye'], opacity: 75, adj: { exposure: 0.25, shadows: 14, saturation: -8 } },
+  { name: 'Eye Pop', parts: ['iris', 'eyeWhites'], opacity: 80, adj: { exposure: 0.15, clarity: 16, texture: 12, vibrance: 10 } },
+  { name: 'Teeth / Lips', parts: ['teeth', 'lips'], opacity: 70, adj: { exposure: 0.12, vibrance: 12 } },
+  { name: 'Shine Control', parts: ['skinShine'], opacity: 80, adj: { highlights: -26, whites: -14 } },
+] as const;
+
 function SettingsPanel({
   container,
   activeSubMask,
@@ -1936,13 +1948,201 @@ function SettingsPanel({
   handleGenerateAiFaceMask,
   handleCancelAiTask,
   activeAiTasks,
+  onSelectContainer,
+  onSelectMask,
 }: any) {
   const { t } = useTranslation();
   const { showContextMenu } = useContextMenu();
+  const maskOverlayMode = useUIStore((s) => s.maskOverlayMode);
+  const setUI = useUIStore((s) => s.setUI);
   const isActive = !!container;
   const presetButtonRef = useRef<HTMLButtonElement>(null);
   const faceMaskTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [textPrompt, setTextPrompt] = useState(activeSubMask?.parameters?.prompt || '');
+  const [isRunningPortraitPro, setIsRunningPortraitPro] = useState(false);
+
+  const invokeFaceMask = async (parts: ReadonlyArray<string>, personIndex: number | null) => {
+    const { selectedImage, adjustments } = useEditorStore.getState();
+    if (!selectedImage?.path) return null;
+    const { noResult, ...params } = await invoke<Record<string, unknown>>(Invokes.GenerateAiFaceMask, {
+      jsAdjustments: getTransformAdjustments(adjustments),
+      path: selectedImage.path,
+      parts: [...parts],
+      personIndex,
+      flipHorizontal: adjustments.flipHorizontal,
+      flipVertical: adjustments.flipVertical,
+      orientationSteps: adjustments.orientationSteps,
+      rotation: adjustments.rotation,
+      taskId: null,
+    });
+    if (noResult) return null;
+    return params;
+  };
+
+  const handleAdaptivePortraitEnhance = async () => {
+    const { selectedImage } = useEditorStore.getState();
+    if (!selectedImage?.path || isRunningPortraitPro) return;
+    const personIndex: number | null = activeSubMask?.parameters?.personIndex ?? null;
+    setIsRunningPortraitPro(true);
+    try {
+      const results = await Promise.allSettled(
+        PORTRAIT_PRO_SPECS.map((spec) => invokeFaceMask(spec.parts, personIndex)),
+      );
+      const created: Array<MaskContainer> = [];
+      PORTRAIT_PRO_SPECS.forEach((spec, idx) => {
+        const res = results[idx];
+        if (res.status !== 'fulfilled' || !res.value?.maskDataBase64) return;
+        const subMask = createSubMask(Mask.AiFace, { width: 1000, height: 1000 });
+        subMask.parameters = { ...subMask.parameters, ...res.value, personIndex };
+        created.push({
+          ...INITIAL_MASK_CONTAINER,
+          id: uuidv4(),
+          name: spec.name,
+          opacity: spec.opacity,
+          adjustments: {
+            ...INITIAL_MASK_ADJUSTMENTS,
+            ...spec.adj,
+            activeTools: setToolActive(getActiveTools(INITIAL_MASK_ADJUSTMENTS), 'basic', true),
+          } as any,
+          subMasks: [subMask],
+        });
+      });
+
+      if (created.length === 0) {
+        toast.info(t('editor.masks.settings.noFacesInfo', 'No faces detected in this photo.'));
+        return;
+      }
+
+      setAdjustments(
+        (prev: Adjustments) => ({
+          ...prev,
+          masks: [...(prev.masks || []), ...created],
+        }),
+        'Adaptive Portrait Enhance',
+      );
+      onSelectContainer?.(created[0].id);
+      onSelectMask?.(null);
+      toast.success(
+        t('editor.masks.settings.portraitEnhanceApplied', {
+          count: created.length,
+          defaultValue: `Created ${created.length} Adaptive Portrait layer(s).`,
+        }),
+      );
+    } catch (err) {
+      toast.error(`Adaptive Portrait Enhance failed: ${String(err)}`);
+    } finally {
+      setIsRunningPortraitPro(false);
+    }
+  };
+
+  const handleMatchBodySkin = async () => {
+    const { selectedImage, adjustments } = useEditorStore.getState();
+    if (!selectedImage?.path || isRunningPortraitPro) return;
+    const personIndex: number | null = activeSubMask?.parameters?.personIndex ?? null;
+    setIsRunningPortraitPro(true);
+    try {
+      const match = await invoke<SkinToneMatchResult>(Invokes.MatchBodyToFaceSkin, {
+        jsAdjustments: getTransformAdjustments(adjustments),
+        path: selectedImage.path,
+        personIndex,
+        rotation: adjustments.rotation,
+        flipHorizontal: adjustments.flipHorizontal,
+        flipVertical: adjustments.flipVertical,
+        orientationSteps: adjustments.orientationSteps,
+        taskId: null,
+      });
+      if (!match?.found) {
+        toast.info(
+          t(
+            'editor.masks.settings.matchBodySkinEmpty',
+            'Needs both face skin and visible neck or body skin to match skin tone.',
+          ),
+        );
+        return;
+      }
+
+      const existingBody = adjustments.masks?.find((m) =>
+        m.subMasks.some(
+          (sm) =>
+            sm.type === Mask.AiFace &&
+            sm.parameters?.parts?.includes('bodySkin') &&
+            (sm.parameters?.personIndex ?? null) === personIndex,
+        ),
+      );
+
+      let newContainer: MaskContainer | null = null;
+      if (!existingBody) {
+        const params = await invokeFaceMask(['bodySkin'], personIndex);
+        if (!params?.maskDataBase64) {
+          toast.info(
+            t(
+              'editor.masks.settings.matchBodySkinEmpty',
+              'Needs both face skin and visible neck or body skin to match skin tone.',
+            ),
+          );
+          return;
+        }
+        const subMask = createSubMask(Mask.AiFace, { width: 1000, height: 1000 });
+        subMask.parameters = { ...subMask.parameters, ...params, personIndex };
+        newContainer = {
+          ...INITIAL_MASK_CONTAINER,
+          id: uuidv4(),
+          name: 'Match Body Skin',
+          opacity: 85,
+          adjustments: INITIAL_MASK_ADJUSTMENTS as any,
+          subMasks: [subMask],
+        };
+      }
+
+      const tonePatch = {
+        temperature: Math.round(match.temperature),
+        tint: Math.round(match.tint),
+        saturation: Math.round(match.saturation),
+        exposure: Number(match.exposure.toFixed(2)),
+      };
+
+      setAdjustments(
+        (prev: Adjustments) => ({
+          ...prev,
+          masks: newContainer
+            ? [
+                ...(prev.masks || []),
+                {
+                  ...newContainer,
+                  adjustments: {
+                    ...newContainer.adjustments,
+                    ...tonePatch,
+                    activeTools: setToolActive(getActiveTools(newContainer.adjustments), 'basic', true),
+                  } as any,
+                },
+              ]
+            : (prev.masks || []).map((m) =>
+                m.id === existingBody?.id
+                  ? {
+                      ...m,
+                      adjustments: {
+                        ...m.adjustments,
+                        ...tonePatch,
+                        activeTools: setToolActive(getActiveTools(m.adjustments), 'basic', true),
+                      } as any,
+                    }
+                  : m,
+              ),
+        }),
+        'Match Body Skin',
+      );
+      const targetId = newContainer ? newContainer.id : existingBody?.id;
+      if (targetId) {
+        onSelectContainer?.(targetId);
+        onSelectMask?.(null);
+      }
+      toast.success(t('editor.masks.settings.matchBodySkinApplied', 'Matched body skin tone to face.'));
+    } catch (err) {
+      toast.error(`Match Body Skin failed: ${String(err)}`);
+    } finally {
+      setIsRunningPortraitPro(false);
+    }
+  };
 
   useEffect(() => {
     setTextPrompt(activeSubMask?.parameters?.prompt || '');
@@ -2112,6 +2312,8 @@ function SettingsPanel({
   };
   const isTextMaskRunning = isTextMask && Boolean(activeAiTasks?.[activeSubMask.id]);
   const faceParts: Array<string> = activeSubMask?.parameters?.parts || [];
+  const facePersonIndex: number | null = activeSubMask?.parameters?.personIndex ?? null;
+  const faceCount: number = activeSubMask?.parameters?.faceCount ?? 0;
 
   const handleToggleFacePart = (part: string) => {
     if (!isActive || !isFaceMask) return;
@@ -2122,7 +2324,25 @@ function SettingsPanel({
     });
     clearTimeout(faceMaskTimeoutRef.current);
     if (parts.length > 0) {
-      faceMaskTimeoutRef.current = setTimeout(() => handleGenerateAiFaceMask(subMaskId, parts), FACE_MASK_DELAY_MS);
+      faceMaskTimeoutRef.current = setTimeout(
+        () => handleGenerateAiFaceMask(subMaskId, parts, facePersonIndex),
+        FACE_MASK_DELAY_MS,
+      );
+    }
+  };
+
+  const handleSelectFacePerson = (nextPerson: number | null) => {
+    if (!isActive || !isFaceMask) return;
+    const subMaskId = activeSubMask.id;
+    updateSubMask(subMaskId, {
+      parameters: { ...activeSubMask.parameters, personIndex: nextPerson },
+    });
+    clearTimeout(faceMaskTimeoutRef.current);
+    if (faceParts.length > 0) {
+      faceMaskTimeoutRef.current = setTimeout(
+        () => handleGenerateAiFaceMask(subMaskId, faceParts, nextPerson),
+        80,
+      );
     }
   };
 
@@ -2353,6 +2573,58 @@ function SettingsPanel({
                   </button>
                 ))}
               </div>
+              {faceCount > 1 && (
+                <div className="flex flex-wrap items-center gap-1 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => handleSelectFacePerson(null)}
+                    className={clsx(
+                      'px-2 py-1 text-[11px] rounded-md transition-colors cursor-pointer',
+                      facePersonIndex === null
+                        ? 'bg-accent text-button-text font-medium'
+                        : 'bg-bg-primary text-text-secondary hover:bg-card-active hover:text-text-primary',
+                    )}
+                  >
+                    {t('editor.masks.settings.allPeople', 'All')}
+                  </button>
+                  {Array.from({ length: faceCount }, (_, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => handleSelectFacePerson(idx)}
+                      className={clsx(
+                        'px-2 py-1 text-[11px] rounded-md transition-colors cursor-pointer font-mono',
+                        facePersonIndex === idx
+                          ? 'bg-accent text-button-text font-medium'
+                          : 'bg-bg-primary text-text-secondary hover:bg-card-active hover:text-text-primary',
+                      )}
+                    >
+                      {`#${idx + 1}`}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-1.5 pt-1">
+                <Button
+                  size="sm"
+                  disabled={isRunningPortraitPro}
+                  onClick={handleAdaptivePortraitEnhance}
+                  className="text-[11px] flex items-center justify-center gap-1.5"
+                >
+                  {isRunningPortraitPro ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                  <span className="truncate">{t('editor.masks.settings.adaptivePortraitEnhance')}</span>
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={isRunningPortraitPro}
+                  onClick={handleMatchBodySkin}
+                  className="text-[11px] flex items-center justify-center gap-1.5"
+                >
+                  {isRunningPortraitPro ? <Loader2 size={12} className="animate-spin" /> : <Palette size={12} />}
+                  <span className="truncate">{t('editor.masks.settings.matchBodySkin')}</span>
+                </Button>
+              </div>
             </>
           )}
 
@@ -2441,6 +2713,74 @@ function SettingsPanel({
             fillOrigin="min"
             onDragStateChange={onDragStateChange}
           />
+
+          {!isComponentMode && (
+            <>
+              <Slider
+                defaultValue={0}
+                label={t('editor.masks.settings.feather', 'Feather')}
+                max={100}
+                min={0}
+                value={displayContainer.feather ?? 0}
+                onChange={(e: any) => handleMaskPropertyChange('feather', Number(e.target.value))}
+                step={1}
+                fillOrigin="min"
+                onDragStateChange={onDragStateChange}
+              />
+
+              <Slider
+                defaultValue={0}
+                label={t('editor.masks.settings.expand', 'Expand / Contract')}
+                max={100}
+                min={-100}
+                value={displayContainer.expand ?? 0}
+                onChange={(e: any) => handleMaskPropertyChange('expand', Number(e.target.value))}
+                step={1}
+                onDragStateChange={onDragStateChange}
+              />
+
+              <Slider
+                defaultValue={0}
+                label={t('editor.masks.settings.contrast', 'Mask Contrast')}
+                max={100}
+                min={-100}
+                value={displayContainer.contrast ?? 0}
+                onChange={(e: any) => handleMaskPropertyChange('contrast', Number(e.target.value))}
+                step={1}
+                onDragStateChange={onDragStateChange}
+              />
+
+              <div className="flex items-center justify-between gap-2">
+                <Text variant={TextVariants.label} className="select-none shrink-0">
+                  {t('editor.masks.settings.overlayMode', 'Overlay')}
+                </Text>
+                <div className="flex items-center gap-1 rounded-md bg-bg-primary p-0.5 border border-surface">
+                  {(
+                    [
+                      { id: 'red', label: 'Red' },
+                      { id: 'green', label: 'Green' },
+                      { id: 'bw', label: 'B&W' },
+                      { id: 'unmasked', label: 'Unmasked' },
+                    ] as const
+                  ).map((mode) => (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      onClick={() => setUI({ maskOverlayMode: mode.id })}
+                      className={clsx(
+                        'px-1.5 py-0.5 text-[10px] rounded transition-colors cursor-pointer',
+                        maskOverlayMode === mode.id
+                          ? 'bg-accent text-button-text font-medium'
+                          : 'text-text-secondary hover:text-text-primary',
+                      )}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
 
           {isComponentMode && (
             <>

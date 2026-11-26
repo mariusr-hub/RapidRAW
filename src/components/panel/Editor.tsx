@@ -1599,10 +1599,13 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
       const strippedMaskDef = structuredClone(maskDef);
       stripSubMasks(strippedMaskDef.subMasks);
 
+      const { maskOverlayMode } = useUIStore.getState();
+
       const buffer: ArrayBuffer = await invoke(Invokes.GenerateMaskOverlay, {
         cropOffset,
         height: overlayView.height,
         maskDef: strippedMaskDef,
+        overlayMode: maskOverlayMode,
         scale: overlayView.scale,
         width: overlayView.width,
         jsAdjustments: strippedAdjustments,
@@ -2050,6 +2053,8 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     imageRenderSize.height,
   ]);
 
+  const maskOverlayMode = useUIStore((state) => state.maskOverlayMode);
+
   useEffect(() => {
     let maskDefForOverlay = null;
 
@@ -2080,6 +2085,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     activeMaskContainerId,
     activeAiPatchContainerId,
     imageRenderSize,
+    maskOverlayMode,
   ]);
 
   useEffect(() => {

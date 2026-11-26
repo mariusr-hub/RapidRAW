@@ -2391,5 +2391,334 @@ mod tests {
         assert!(should_route_defect_to_lama(5.0, 0.12, "dust"));
         assert!(should_route_defect_to_lama(6.0, 0.01, "scratch"));
     }
+
+    #[test]
+    fn portrait_blemish_detector_gates_protected_zones_and_rejects_freckle_grids() {
+        let (w, h) = (128u32, 128u32);
+        let mut rgb = RgbImage::from_pixel(w, h, Rgb([205, 165, 145]));
+        let skin = image::GrayImage::from_pixel(w, h, image::Luma([255]));
+        let mut protected = image::GrayImage::new(w, h);
+        // Protect left half (eyes/lips proxy)
+        for y in 40..70 {
+            for x in 20..50 {
+                protected.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        // Pimple inside protected zone (must be ignored)
+        for dy in -3i32..=3 {
+            for dx in -3i32..=3 {
+                if dx * dx + dy * dy <= 9 {
+                    rgb.put_pixel((35 + dx) as u32, (55 + dy) as u32, Rgb([195, 90, 90]));
+                }
+            }
+        }
+        // Isolated red blemish in clean skin at (92, 64) (must be detected)
+        for dy in -3i32..=3 {
+            for dx in -3i32..=3 {
+                if dx * dx + dy * dy <= 9 {
+                    rgb.put_pixel((92 + dx) as u32, (64 + dy) as u32, Rgb([205, 95, 95]));
+                }
+            }
+        }
+        let spots = detect_portrait_blemishes(&DynamicImage::ImageRgb8(rgb), &skin, &protected);
+        assert!(
+            spots.iter().any(|s| (s.x - 92.0).abs() < 6.0 && (s.y - 64.0).abs() < 6.0),
+            "expected isolated skin blemish near (92, 64), got {:?}",
+            spots
+        );
+        assert!(
+            !spots.iter().any(|s| (s.x - 35.0).abs() < 8.0 && (s.y - 55.0).abs() < 8.0),
+            "protected zone mark must be excluded: {:?}",
+            spots
+        );
+    }
+}
+
+fn srgb_pixel_to_oklab(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let lin = |u: u8| -> f32 {
+        let s = u as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (lr, lg, lb) = (lin(r), lin(g), lin(b));
+    let l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
+    let m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
+    let s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
+    let (l_, m_, s_) = (l.max(0.0).cbrt(), m.max(0.0).cbrt(), s.max(0.0).cbrt());
+    let ok_l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    let ok_a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    let ok_b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+    (ok_l, ok_a, ok_b)
+}
+
+fn box_mean_map(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    let stride = w + 1;
+    let mut sat = vec![0.0f64; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut row_sum = 0.0f64;
+        for x in 0..w {
+            row_sum += src[y * w + x] as f64;
+            sat[(y + 1) * stride + (x + 1)] = sat[y * stride + (x + 1)] + row_sum;
+        }
+    }
+    let mut out = vec![0.0f32; w * h];
+    for y in 0..h {
+        let y0 = y.saturating_sub(radius);
+        let y1 = (y + radius + 1).min(h);
+        for x in 0..w {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius + 1).min(w);
+            let area = ((y1 - y0) * (x1 - x0)).max(1) as f64;
+            let sum = sat[y1 * stride + x1] - sat[y0 * stride + x1] - sat[y1 * stride + x0]
+                + sat[y0 * stride + x0];
+            out[y * w + x] = (sum / area) as f32;
+        }
+    }
+    out
+}
+
+/// Detects compact portrait skin blemishes (2-14 px OKLab redness/luminance DoG peaks) strictly
+/// gated inside `skin_mask` outside `protected_mask`, rejecting dense freckle distributions.
+pub fn detect_portrait_blemishes(
+    image: &DynamicImage,
+    skin_mask: &image::GrayImage,
+    protected_mask: &image::GrayImage,
+) -> Vec<DetectedSpot> {
+    let (orig_w, orig_h) = image.dimensions();
+    if orig_w < 16 || orig_h < 16 {
+        return Vec::new();
+    }
+    let max_dim = orig_w.max(orig_h);
+    let scale = if max_dim > 1600 {
+        1600.0 / max_dim as f32
+    } else {
+        1.0
+    };
+    let aw = ((orig_w as f32 * scale).round() as u32).max(16);
+    let ah = ((orig_h as f32 * scale).round() as u32).max(16);
+
+    let analysis_rgb: image::RgbImage = if (aw, ah) == (orig_w, orig_h) {
+        image.to_rgb8()
+    } else {
+        image
+            .resize_exact(aw, ah, image::imageops::FilterType::Triangle)
+            .to_rgb8()
+    };
+    let skin = if skin_mask.dimensions() == (aw, ah) {
+        Cow::Borrowed(skin_mask)
+    } else {
+        Cow::Owned(image::imageops::resize(skin_mask, aw, ah, image::imageops::FilterType::Triangle))
+    };
+    let prot = if protected_mask.dimensions() == (aw, ah) {
+        Cow::Borrowed(protected_mask)
+    } else {
+        Cow::Owned(image::imageops::resize(protected_mask, aw, ah, image::imageops::FilterType::Triangle))
+    };
+
+    let (w, h) = (aw as usize, ah as usize);
+    let mut ch_l = Vec::with_capacity(w * h);
+    let mut ch_a = Vec::with_capacity(w * h);
+    for px in analysis_rgb.as_raw().chunks_exact(3) {
+        let (ok_l, ok_a, _) = srgb_pixel_to_oklab(px[0], px[1], px[2]);
+        ch_l.push(ok_l);
+        ch_a.push(ok_a);
+    }
+
+    let l_small = box_mean_map(&ch_l, w, h, 2);
+    let l_large = box_mean_map(&ch_l, w, h, 8);
+    let a_small = box_mean_map(&ch_a, w, h, 2);
+    let a_large = box_mean_map(&ch_a, w, h, 8);
+
+    let skin_raw = skin.as_raw();
+    let prot_raw = prot.as_raw();
+    let mut scores = vec![0.0f32; w * h];
+    let mut skin_scores = Vec::new();
+    for i in 0..(w * h) {
+        if skin_raw[i] >= 128 && prot_raw[i] < 48 {
+            let da = (a_small[i] - a_large[i]).max(0.0);
+            let dl = (l_small[i] - l_large[i]).abs();
+            let s = da * 2.4 + dl * 1.4;
+            scores[i] = s;
+            skin_scores.push(s);
+        }
+    }
+    if skin_scores.len() < 32 {
+        return Vec::new();
+    }
+    let mid = skin_scores.len() / 2;
+    let (_, median_val, _) = skin_scores.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let median = *median_val;
+    let mut abs_devs: Vec<f32> = skin_scores.iter().map(|&v| (v - median).abs()).collect();
+    let (_, mad_val, _) = abs_devs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let mad = (*mad_val * 1.4826).max(0.004);
+    let thresh = (median + 4.5 * mad).max(0.055);
+
+    let mut raw_peaks: Vec<(usize, usize, f32, f32)> = Vec::new();
+    for y in 4..h.saturating_sub(4) {
+        for x in 4..w.saturating_sub(4) {
+            let idx = y * w + x;
+            let val = scores[idx];
+            if val < thresh {
+                continue;
+            }
+            let mut is_max = true;
+            'nms: for ny in (y - 3)..=(y + 3) {
+                for nx in (x - 3)..=(x + 3) {
+                    if (nx != x || ny != y) && scores[ny * w + nx] > val {
+                        is_max = false;
+                        break 'nms;
+                    }
+                }
+            }
+            if is_max {
+                // Estimate compact radius where response stays > 40% of peak (clamped 2..14 px)
+                let half = val * 0.4;
+                let mut r_est = 3usize;
+                for r in 2..=12 {
+                    let s_r = scores.get(y * w + (x + r).min(w - 1)).copied().unwrap_or(0.0)
+                        + scores.get((y + r).min(h - 1) * w + x).copied().unwrap_or(0.0);
+                    if s_r * 0.5 < half {
+                        r_est = r;
+                        break;
+                    }
+                    r_est = r;
+                }
+                let radius = (r_est as f32 / scale).clamp(2.0, 14.0);
+                raw_peaks.push((x, y, val, radius));
+            }
+        }
+    }
+
+    // Reject dense uniform freckle distributions (> 6 neighbors within 24 px)
+    raw_peaks.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let mut kept = Vec::new();
+    for &(px, py, _val, radius) in &raw_peaks {
+        let nearby = raw_peaks
+            .iter()
+            .filter(|&&(qx, qy, _, _)| {
+                let dx = px as f32 - qx as f32;
+                let dy = py as f32 - qy as f32;
+                let d2 = dx * dx + dy * dy;
+                d2 > 0.0 && d2 <= 24.0 * 24.0
+            })
+            .count();
+        if nearby > 6 {
+            continue;
+        }
+        let full_x = (px as f32 / scale).clamp(0.0, (orig_w - 1) as f32);
+        let full_y = (py as f32 / scale).clamp(0.0, (orig_h - 1) as f32);
+        let routing = if radius >= 8.0 {
+            "lama".to_string()
+        } else {
+            "analytical".to_string()
+        };
+        kept.push(DetectedSpot {
+            x: full_x,
+            y: full_y,
+            radius,
+            norm_x: full_x / orig_w as f32,
+            norm_y: full_y / orig_h as f32,
+            kind: "blemish".to_string(),
+            end_x: None,
+            end_y: None,
+            norm_end_x: None,
+            norm_end_y: None,
+            points: Vec::new(),
+            routing,
+        });
+        if kept.len() >= 48 {
+            break;
+        }
+    }
+    kept
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn scan_portrait_blemishes(
+    js_adjustments: serde_json::Value,
+    path: String,
+    rotation: f32,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    orientation_steps: u8,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<AutoDefectRepairResult, String> {
+    let models = crate::ai::models::get_or_init_ai_models(
+        &app_handle,
+        &state.ai_state,
+        &state.ai_init_lock,
+        crate::ai::models::AiMaskModel::Face,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let warped_image = crate::render::preview::get_cached_full_warped_image(&state, &js_adjustments)?;
+    let transform = crate::ai::commands::MaskTransform {
+        rotation,
+        flip_horizontal,
+        flip_vertical,
+        orientation_steps,
+    };
+    let cache_key = crate::ai::commands::ai_cache_key(&path, &js_adjustments);
+    let analysis = crate::ai::commands::cached_face_analysis(
+        &state.ai_state,
+        &models,
+        &cache_key,
+        &warped_image,
+        transform,
+    )?;
+
+    if analysis.faces.is_empty() {
+        return Ok(AutoDefectRepairResult {
+            spots: Vec::new(),
+            total_detected: 0,
+            message: "No faces detected for portrait blemish scan.".to_string(),
+        });
+    }
+
+    let spots = tokio::task::spawn_blocking(move || {
+        use crate::masks::face::{FacePart, compose_face_mask};
+        use crate::masks::morphology::grayscale_dilate;
+
+        let skin_mask = compose_face_mask(
+            &warped_image,
+            &analysis,
+            &[FacePart::FaceSkin, FacePart::BodySkin],
+            None,
+        );
+        let features = compose_face_mask(
+            &warped_image,
+            &analysis,
+            &[
+                FacePart::Iris,
+                FacePart::EyeWhites,
+                FacePart::Eyebrows,
+                FacePart::Lips,
+                FacePart::Nose,
+            ],
+            None,
+        );
+        let protected = grayscale_dilate(&features, 4);
+        detect_portrait_blemishes(&warped_image, &skin_mask, &protected)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total_detected = spots.len();
+    let message = if total_detected == 0 {
+        "No portrait skin blemishes detected.".to_string()
+    } else {
+        format!("Detected {total_detected} portrait blemish(es).")
+    };
+    Ok(AutoDefectRepairResult {
+        spots,
+        total_detected,
+        message,
+    })
 }
 

@@ -487,6 +487,7 @@ export interface UIState {
   setCustomEscapeHandler: (handler: (() => void) | null) => void;
   imageSelectHandler: ((path: string, openInEditor?: boolean) => void) | null;
   setImageSelectHandler: (handler: ((path: string, openInEditor?: boolean) => void) | null) => void;
+  maskOverlayMode: 'red' | 'green' | 'bw' | 'unmasked';
   searchFocusRequest: number;
   requestSearchFocus: () => void;
   toggleFullScreen: () => void;
@@ -769,6 +770,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   setCustomEscapeHandler: (handler) => set({ customEscapeHandler: handler }),
   imageSelectHandler: null,
   setImageSelectHandler: (handler) => set({ imageSelectHandler: handler }),
+  maskOverlayMode: 'red',
   searchFocusRequest: 0,
   requestSearchFocus: () => set((state) => ({ searchFocusRequest: state.searchFocusRequest + 1 })),
 }));

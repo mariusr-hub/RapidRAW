@@ -229,10 +229,13 @@ function EffectsPanel({
   const setEditor = useEditorStore((state) => state.setEditor);
   const { showContextMenu } = useContextMenu();
 
-  const handleGenerateLensBlurDepthMap = async () => {
+  const handleGenerateLensBlurDepthMap = async (crispEdges?: boolean) => {
     setIsGeneratingDepth(true);
     try {
-      const b64: string = await invoke('generate_full_image_depth_map', { jsAdjustments: adjustments });
+      const b64: string = await invoke('generate_full_image_depth_map', {
+        jsAdjustments: adjustments,
+        crispEdges: crispEdges ?? null,
+      });
       setAdjustments((prev: Partial<Adjustments>) => ({
         ...prev,
         lensBlurDepthMap: b64,
@@ -729,6 +732,15 @@ function EffectsPanel({
                           onDragStateChange={onDragStateChange}
                         />
                       )}
+
+                      <button
+                        type="button"
+                        disabled={isGeneratingDepth}
+                        onClick={() => handleGenerateLensBlurDepthMap(true)}
+                        className="w-full py-1.5 px-2.5 text-[11px] font-medium rounded-md border border-accent/35 bg-accent/10 hover:bg-accent/20 text-text-primary transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        {t('adjustments.effects.crispSubjectEdges', 'Crisp Hair & Subject Edges (BiRefNet)')}
+                      </button>
 
                       <DepthRangePicker
                         minDepth={100 - (adjustments.lensBlurMaxDepth ?? 90)}

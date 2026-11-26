@@ -183,6 +183,9 @@ const maskChanges = (before: MaskContainer[] = [], after: MaskContainer[] = []):
     changes.push(...nestedChanges(name, prev.adjustments, mask.adjustments));
     if (!isSameValue(prev.subMasks, mask.subMasks)) changes.push(`${name}: Mask Area / Brush`);
     if (prev.opacity !== mask.opacity) changes.push(`${name}: Opacity ${mask.opacity}`);
+    if ((prev.feather ?? 0) !== (mask.feather ?? 0)) changes.push(`${name}: Feather ${mask.feather ?? 0}`);
+    if ((prev.expand ?? 0) !== (mask.expand ?? 0)) changes.push(`${name}: Expand ${mask.expand ?? 0}`);
+    if ((prev.contrast ?? 0) !== (mask.contrast ?? 0)) changes.push(`${name}: Contrast ${mask.contrast ?? 0}`);
     if (prev.invert !== mask.invert) changes.push(`${name}: Invert ${formatValue(mask.invert)}`);
     if (prev.visible !== mask.visible) changes.push(`${name}: Visible ${formatValue(mask.visible)}`);
     if (prev.name !== mask.name) changes.push(`Renamed Mask: ${name}`);

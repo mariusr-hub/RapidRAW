@@ -274,7 +274,7 @@ pub fn generate_text_mask(
     })
 }
 
-fn cached_face_analysis(
+pub(crate) fn cached_face_analysis(
     ai_state: &Mutex<Option<AiState>>,
     models: &AiModels,
     cache_key: &str,
@@ -323,6 +323,7 @@ pub fn generate_face_mask(
     cache_key: &str,
     warped_image: &DynamicImage,
     parts: &[String],
+    person_index: Option<usize>,
     transform: MaskTransform,
     ai_source: Option<String>,
 ) -> Result<AiFaceMaskParameters, String> {
@@ -330,11 +331,15 @@ pub fn generate_face_mask(
     if analysis.faces.is_empty() {
         return Err(NO_FACES_FOUND.to_string());
     }
+    let face_count = analysis.faces.len();
+    let effective_person = person_index.filter(|&idx| idx < face_count);
     let face_parts: Vec<FacePart> = parts.iter().filter_map(|p| FacePart::from_id(p)).collect();
-    let mask = compose_face_mask(warped_image, &analysis, &face_parts);
+    let mask = compose_face_mask(warped_image, &analysis, &face_parts, effective_person);
 
     Ok(AiFaceMaskParameters {
         parts: parts.to_vec(),
+        person_index: effective_person,
+        face_count: Some(face_count),
         mask_data_base64: Some(encode_to_base64_png(&mask)?),
         rotation: Some(transform.rotation),
         flip_horizontal: Some(transform.flip_horizontal),
@@ -705,6 +710,7 @@ pub async fn generate_ai_face_mask(
     js_adjustments: serde_json::Value,
     path: String,
     parts: Vec<String>,
+    person_index: Option<usize>,
     rotation: f32,
     flip_horizontal: bool,
     flip_vertical: bool,
@@ -743,6 +749,7 @@ pub async fn generate_ai_face_mask(
             &ai_cache_key(&path, &js_adjustments),
             &warped_image,
             &parts,
+            person_index,
             transform,
             ai_source.clone(),
         )
@@ -752,6 +759,58 @@ pub async fn generate_ai_face_mask(
     )?;
     check_cancelled(&guard)?;
     Ok(params)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn match_body_to_face_skin(
+    js_adjustments: serde_json::Value,
+    path: String,
+    person_index: Option<usize>,
+    rotation: f32,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    orientation_steps: u8,
+    task_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::masks::face::SkinToneMatchResult, String> {
+    let guard = task_id.map(|id| AiTaskGuard::new(&state.active_ai_tasks, id));
+    check_cancelled(&guard)?;
+
+    let models = get_or_init_ai_models(
+        &app_handle,
+        &state.ai_state,
+        &state.ai_init_lock,
+        AiMaskModel::Face,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    check_cancelled(&guard)?;
+
+    let warped_image = get_cached_full_warped_image(&state, &js_adjustments)?;
+    check_cancelled(&guard)?;
+
+    let transform = MaskTransform {
+        rotation,
+        flip_horizontal,
+        flip_vertical,
+        orientation_steps,
+    };
+    let analysis = cached_face_analysis(
+        &state.ai_state,
+        &models,
+        &ai_cache_key(&path, &js_adjustments),
+        &warped_image,
+        transform,
+    )?;
+    check_cancelled(&guard)?;
+
+    Ok(crate::masks::face::compute_face_to_body_skin_delta(
+        &warped_image,
+        &analysis,
+        person_index,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -907,6 +966,16 @@ pub async fn generate_effect_map(
     source_image: &DynamicImage,
     source_id: &str,
 ) -> Result<String, String> {
+    generate_effect_map_with_options(app_handle, kind, source_image, source_id, None).await
+}
+
+pub async fn generate_effect_map_with_options(
+    app_handle: &tauri::AppHandle,
+    kind: EffectMapKind,
+    source_image: &DynamicImage,
+    source_id: &str,
+    crisp_edges: Option<bool>,
+) -> Result<String, String> {
     let state = tauri::Manager::state::<AppState>(app_handle);
     let map = match kind {
         EffectMapKind::Depth => {
@@ -919,9 +988,39 @@ pub async fn generate_effect_map(
             .await
             .map_err(|e| e.to_string())?;
             let session = models.depth_anything().map_err(|e| e.to_string())?;
-            DynamicImage::ImageLuma8(
-                run_depth_anything_model(source_image, &session).map_err(|e| e.to_string())?,
-            )
+            let mut depth_img =
+                run_depth_anything_model(source_image, &session).map_err(|e| e.to_string())?;
+            drop(session);
+
+            let want_fusion = match crisp_edges {
+                Some(v) => v,
+                None => models.has_model_on_disk(AiMaskModel::Foreground),
+            };
+            if want_fusion {
+                let fg_models = if crisp_edges == Some(true) {
+                    get_or_init_ai_models(
+                        app_handle,
+                        &state.ai_state,
+                        &state.ai_init_lock,
+                        AiMaskModel::Foreground,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                } else {
+                    Ok(models.clone())
+                };
+                if let Ok(fg_models) = fg_models
+                    && let Ok(fg_session) = fg_models.birefnet()
+                    && let Ok(matte) = run_birefnet_model(source_image, &fg_session)
+                {
+                    crate::effects::lens_blur::fuse_depth_with_foreground_matte(
+                        &mut depth_img,
+                        &matte,
+                        source_image,
+                    );
+                }
+            }
+            DynamicImage::ImageLuma8(depth_img)
         }
         EffectMapKind::Normal => {
             let session = crate::ai::models::get_or_init_normal_model(
@@ -944,6 +1043,7 @@ pub async fn generate_effect_map(
 async fn generate_loaded_effect_map(
     kind: EffectMapKind,
     js_adjustments: serde_json::Value,
+    crisp_edges: Option<bool>,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -955,16 +1055,24 @@ async fn generate_loaded_effect_map(
         loaded_image.is_raw,
         &js_adjustments,
     );
-    generate_effect_map(&app_handle, kind, &source_image, &source_id).await
+    generate_effect_map_with_options(&app_handle, kind, &source_image, &source_id, crisp_edges).await
 }
 
 #[tauri::command]
 pub async fn generate_full_image_depth_map(
     js_adjustments: serde_json::Value,
+    crisp_edges: Option<bool>,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    generate_loaded_effect_map(EffectMapKind::Depth, js_adjustments, state, app_handle).await
+    generate_loaded_effect_map(
+        EffectMapKind::Depth,
+        js_adjustments,
+        crisp_edges,
+        state,
+        app_handle,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -973,7 +1081,14 @@ pub async fn generate_relight_normal_map(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    generate_loaded_effect_map(EffectMapKind::Normal, js_adjustments, state, app_handle).await
+    generate_loaded_effect_map(
+        EffectMapKind::Normal,
+        js_adjustments,
+        None,
+        state,
+        app_handle,
+    )
+    .await
 }
 
 #[tauri::command]

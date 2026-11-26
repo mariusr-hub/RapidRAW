@@ -45,7 +45,7 @@ pub(crate) fn grayscale_dilate(image: &GrayImage, k: u8) -> GrayImage {
     GrayImage::from_raw(width, height, out).unwrap()
 }
 
-fn grayscale_erode(image: &GrayImage, k: u8) -> GrayImage {
+pub(crate) fn grayscale_erode(image: &GrayImage, k: u8) -> GrayImage {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
         return image.clone();
@@ -206,4 +206,79 @@ pub fn for_each_mask_row(mask: &mut GrayImage, fill_row: impl Fn(u32, &mut [u8])
     mask.par_chunks_mut(width)
         .enumerate()
         .for_each(|(y, row)| fill_row(y as u32, row));
+}
+
+pub(crate) fn refine_mask_bitmap(
+    mask: &mut GrayImage,
+    expand: f32,
+    feather: f32,
+    contrast: f32,
+    scale: f32,
+) {
+    let s = scale.max(0.15);
+    if expand.abs() > 0.2 {
+        let radius = ((expand.abs() / 100.0) * 32.0 * s).round().clamp(1.0, 48.0) as u8;
+        if expand > 0.0 {
+            *mask = grayscale_dilate(mask, radius);
+        } else {
+            *mask = grayscale_erode(mask, radius);
+        }
+    }
+
+    if feather > 0.2 {
+        let sigma = ((feather / 100.0) * 24.0 * s).clamp(0.4, 32.0);
+        *mask = gaussian_blur_mask(mask, sigma);
+    }
+
+    if contrast.abs() > 0.5 {
+        let k = (contrast / 100.0).clamp(-1.0, 1.0);
+        if k > 0.0 {
+            let gain = 1.0 + k * 7.0;
+            let norm = (gain * 0.5).tanh().max(1e-5);
+            mask.par_iter_mut().for_each(|px| {
+                let x = *px as f32 / 255.0;
+                let shaped = 0.5 + 0.5 * (gain * (x - 0.5)).tanh() / norm;
+                *px = (shaped.clamp(0.0, 1.0) * 255.0).round() as u8;
+            });
+        } else {
+            let slope = 1.0 + k * 0.7;
+            mask.par_iter_mut().for_each(|px| {
+                let x = *px as f32 / 255.0;
+                let shaped = 0.5 + (x - 0.5) * slope;
+                *px = (shaped.clamp(0.0, 1.0) * 255.0).round() as u8;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refine_mask_expand_grows_and_contract_shrinks() {
+        let mut base = GrayImage::new(32, 32);
+        for y in 12..20 {
+            for x in 12..20 {
+                base.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        let mut expanded = base.clone();
+        refine_mask_bitmap(&mut expanded, 50.0, 0.0, 0.0, 1.0);
+        let mut contracted = base.clone();
+        refine_mask_bitmap(&mut contracted, -50.0, 0.0, 0.0, 1.0);
+
+        let count = |img: &GrayImage| img.as_raw().iter().filter(|&&v| v > 127).count();
+        assert!(count(&expanded) > count(&base));
+        assert!(count(&contracted) < count(&base));
+    }
+
+    #[test]
+    fn refine_mask_contrast_steepens_midtones() {
+        let mut img = GrayImage::from_raw(3, 1, vec![64, 128, 192]).unwrap();
+        refine_mask_bitmap(&mut img, 0.0, 0.0, 100.0, 1.0);
+        assert!(img.get_pixel(0, 0)[0] < 32);
+        assert!((125..=132).contains(&img.get_pixel(1, 0)[0]));
+        assert!(img.get_pixel(2, 0)[0] > 223);
+    }
 }

@@ -607,6 +607,9 @@ export interface MaskAdjustments {
 
 export interface MaskContainer {
   adjustments: MaskAdjustments;
+  contrast?: number;
+  expand?: number;
+  feather?: number;
   id?: any;
   invert: boolean;
   name: string;
@@ -733,6 +736,9 @@ export const INITIAL_MASK_ADJUSTMENTS: MaskAdjustments = {
 
 export const INITIAL_MASK_CONTAINER: MaskContainer = {
   adjustments: INITIAL_MASK_ADJUSTMENTS,
+  contrast: 0,
+  expand: 0,
+  feather: 0,
   invert: false,
   name: 'New Mask',
   opacity: 100,

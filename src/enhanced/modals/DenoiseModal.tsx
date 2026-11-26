@@ -35,6 +35,7 @@ import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { listen } from '@tauri-apps/api/event';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useEditorStore } from '../../store/useEditorStore';
+import { useProcessStore } from '../../store/useProcessStore';
 import { useUIStore } from '../../store/useUIStore';
 import { Invokes } from '../../components/ui/AppProperties';
 import { useSettingsStore } from '../../store/useSettingsStore';
@@ -405,6 +406,9 @@ export default function DenoiseModal({
   const { t } = useTranslation();
   const setUI = useUIStore((s) => s.setUI);
   const selectedImage = useEditorStore((state) => state.selectedImage);
+  const minimapSrc = useProcessStore((s) =>
+    selectedImage?.path ? s.mediumThumbnails[selectedImage.path] || s.thumbnails[selectedImage.path] : undefined,
+  );
   const imageList = useLibraryStore((state) => state.imageList);
   const isAiFree = useSettingsStore((s) => s.appSettings?.aiProvider === 'ai-free');
 
@@ -1117,6 +1121,46 @@ export default function DenoiseModal({
               viewMode={viewMode}
               onViewModeChange={setViewMode}
             />
+            {!previewBase64 && roiFull && (
+              <div
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const nx = Math.min(0.95, Math.max(0.05, (e.clientX - rect.left) / rect.width));
+                  const ny = Math.min(0.95, Math.max(0.05, (e.clientY - rect.top) / rect.height));
+                  setRoiCenter({ x: nx, y: ny });
+                }}
+                onPointerMove={(e) => {
+                  if ((e.buttons & 1) === 0) return;
+                  e.stopPropagation();
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const nx = Math.min(0.95, Math.max(0.05, (e.clientX - rect.left) / rect.width));
+                  const ny = Math.min(0.95, Math.max(0.05, (e.clientY - rect.top) / rect.height));
+                  setRoiCenter({ x: nx, y: ny });
+                }}
+                title="Click or drag to pan 1:1 ROI inspection window"
+                className="absolute top-2.5 right-2.5 z-20 w-[140px] h-[96px] rounded-md overflow-hidden border border-white/25 bg-black/75 shadow-lg cursor-crosshair select-none touch-none"
+              >
+                {minimapSrc ? (
+                  <img
+                    src={minimapSrc}
+                    alt="ROI Minimap"
+                    draggable={false}
+                    className="w-full h-full object-cover opacity-85 pointer-events-none"
+                  />
+                ) : (
+                  <div className="w-full h-full bg-gradient-to-br from-neutral-800 to-neutral-900 pointer-events-none" />
+                )}
+                <div
+                  className="absolute w-7 h-5 -translate-x-1/2 -translate-y-1/2 border-2 border-accent bg-accent/20 rounded-xs pointer-events-none shadow-xs"
+                  style={{ left: `${roiCenter.x * 100}%`, top: `${roiCenter.y * 100}%` }}
+                />
+                <span className="absolute bottom-0.5 right-1 text-[9px] font-mono text-white/85 bg-black/55 px-1 rounded pointer-events-none">
+                  {`${Math.round(roiCenter.x * 100)}%,${Math.round(roiCenter.y * 100)}%`}
+                </span>
+              </div>
+            )}
           </div>
           {savedPath && (
             <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>

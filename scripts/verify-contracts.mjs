@@ -788,6 +788,7 @@ const IPC_RETURN_PAIRS = [
   { rs: 'enhanced/astro_starless.rs', rsStruct: 'StarSeparationExportResult', ts: 'enhanced/types/astro.ts', tsIface: 'StarSeparationExportResult' },
   { rs: 'decode/camera_profile.rs', rsStruct: 'CameraProfileInfo', ts: 'enhanced/types/color.ts', tsIface: 'CameraProfileInfo' },
   { rs: 'enhanced/denoising.rs', rsStruct: 'DenoiseRoiPreview', ts: 'enhanced/types/denoise.ts', tsIface: 'DenoiseRoiPreview' },
+  { rs: 'masks/face.rs', rsStruct: 'SkinToneMatchResult', ts: 'types/invokes.ts', tsIface: 'SkinToneMatchResult' },
 ];
 
 for (const pair of IPC_RETURN_PAIRS) {

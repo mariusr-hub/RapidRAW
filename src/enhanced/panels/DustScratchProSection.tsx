@@ -9,6 +9,7 @@ import { useEditorStore } from '../../store/useEditorStore';
 import { useEditorActions } from '../../hooks/useEditorActions';
 import { AiPatch } from '../../utils/adjustments';
 import { Invokes } from '../../types/invokes';
+import { getTransformAdjustments } from '../../hooks/useAiMasking';
 
 export interface DetectedSpot {
   x: number;
@@ -78,6 +79,32 @@ export default function DustScratchProSection() {
       }
     } catch (err) {
       toast.error(`Defect scan failed: ${err}`);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const handleScanPortraitBlemishes = async () => {
+    if (!selectedImage || isScanning || isHealing) return;
+    setIsScanning(true);
+    try {
+      const result = await invoke<AutoDefectRepairResult>(Invokes.ScanPortraitBlemishes, {
+        jsAdjustments: getTransformAdjustments(adjustments),
+        path: selectedImage.path,
+        rotation: adjustments.rotation,
+        flipHorizontal: adjustments.flipHorizontal,
+        flipVertical: adjustments.flipVertical,
+        orientationSteps: adjustments.orientationSteps,
+      });
+      setSpots(result.spots || []);
+      if ((result.spots || []).length === 0) {
+        toast.info(result.message || 'No portrait skin blemishes detected.');
+      } else {
+        setIsOpen(true);
+        toast.success(result.message || `Detected ${result.total_detected} blemish(es).`);
+      }
+    } catch (err) {
+      toast.error(`Portrait blemish scan failed: ${err}`);
     } finally {
       setIsScanning(false);
     }
@@ -178,7 +205,7 @@ export default function DustScratchProSection() {
             onChange={(checked: boolean) => setRouteLargeToLama(checked)}
           />
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <Button
               size="sm"
               className="flex-1 text-xs flex items-center justify-center gap-1.5"
@@ -187,6 +214,17 @@ export default function DustScratchProSection() {
             >
               {isScanning ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
               <span>{isScanning ? 'Scanning...' : 'Scan Defects'}</span>
+            </Button>
+
+            <Button
+              size="sm"
+              className="text-xs flex items-center justify-center gap-1 px-2"
+              disabled={!selectedImage || isScanning || isHealing}
+              onClick={handleScanPortraitBlemishes}
+              title="Scan skin regions for removable blemishes (protects eyes, brows, lips & freckles)"
+            >
+              <Sparkles size={12} />
+              <span>Blemishes</span>
             </Button>
 
             {spots.length > 0 && (
@@ -225,7 +263,7 @@ export default function DustScratchProSection() {
                     <div className="flex items-center gap-1.5 min-w-0">
                       <span className="text-text-secondary font-mono text-[10px]">#{idx + 1}</span>
                       <span className="capitalize text-text-primary truncate">
-                        {spot.kind === 'scratch' ? 'Scratch' : 'Dust'}
+                        {spot.kind === 'scratch' ? 'Scratch' : spot.kind === 'blemish' ? 'Blemish' : 'Dust'}
                       </span>
                       <span className="text-text-secondary text-[10px]">
                         {`r=${spot.radius.toFixed(1)}`}

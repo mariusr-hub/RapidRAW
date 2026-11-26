@@ -1002,6 +1002,10 @@ pub struct AiTextMaskParameters {
 pub struct AiFaceMaskParameters {
     #[serde(default)]
     pub parts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_count: Option<usize>,
     #[serde(default)]
     pub mask_data_base64: Option<String>,
     #[serde(default)]

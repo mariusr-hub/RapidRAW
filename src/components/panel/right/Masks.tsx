@@ -59,6 +59,8 @@ export const MASK_AI_TYPES: Array<MaskType> = [
 
 export const FACE_PARTS = [
   'faceSkin',
+  'underEye',
+  'skinShine',
   'bodySkin',
   'eyebrows',
   'eyeWhites',
