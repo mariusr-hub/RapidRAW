@@ -31,6 +31,7 @@ import { useEditorStore, WgpuPhase } from '../../../store/useEditorStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { isDirectWgpuSwapchainActive } from '../../../utils/wgpuRenderer';
 import { MIXER_SAMPLE_SCREEN_SIZE, useHslMixerPicker } from '../../../hooks/useHslMixerPicker';
+import { useTargetedCurveTool } from '../../../hooks/useTargetedCurveTool';
 import { isPanelVisible, useUIStore } from '../../../store/useUIStore';
 import CompositionOverlays from './overlays/CompositionOverlays';
 import CropRotateArea from './overlays/CropRotateArea';
@@ -1509,6 +1510,7 @@ const ImageCanvas = memo(
       base: finalPreviewUrl || selectedImage.thumbnailUrl,
       fade: null as string | null,
     });
+    const imageBoxRef = useRef<SVGSVGElement>(null);
     const [isFadingIn, setIsFadingIn] = useState(false);
     const prevImageIdentityRef = useRef(selectedImage.thumbnailUrl);
 
@@ -1836,6 +1838,19 @@ const ImageCanvas = memo(
       imageRenderSize,
       isMasking,
       zoomScale: effectiveZoomScale,
+      setAdjustments,
+    });
+
+    const {
+      isActive: isTargetedCurveActive,
+      isDragging: isTargetedCurveDragging,
+      start: startTargetedCurve,
+      exit: exitTargetedCurve,
+      updateHoverAtNormalized,
+    } = useTargetedCurveTool({
+      imageSrc: displayState.base || selectedImage.thumbnailUrl || null,
+      getCanvasPointer,
+      imageRenderSize,
       setAdjustments,
     });
     const brushStageSize = (brushSettings?.size ?? 0) / effectiveZoomScale;
@@ -2624,6 +2639,11 @@ const ImageCanvas = memo(
           return;
         }
 
+        if (isTargetedCurveActive) {
+          startTargetedCurve(e);
+          return;
+        }
+
         if (isParametricActive && activeSubMask) {
           const pos = getCanvasPointer(e.target.getStage());
           if (!pos) return;
@@ -2812,6 +2832,8 @@ const ImageCanvas = memo(
         isInsideImage,
         isMixerPickerActive,
         startMixerPick,
+        isTargetedCurveActive,
+        startTargetedCurve,
         isInitialDrawing,
         isBrushActive,
         isCloneOrHealActive,
@@ -2869,12 +2891,22 @@ const ImageCanvas = memo(
           }
         }
 
+        if (pos && imageRenderSize.width > 0 && imageRenderSize.height > 0 && isInsideImage(pos)) {
+          updateHoverAtNormalized(pos.x / imageRenderSize.width, pos.y / imageRenderSize.height);
+        } else if (!isTargetedCurveDragging) {
+          updateHoverAtNormalized(null, null);
+        }
+
         if (isMixerPickerActive) {
           if (pos && isInsideImage(pos)) {
             setPickerHover({ x: pos.x, y: pos.y, visible: true });
           } else {
             setPickerHover((p: CursorPreview) => (p.visible ? { ...p, visible: false } : p));
           }
+          return;
+        }
+
+        if (isTargetedCurveActive) {
           return;
         }
 
@@ -3112,6 +3144,9 @@ const ImageCanvas = memo(
         isToolActive,
         isWbPickerActive,
         isMixerPickerActive,
+        isTargetedCurveActive,
+        isTargetedCurveDragging,
+        updateHoverAtNormalized,
         isInitialDrawing,
         activeMaskId,
         activeAiSubMaskId,
@@ -3420,10 +3455,32 @@ const ImageCanvas = memo(
 
     const handleMouseLeave = useCallback(() => {
       setIsCursorPreviewVisible(false);
+      updateHoverAtNormalized(null, null);
       if (!wbDragRef.current) {
         resetWbSample();
       }
-    }, [resetWbSample]);
+    }, [resetWbSample, updateHoverAtNormalized]);
+
+    const handleViewportMouseMove = useCallback(
+      (e: React.MouseEvent<HTMLDivElement>) => {
+        const svgEl = imageBoxRef.current;
+        if (!svgEl) return;
+        const rect = svgEl.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const u = (e.clientX - rect.left) / rect.width;
+        const v = (e.clientY - rect.top) / rect.height;
+        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+          updateHoverAtNormalized(u, v);
+        } else {
+          updateHoverAtNormalized(null, null);
+        }
+      },
+      [updateHoverAtNormalized],
+    );
+
+    const handleViewportMouseLeave = useCallback(() => {
+      updateHoverAtNormalized(null, null);
+    }, [updateHoverAtNormalized]);
 
     useEffect(() => {
       if (!isToolActive && !isWbPickerActive) return;
@@ -3573,6 +3630,8 @@ const ImageCanvas = memo(
       }
       if (isMixerPickerDragging) return 'move';
       if (isMixerPickerActive) return pickerHover.visible ? 'none' : 'crosshair';
+      if (isTargetedCurveDragging) return 'ns-resize';
+      if (isTargetedCurveActive) return 'crosshair';
       if (isParametricActive) return 'crosshair';
       if (isInitialDrawing) return 'crosshair';
 
@@ -3590,6 +3649,8 @@ const ImageCanvas = memo(
       pickerHover.visible,
       isMixerPickerDragging,
       isMixerPickerActive,
+      isTargetedCurveDragging,
+      isTargetedCurveActive,
       isInitialDrawing,
       isBrushActive,
       isAiSubjectActive,
@@ -3666,7 +3727,12 @@ const ImageCanvas = memo(
           };
 
     return (
-      <div className="relative" style={{ width: '100%', height: '100%', cursor: effectiveCursor }}>
+      <div
+        className="relative"
+        style={{ width: '100%', height: '100%', cursor: effectiveCursor }}
+        onMouseMove={handleViewportMouseMove}
+        onMouseLeave={handleViewportMouseLeave}
+      >
         <div
           className="absolute inset-0 w-full h-full transition-opacity duration-200 flex items-center justify-center"
           style={{
@@ -3683,7 +3749,7 @@ const ImageCanvas = memo(
             }}
           >
             <div className="absolute inset-0 w-full h-full">
-              <svg className="pointer-events-none" style={imageBoxStyle}>
+              <svg ref={imageBoxRef} className="pointer-events-none" style={imageBoxStyle}>
                 {displayState.base && (!isWgpuActive || isWgpuHandoffFading) && (
                   <image
                     href={displayState.base}
@@ -3791,6 +3857,7 @@ const ImageCanvas = memo(
                   isAiEditing ||
                   isWbPickerActive ||
                   isMixerPickerActive ||
+                  isTargetedCurveActive ||
                   showRelightLights ||
                   showCenterMarker) &&
                   viewportWidth > 0 &&
@@ -3817,6 +3884,12 @@ const ImageCanvas = memo(
                         height={viewportHeight}
                         onMouseDown={handleStart}
                         onDblClick={isMixerPickerActive ? resetMixerPick : undefined}
+                        onContextMenu={(e) => {
+                          if (isTargetedCurveActive) {
+                            e.evt.preventDefault();
+                            exitTargetedCurve();
+                          }
+                        }}
                         onTouchStart={handleStart}
                         onMouseEnter={handleMouseEnter}
                         onMouseLeave={handleMouseLeave}

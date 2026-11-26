@@ -464,6 +464,9 @@ export interface Adjustments extends EnhancedAdjustments {
   cameraProfileId?: string;
   hslMode?: 'classic' | 'tetrahedral';
   hslSkinLock?: number;
+  hslUniformity?: number;
+  colorGradingShadowsPivot?: number;
+  colorGradingHighlightsPivot?: number;
 }
 
 export interface AiPatch {
@@ -1021,8 +1024,11 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
       label: 'modals.copyPaste.groups.hueShift',
       keys: [ColorAdjustment.Hue],
     },
-    { label: 'modals.copyPaste.groups.colorGrading', keys: [ColorAdjustment.ColorGrading] },
-    { label: 'modals.copyPaste.groups.colorMixer', keys: [ColorAdjustment.Hsl, 'hslMode', 'hslSkinLock'] },
+    {
+      label: 'modals.copyPaste.groups.colorGrading',
+      keys: [ColorAdjustment.ColorGrading, 'colorGradingShadowsPivot', 'colorGradingHighlightsPivot'],
+    },
+    { label: 'modals.copyPaste.groups.colorMixer', keys: [ColorAdjustment.Hsl, 'hslMode', 'hslSkinLock', 'hslUniformity'] },
     { label: 'modals.copyPaste.groups.colorCalibration', keys: ['colorCalibration', 'cameraProfileId'] },
     {
       label: 'modals.copyPaste.groups.blackWhite',
@@ -1322,6 +1328,9 @@ export const ADJUSTMENT_SECTIONS: Sections = {
     'cameraProfileId',
     'hslMode',
     'hslSkinLock',
+    'hslUniformity',
+    'colorGradingShadowsPivot',
+    'colorGradingHighlightsPivot',
     ...MONOCHROME_ADJUSTMENT_KEYS,
   ],
   details: [

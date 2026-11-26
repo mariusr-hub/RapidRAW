@@ -1,5 +1,8 @@
+use crate::adjustments::lut_processing::Lut;
 use crate::app::settings::resolved_app_data_dir;
-use crate::render::color_space::working_profile;
+use crate::decode::white_balance::{self, WhiteBalance};
+use crate::render::color_space::{prophoto_to_working, working_profile, working_to_prophoto};
+use glam::Vec3;
 use image::{DynamicImage, Rgb32FImage};
 use moxcms::{ColorProfile, DataColorSpace, Layout, RenderingIntent, TransformOptions};
 use rayon::prelude::*;
@@ -9,7 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use tauri::AppHandle;
 
 const TAG_UNIQUE_CAMERA_MODEL: u16 = 50708;
@@ -24,6 +27,13 @@ const TAG_PROFILE_HUE_SAT_MAP_DATA_2: u16 = 50939;
 const TAG_PROFILE_TONE_CURVE: u16 = 50940;
 const TAG_FORWARD_MATRIX_1: u16 = 50964;
 const TAG_FORWARD_MATRIX_2: u16 = 50965;
+const TAG_PROFILE_LOOK_TABLE_DIMS: u16 = 50981;
+const TAG_PROFILE_LOOK_TABLE_DATA: u16 = 50982;
+const TAG_PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
+const TAG_BASELINE_EXPOSURE_OFFSET: u16 = 51109;
+
+const DCP_LUT_SIZE: u32 = 33;
+const DCP_SHAPER_MAX: f32 = 4.0;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +61,10 @@ pub struct DcpProfile {
     pub hue_sat_dims: Option<[usize; 3]>, // [hue_divs, sat_divs, val_divs]
     pub hue_sat_data_1: Option<Vec<[f32; 3]>>,
     pub hue_sat_data_2: Option<Vec<[f32; 3]>>,
+    pub look_table_dims: Option<[usize; 3]>,
+    pub look_table_data: Option<Vec<[f32; 3]>>,
+    pub look_table_encoding: u32,
+    pub baseline_exposure_offset: f32,
     pub tone_curve: Option<Vec<[f32; 2]>>,
 }
 
@@ -62,6 +76,9 @@ enum CachedCameraProfile {
 
 static CAMERA_PROFILE_CACHE: LazyLock<Mutex<HashMap<String, CachedCameraProfile>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static DCP_GPU_LUT_CACHE: LazyLock<Mutex<HashMap<(String, u32), Arc<Lut>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CAMERA_PROFILES_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn dng_illuminant_kelvin(code: u16) -> f64 {
     match code {
@@ -259,6 +276,10 @@ pub fn parse_dcp_bytes(bytes: &[u8]) -> Result<DcpProfile, String> {
         hue_sat_dims: None,
         hue_sat_data_1: None,
         hue_sat_data_2: None,
+        look_table_dims: None,
+        look_table_data: None,
+        look_table_encoding: 0,
+        baseline_exposure_offset: 0.0,
         tone_curve: None,
     };
 
@@ -326,6 +347,35 @@ pub fn parse_dcp_bytes(bytes: &[u8]) -> Result<DcpProfile, String> {
             TAG_PROFILE_HUE_SAT_MAP_DATA_2 => {
                 profile.hue_sat_data_2 = Some(decode_f32_triplets(&payload, le));
             }
+            TAG_PROFILE_LOOK_TABLE_DIMS => {
+                if payload.len() >= 12 {
+                    let h = read_u32(&payload, 0, le)? as usize;
+                    let s = read_u32(&payload, 4, le)? as usize;
+                    let v = read_u32(&payload, 8, le)? as usize;
+                    if h > 0 && s > 0 && v > 0 {
+                        profile.look_table_dims = Some([h, s, v]);
+                    }
+                }
+            }
+            TAG_PROFILE_LOOK_TABLE_DATA => {
+                profile.look_table_data = Some(decode_f32_triplets(&payload, le));
+            }
+            TAG_PROFILE_LOOK_TABLE_ENCODING => {
+                if payload.len() >= 4 {
+                    profile.look_table_encoding = read_u32(&payload, 0, le).unwrap_or(0);
+                } else if payload.len() >= 2 {
+                    profile.look_table_encoding = read_u16(&payload, 0, le).unwrap_or(0) as u32;
+                }
+            }
+            TAG_BASELINE_EXPOSURE_OFFSET => {
+                if payload.len() >= 8 {
+                    let num = read_i32(&payload, 0, le).unwrap_or(0) as f64;
+                    let den = read_i32(&payload, 4, le).unwrap_or(1) as f64;
+                    if den.abs() > 1e-9 {
+                        profile.baseline_exposure_offset = ((num / den) as f32).clamp(-6.0, 6.0);
+                    }
+                }
+            }
             TAG_PROFILE_TONE_CURVE => {
                 let pairs = payload.len() / 8;
                 let mut curve = Vec::with_capacity(pairs);
@@ -338,6 +388,7 @@ pub fn parse_dcp_bytes(bytes: &[u8]) -> Result<DcpProfile, String> {
                     }
                 }
                 if curve.len() >= 2 {
+                    curve.sort_by(|a, b| a[0].total_cmp(&b[0]));
                     profile.tone_curve = Some(curve);
                 }
             }
@@ -431,11 +482,29 @@ fn sample_hsm_trilinear(dims: [usize; 3], table: &[[f32; 3]], h_deg: f32, s: f32
     lerp3(c0, c1, fv)
 }
 
+fn linear_to_srgb_scalar(c: f32) -> f32 {
+    let x = c.max(0.0);
+    if x <= 0.003_130_8 {
+        x * 12.92
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_to_linear_scalar(c: f32) -> f32 {
+    let x = c.max(0.0);
+    if x <= 0.040_45 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 fn eval_tone_curve(curve: &[[f32; 2]], x: f32) -> f32 {
     if curve.len() < 2 {
         return x;
     }
-    let clamped = x.clamp(0.0, 1.0);
+    let clamped = x.max(0.0);
     if clamped <= curve[0][0] {
         return curve[0][1];
     }
@@ -451,31 +520,130 @@ fn eval_tone_curve(curve: &[[f32; 2]], x: f32) -> f32 {
             return y0 + (y1 - y0) * t;
         }
     }
+    let prev = curve[curve.len() - 2];
     let last = curve[curve.len() - 1];
-    last[1] + (x - last[0]).max(0.0)
+    let dx = (last[0] - prev[0]).max(1e-4);
+    let end_slope = ((last[1] - prev[1]) / dx).clamp(0.1, 4.0);
+    last[1] + (clamped - last[0]).max(0.0) * end_slope
+}
+
+fn apply_hsv_table(rgb: Vec3, dims: [usize; 3], table: &[[f32; 3]], srgb_encode: bool) -> Vec3 {
+    let mut p = if srgb_encode {
+        Vec3::new(
+            linear_to_srgb_scalar(rgb.x),
+            linear_to_srgb_scalar(rgb.y),
+            linear_to_srgb_scalar(rgb.z),
+        )
+    } else {
+        rgb.max(Vec3::ZERO)
+    };
+    let (mut hh, mut ss, vv) = rgb_to_hsv_norm(p.x, p.y, p.z);
+    let [dh, ms, mv] = sample_hsm_trilinear(dims, table, hh, ss, vv.min(1.0));
+    hh = (hh + dh).rem_euclid(360.0);
+    ss = (ss * ms).clamp(0.0, 1.0);
+    let new_vv = (vv * mv).max(0.0);
+    let (nr, ng, nb) = hsv_to_rgb_norm(hh, ss, new_vv);
+    p = Vec3::new(nr, ng, nb);
+    if srgb_encode {
+        // Preserve HDR headroom smoothly above 1.0 when LookTable is sRGB-encoded.
+        let hdr_scale = if rgb.max_element() > 1.0 {
+            let ref_max = p.max_element().max(1e-5);
+            (rgb.max_element() / ref_max).max(1.0)
+        } else {
+            1.0
+        };
+        Vec3::new(
+            srgb_to_linear_scalar(p.x),
+            srgb_to_linear_scalar(p.y),
+            srgb_to_linear_scalar(p.z),
+        ) * hdr_scale
+    } else {
+        p
+    }
+}
+
+struct PreparedDcpEval<'a> {
+    exposure_scale: f32,
+    hsm_table: Option<([usize; 3], Vec<[f32; 3]>)>,
+    look_table: Option<([usize; 3], &'a [[f32; 3]], bool)>,
+    tone_curve: Option<&'a [[f32; 2]]>,
+    to_prophoto: glam::Mat3,
+    from_prophoto: glam::Mat3,
+}
+
+impl<'a> PreparedDcpEval<'a> {
+    fn new(dcp: &'a DcpProfile, temp_kelvin: f64) -> Option<Self> {
+        let t_interp = if let Some(ill2) = dcp.illuminant2_kelvin {
+            interpolate_mired_weight(temp_kelvin, dcp.illuminant1_kelvin, ill2) as f32
+        } else {
+            0.0
+        };
+
+        let hsm_table = dcp.hue_sat_dims.and_then(|dims| {
+            match (&dcp.hue_sat_data_1, &dcp.hue_sat_data_2) {
+                (Some(d1), Some(d2)) if d1.len() == d2.len() => {
+                    Some((dims, interpolate_huesatmap(d1, d2, t_interp)))
+                }
+                (Some(d1), _) => Some((dims, d1.clone())),
+                _ => None,
+            }
+        });
+
+        let look_table = dcp.look_table_dims.and_then(|dims| {
+            dcp.look_table_data
+                .as_deref()
+                .map(|d| (dims, d, dcp.look_table_encoding != 0))
+        });
+
+        let exposure_scale = if dcp.baseline_exposure_offset.abs() > 1e-4 {
+            2.0_f32.powf(dcp.baseline_exposure_offset)
+        } else {
+            1.0
+        };
+
+        let tone_curve = dcp.tone_curve.as_deref();
+        if hsm_table.is_none()
+            && look_table.is_none()
+            && tone_curve.is_none()
+            && (exposure_scale - 1.0).abs() <= 1e-4
+        {
+            return None;
+        }
+
+        Some(Self {
+            exposure_scale,
+            hsm_table,
+            look_table,
+            tone_curve,
+            to_prophoto: working_to_prophoto(),
+            from_prophoto: prophoto_to_working(),
+        })
+    }
+
+    #[inline]
+    fn eval_working(&self, working_rgb: Vec3) -> Vec3 {
+        let mut p = (self.to_prophoto * working_rgb).max(Vec3::ZERO) * self.exposure_scale;
+        if let Some((dims, ref table)) = self.hsm_table {
+            p = apply_hsv_table(p, dims, table, false);
+        }
+        if let Some((dims, table, srgb_encode)) = self.look_table {
+            p = apply_hsv_table(p, dims, table, srgb_encode);
+        }
+        if let Some(c) = self.tone_curve {
+            p = Vec3::new(
+                eval_tone_curve(c, p.x),
+                eval_tone_curve(c, p.y),
+                eval_tone_curve(c, p.z),
+            );
+        }
+        (self.from_prophoto * p).max(Vec3::ZERO)
+    }
 }
 
 fn apply_dcp_profile(rgb: &mut Rgb32FImage, dcp: &DcpProfile) {
-    let t_interp = if let Some(ill2) = dcp.illuminant2_kelvin {
-        interpolate_mired_weight(6504.0, dcp.illuminant1_kelvin, ill2) as f32
-    } else {
-        0.0
-    };
-
-    let hsm_table: Option<([usize; 3], Vec<[f32; 3]>)> = dcp.hue_sat_dims.and_then(|dims| {
-        match (&dcp.hue_sat_data_1, &dcp.hue_sat_data_2) {
-            (Some(d1), Some(d2)) if d1.len() == d2.len() => {
-                Some((dims, interpolate_huesatmap(d1, d2, t_interp)))
-            }
-            (Some(d1), _) => Some((dims, d1.clone())),
-            _ => None,
-        }
-    });
-
-    let curve = dcp.tone_curve.as_deref();
-    if hsm_table.is_none() && curve.is_none() {
+    let Some(eval) = PreparedDcpEval::new(dcp, 6504.0) else {
         return;
-    }
+    };
 
     let (w, _h) = rgb.dimensions();
     let row_stride = (w * 3) as usize;
@@ -484,28 +652,14 @@ fn apply_dcp_profile(rgb: &mut Rgb32FImage, dcp: &DcpProfile) {
         .for_each(|row| {
             for x in 0..w as usize {
                 let idx = x * 3;
-                let mut r = row[idx].max(0.0);
-                let mut g = row[idx + 1].max(0.0);
-                let mut b = row[idx + 2].max(0.0);
-
-                if let Some((dims, ref table)) = hsm_table {
-                    let (mut hh, mut ss, mut vv) = rgb_to_hsv_norm(r, g, b);
-                    let [dh, ms, mv] = sample_hsm_trilinear(dims, table, hh, ss, vv.min(1.0));
-                    hh = (hh + dh).rem_euclid(360.0);
-                    ss = (ss * ms).clamp(0.0, 1.0);
-                    vv = (vv * mv).max(0.0);
-                    (r, g, b) = hsv_to_rgb_norm(hh, ss, vv);
-                }
-
-                if let Some(c) = curve {
-                    r = eval_tone_curve(c, r);
-                    g = eval_tone_curve(c, g);
-                    b = eval_tone_curve(c, b);
-                }
-
-                row[idx] = r.max(0.0);
-                row[idx + 1] = g.max(0.0);
-                row[idx + 2] = b.max(0.0);
+                let out = eval.eval_working(Vec3::new(
+                    row[idx].max(0.0),
+                    row[idx + 1].max(0.0),
+                    row[idx + 2].max(0.0),
+                ));
+                row[idx] = out.x;
+                row[idx + 1] = out.y;
+                row[idx + 2] = out.z;
             }
         });
 }
@@ -535,6 +689,189 @@ fn apply_icc_camera_profile(rgb: &mut Rgb32FImage, icc_bytes: &[u8]) {
     }
 }
 
+fn bake_dcp_lut(dcp: &DcpProfile, temp_kelvin: f64) -> Option<Arc<Lut>> {
+    let eval = PreparedDcpEval::new(dcp, temp_kelvin)?;
+    let size = DCP_LUT_SIZE as usize;
+    let denom = (size - 1) as f32;
+    let mut data = vec![0.0f32; size * size * size * 3];
+
+    data.par_chunks_mut(size * size * 3)
+        .enumerate()
+        .for_each(|(b_idx, plane)| {
+            let ub = b_idx as f32 / denom;
+            let lb = DCP_SHAPER_MAX * ub * ub;
+            for g_idx in 0..size {
+                let ug = g_idx as f32 / denom;
+                let lg = DCP_SHAPER_MAX * ug * ug;
+                let row_off = g_idx * size * 3;
+                for r_idx in 0..size {
+                    let ur = r_idx as f32 / denom;
+                    let lr = DCP_SHAPER_MAX * ur * ur;
+                    let out = eval.eval_working(Vec3::new(lr, lg, lb));
+                    let i = row_off + r_idx * 3;
+                    plane[i] = out.x;
+                    plane[i + 1] = out.y;
+                    plane[i + 2] = out.z;
+                }
+            }
+        });
+
+    Some(Arc::new(Lut {
+        size: DCP_LUT_SIZE,
+        data,
+    }))
+}
+
+fn bake_icc_lut(icc_bytes: &[u8]) -> Option<Arc<Lut>> {
+    let in_prof = ColorProfile::new_from_slice(icc_bytes).ok()?;
+    if in_prof.color_space != DataColorSpace::Rgb {
+        return None;
+    }
+    let out_prof = working_profile();
+    let xform = in_prof
+        .create_transform_f32(
+            Layout::Rgb,
+            &out_prof,
+            Layout::Rgb,
+            TransformOptions {
+                rendering_intent: RenderingIntent::RelativeColorimetric,
+                ..TransformOptions::default()
+            },
+        )
+        .ok()?;
+
+    let size = DCP_LUT_SIZE as usize;
+    let denom = (size - 1) as f32;
+    let count = size * size * size;
+    let mut normalized_in = vec![0.0f32; count * 3];
+    let mut scales = vec![1.0f32; count];
+
+    for b in 0..size {
+        let ub = b as f32 / denom;
+        let lb = DCP_SHAPER_MAX * ub * ub;
+        for g in 0..size {
+            let ug = g as f32 / denom;
+            let lg = DCP_SHAPER_MAX * ug * ug;
+            for r in 0..size {
+                let ur = r as f32 / denom;
+                let lr = DCP_SHAPER_MAX * ur * ur;
+                let idx = (b * size + g) * size + r;
+                let peak = lr.max(lg).max(lb);
+                let scale = if peak > 1.0 { peak } else { 1.0 };
+                scales[idx] = scale;
+                normalized_in[idx * 3] = (lr / scale).clamp(0.0, 1.0);
+                normalized_in[idx * 3 + 1] = (lg / scale).clamp(0.0, 1.0);
+                normalized_in[idx * 3 + 2] = (lb / scale).clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    let mut data = vec![0.0f32; count * 3];
+    xform.transform(&normalized_in, &mut data).ok()?;
+    for (idx, chunk) in data.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+        let s = scales[idx];
+        chunk[0] = (chunk[0] * s).max(0.0);
+        chunk[1] = (chunk[1] * s).max(0.0);
+        chunk[2] = (chunk[2] * s).max(0.0);
+    }
+
+    Some(Arc::new(Lut {
+        size: DCP_LUT_SIZE,
+        data,
+    }))
+}
+
+fn load_cached_profile_by_id(profile_id: &str) -> Option<CachedCameraProfile> {
+    if let Some(existing) = CAMERA_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(profile_id)
+        .cloned()
+    {
+        return Some(existing);
+    }
+
+    let dir = CAMERA_PROFILES_DIR.get()?;
+    let path = dir.join(profile_id);
+    if !path.is_file() {
+        return None;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let bytes = fs::read(&path).ok()?;
+    let item = if ext == "dcp" {
+        CachedCameraProfile::Dcp(parse_dcp_bytes(&bytes).ok()?)
+    } else if ext == "icc" || ext == "icm" {
+        let icc = ColorProfile::new_from_slice(&bytes).ok()?;
+        if icc.color_space != DataColorSpace::Rgb {
+            return None;
+        }
+        CachedCameraProfile::Icc(bytes)
+    } else {
+        return None;
+    };
+
+    CAMERA_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(profile_id.to_string(), item.clone());
+    Some(item)
+}
+
+/// Resolves and caches a GPU-resident 33³ linear-shaper Rec.2020 LUT for the selected camera profile.
+pub fn resolve_dcp_gpu_lut(
+    adjustments: &Value,
+    as_shot_wb: Option<WhiteBalance>,
+) -> Option<Arc<Lut>> {
+    let profile_id = adjustments["cameraProfileId"]
+        .as_str()
+        .unwrap_or("")
+        .trim();
+    if profile_id.is_empty() {
+        return None;
+    }
+
+    let cached = load_cached_profile_by_id(profile_id)?;
+    let (temp_kelvin, kelvin_bucket) = match &cached {
+        CachedCameraProfile::Dcp(dcp) if dcp.illuminant2_kelvin.is_some() => {
+            let wb = white_balance::from_adjustments(
+                adjustments,
+                as_shot_wb.unwrap_or_else(WhiteBalance::reference),
+            );
+            let bucket = ((wb.temperature / 100.0).round() as u32).clamp(15, 500) * 100;
+            (bucket as f64, bucket)
+        }
+        _ => (6504.0, 0),
+    };
+
+    let cache_key = (profile_id.to_string(), kelvin_bucket);
+    if let Some(lut) = DCP_GPU_LUT_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return Some(lut);
+    }
+
+    let lut = match &cached {
+        CachedCameraProfile::Dcp(dcp) => bake_dcp_lut(dcp, temp_kelvin),
+        CachedCameraProfile::Icc(icc) => bake_icc_lut(icc),
+    }?;
+
+    let mut lut_cache = DCP_GPU_LUT_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if lut_cache.len() >= 32 {
+        lut_cache.clear();
+    }
+    lut_cache.insert(cache_key, Arc::clone(&lut));
+    Some(lut)
+}
+
 /// Applies the user-selected DCP/ICC camera profile non-destructively when `cameraProfileId` is set.
 pub fn apply_camera_profile_if_enabled<'a>(
     image: Cow<'a, DynamicImage>,
@@ -548,13 +885,7 @@ pub fn apply_camera_profile_if_enabled<'a>(
         return image;
     }
 
-    let cached = {
-        let guard = CAMERA_PROFILE_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.get(profile_id).cloned()
-    };
-    let Some(profile) = cached else {
+    let Some(profile) = load_cached_profile_by_id(profile_id) else {
         return image;
     };
 
@@ -571,7 +902,12 @@ fn camera_profiles_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     }
+    let _ = CAMERA_PROFILES_DIR.set(dir.clone());
     Ok(dir)
+}
+
+pub fn init_camera_profiles_dir(app_handle: &AppHandle) {
+    let _ = camera_profiles_dir(app_handle);
 }
 
 fn scan_profiles_in_dir(dir: &Path) -> Vec<CameraProfileInfo> {
@@ -645,6 +981,10 @@ fn scan_profiles_in_dir(dir: &Path) -> Vec<CameraProfileInfo> {
         for (id, item) in cache_updates {
             cache.insert(id, item);
         }
+        DCP_GPU_LUT_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -803,5 +1143,66 @@ mod tests {
         let m_mid = interpolate_matrix3(&m1, &m2, w_mid as f32);
         assert!((m_mid[0][0] - 1.5).abs() < 1e-4);
         assert!((m_mid[1][1] - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_dcp_look_table_and_baseline_offset_bake_into_33_cube() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        push_le_u16(&mut buf, 42);
+        push_le_u32(&mut buf, 8);
+
+        let num_entries: u16 = 5;
+        push_le_u16(&mut buf, num_entries);
+        let entries_start = buf.len();
+        buf.resize(entries_start + (num_entries as usize) * 12 + 4, 0);
+
+        let write_entry = |idx: usize, tag: u16, ftype: u16, count: u32, payload: &[u8], buf: &mut Vec<u8>| {
+            let off = entries_start + idx * 12;
+            buf[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+            buf[off + 2..off + 4].copy_from_slice(&ftype.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&count.to_le_bytes());
+            if payload.len() <= 4 {
+                buf[off + 8..off + 8 + payload.len()].copy_from_slice(payload);
+            } else {
+                let data_off = buf.len() as u32;
+                buf[off + 8..off + 12].copy_from_slice(&data_off.to_le_bytes());
+                buf.extend_from_slice(payload);
+            }
+        };
+
+        let mut look_dims = Vec::new();
+        for v in [2u32, 2u32, 1u32] {
+            look_dims.extend_from_slice(&v.to_le_bytes());
+        }
+        write_entry(0, TAG_PROFILE_LOOK_TABLE_DIMS, 4, 3, &look_dims, &mut buf);
+
+        let mut look_data = Vec::new();
+        for _ in 0..4 {
+            for v in [8.0f32, 1.25f32, 1.0f32] {
+                look_data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        write_entry(1, TAG_PROFILE_LOOK_TABLE_DATA, 11, 12, &look_data, &mut buf);
+        write_entry(2, TAG_PROFILE_LOOK_TABLE_ENCODING, 4, 1, &1u32.to_le_bytes(), &mut buf);
+
+        let mut baseline_payload = Vec::new();
+        baseline_payload.extend_from_slice(&1i32.to_le_bytes());
+        baseline_payload.extend_from_slice(&2i32.to_le_bytes()); // +0.5 EV
+        write_entry(3, TAG_BASELINE_EXPOSURE_OFFSET, 10, 1, &baseline_payload, &mut buf);
+        write_entry(4, TAG_UNIQUE_CAMERA_MODEL, 2, 7, b"CamX1\0\0", &mut buf);
+
+        let dcp = parse_dcp_bytes(&buf).expect("DCP with LookTable & BaselineExposureOffset");
+        assert_eq!(dcp.look_table_dims, Some([2, 2, 1]));
+        assert_eq!(dcp.look_table_encoding, 1);
+        assert!((dcp.baseline_exposure_offset - 0.5).abs() < 1e-5);
+
+        let lut = bake_dcp_lut(&dcp, 5500.0).expect("33^3 LUT baked");
+        assert_eq!(lut.size, 33);
+        assert_eq!(lut.data.len(), 33 * 33 * 33 * 3);
+        assert!(lut.data.iter().all(|v| v.is_finite() && *v >= 0.0));
+        // Mid-gray index (16, 16, 16) corresponds to u=0.5 => linear 1.0, scaled by 2^0.5 (~1.414)
+        let idx = ((16 * 33 + 16) * 33 + 16) * 3;
+        assert!(lut.data[idx] > 1.2, "Expected +0.5 EV boost, got {}", lut.data[idx]);
     }
 }

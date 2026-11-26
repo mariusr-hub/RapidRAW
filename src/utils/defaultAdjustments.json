@@ -404,5 +404,8 @@
   "astroNebulaBoost": 0,
   "cameraProfileId": "",
   "hslMode": "classic",
-  "hslSkinLock": 0
+  "hslSkinLock": 0,
+  "hslUniformity": 0,
+  "colorGradingShadowsPivot": 0,
+  "colorGradingHighlightsPivot": 0
 }

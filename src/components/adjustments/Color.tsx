@@ -190,7 +190,7 @@ export const ColorSwatch = ({ color, name, isActive, ariaLabel, tooltip, onClick
   );
 };
 
-const ColorGradingPanel = ({ adjustments, setAdjustments, onDragStateChange }: ColorPanelProps) => {
+const ColorGradingPanel = ({ adjustments, setAdjustments, isForMask = false, onDragStateChange }: ColorPanelProps) => {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<'3way' | 'global'>('3way');
   const isExpanded = useUIStore((state) => state.isColorGradingExpanded);
@@ -348,6 +348,36 @@ const ColorGradingPanel = ({ adjustments, setAdjustments, onDragStateChange }: C
           value={colorGrading.balance}
           onDragStateChange={onDragStateChange}
         />
+        {!isForMask && (
+          <>
+            <Slider
+              defaultValue={0}
+              label={t('adjustments.color.grading.shadowsPivot')}
+              max={100}
+              min={-100}
+              onChange={(e: SliderChangeEvent) =>
+                setAdjustments({ colorGradingShadowsPivot: Number(e.target.value) })
+              }
+              step={1}
+              resetKey="colorGradingShadowsPivot"
+              value={adjustments.colorGradingShadowsPivot ?? 0}
+              onDragStateChange={onDragStateChange}
+            />
+            <Slider
+              defaultValue={0}
+              label={t('adjustments.color.grading.highlightsPivot')}
+              max={100}
+              min={-100}
+              onChange={(e: SliderChangeEvent) =>
+                setAdjustments({ colorGradingHighlightsPivot: Number(e.target.value) })
+              }
+              step={1}
+              resetKey="colorGradingHighlightsPivot"
+              value={adjustments.colorGradingHighlightsPivot ?? 0}
+              onDragStateChange={onDragStateChange}
+            />
+          </>
+        )}
       </div>
     </div>
   );
@@ -748,6 +778,25 @@ function ColorPanel({
   const handleSettingsChange = useSettingsStore((state) => state.handleSettingsChange);
   const [activeColor, setActiveColor] = useState('reds');
   const [cameraProfiles, setCameraProfiles] = useState<CameraProfileInfo[]>([]);
+  const cameraModel = useEditorStore((state) => {
+    const exif = state.selectedImage?.exif;
+    return String(exif?.Model ?? exif?.model ?? exif?.UniqueCameraModel ?? '').trim();
+  });
+  const { matchedProfiles, otherProfiles } = useMemo(() => {
+    if (!cameraModel) return { matchedProfiles: [] as CameraProfileInfo[], otherProfiles: cameraProfiles };
+    const needle = cameraModel.toLowerCase();
+    const matched: CameraProfileInfo[] = [];
+    const others: CameraProfileInfo[] = [];
+    for (const prof of cameraProfiles) {
+      const m = (prof.cameraModel || '').trim().toLowerCase();
+      if (m && (m.includes(needle) || needle.includes(m))) {
+        matched.push(prof);
+      } else {
+        others.push(prof);
+      }
+    }
+    return { matchedProfiles: matched, otherProfiles: others };
+  }, [cameraProfiles, cameraModel]);
   const hiddenTools = getHiddenAdjustmentTools(appSettings?.adjustmentLayout);
   const toolOrder = getAdjustmentToolOrder('color', appSettings?.adjustmentLayout?.toolOrder);
 
@@ -1127,6 +1176,7 @@ function ColorPanel({
               adjustments={adjustments}
               setAdjustments={setAdjustments}
               appSettings={appSettings}
+              isForMask={isForMask}
               onDragStateChange={onDragStateChange}
             />
           )}
@@ -1248,6 +1298,20 @@ function ColorPanel({
                     }
                     onDragStateChange={onDragStateChange}
                   />
+                  <Slider
+                    label={t('adjustments.color.hslUniformity')}
+                    min={0}
+                    max={100}
+                    step={1}
+                    defaultValue={0}
+                    resetKey="hslUniformity"
+                    value={adjustments.hslUniformity ?? 0}
+                    onChange={(e: SliderChangeEvent) =>
+                      setAdjustments({ hslUniformity: Number(e.target.value) })
+                    }
+                    onDragStateChange={onDragStateChange}
+                    fillOrigin="min"
+                  />
                 </div>
               )}
             </div>
@@ -1271,11 +1335,24 @@ function ColorPanel({
               title="Select DCP / ICC Camera Profile"
             >
               <option value="">Camera Standard (Embedded)</option>
-              {cameraProfiles.map((prof) => (
-                <option key={prof.id} value={prof.id}>
-                  {`${prof.name} (${prof.format})`}
-                </option>
-              ))}
+              {matchedProfiles.length > 0 && (
+                <optgroup label={`Matched for ${cameraModel}`}>
+                  {matchedProfiles.map((prof) => (
+                    <option key={prof.id} value={prof.id}>
+                      {`★ ${prof.name} (${prof.format})`}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {otherProfiles.length > 0 && (
+                <optgroup label={matchedProfiles.length > 0 ? 'Other Profiles' : 'Available Profiles'}>
+                  {otherProfiles.map((prof) => (
+                    <option key={prof.id} value={prof.id}>
+                      {`${prof.name} (${prof.format})`}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
             <button
               type="button"

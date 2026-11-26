@@ -115,6 +115,8 @@ struct WorkingSpace {
     luma: Vec3,
     to_srgb: Mat3,
     from_srgb: Mat3,
+    to_prophoto: Mat3,
+    from_prophoto: Mat3,
     to_oklab_lms: Mat3,
     from_oklab_lms: Mat3,
     icc: Vec<u8>,
@@ -127,6 +129,8 @@ static WORKING_SPACE: LazyLock<WorkingSpace> = LazyLock::new(|| {
         luma: WORKING.luma().as_vec3(),
         to_srgb: WORKING.to(SRGB).as_mat3(),
         from_srgb: SRGB.to(WORKING).as_mat3(),
+        to_prophoto: WORKING.to(PRO_PHOTO_RGB).as_mat3(),
+        from_prophoto: PRO_PHOTO_RGB.to(WORKING).as_mat3(),
         to_oklab_lms: to_oklab_lms.as_mat3(),
         from_oklab_lms: to_oklab_lms.inverse().as_mat3(),
         icc: working_profile()
@@ -150,6 +154,14 @@ pub fn working_to_srgb() -> Mat3 {
 
 pub fn srgb_to_working() -> Mat3 {
     WORKING_SPACE.from_srgb
+}
+
+pub fn working_to_prophoto() -> Mat3 {
+    WORKING_SPACE.to_prophoto
+}
+
+pub fn prophoto_to_working() -> Mat3 {
+    WORKING_SPACE.from_prophoto
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

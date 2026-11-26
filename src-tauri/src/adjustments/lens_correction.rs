@@ -728,8 +728,24 @@ fn resolve(path: &str, adjustments: &Value) -> Option<Arc<ResolvedLens>> {
     if let Some(cached) = profile_cache().lock().unwrap().get(&key) {
         return cached.clone();
     }
-    let db = database()?;
-    let resolved = db.resolve(&Shot::read(&key.0), &key.1).map(Arc::new);
+    let resolved = if key.1.is_none()
+        && let Some((maker, model, profile)) =
+            crate::adjustments::raw_lens_opcodes::resolve_dng_opcode_lens(&key.0)
+    {
+        Some(Arc::new(ResolvedLens {
+            info: LensCorrectionInfo {
+                maker,
+                model,
+                distortion: profile.distortion.is_some(),
+                tca: profile.tca.is_some(),
+                vignetting: profile.vignetting.is_some(),
+            },
+            profile,
+        }))
+    } else {
+        let db = database()?;
+        db.resolve(&Shot::read(&key.0), &key.1).map(Arc::new)
+    };
     let mut cache = profile_cache().lock().unwrap();
     if cache.len() >= MAX_CACHED_PROFILES {
         cache.clear();

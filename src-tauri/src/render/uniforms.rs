@@ -167,10 +167,10 @@ pub struct GlobalAdjustments {
     pub red_curve_count: u32,
     pub green_curve_count: u32,
     pub blue_curve_count: u32,
-    _pad_end1: f32,
-    _pad_end2: f32,
-    _pad_end3: f32,
-    _pad_end4: f32,
+    pub has_dcp_lut: u32,
+    pub hsl_uniformity: f32,
+    pub cg_shadows_pivot: f32,
+    pub cg_highlights_pivot: f32,
 
     pub glow_amount: f32,
     pub halation_amount: f32,
@@ -942,10 +942,37 @@ fn get_global_adjustments_from_json(
         red_curve_count: red_points.len() as u32,
         green_curve_count: green_points.len() as u32,
         blue_curve_count: blue_points.len() as u32,
-        _pad_end1: 0.0,
-        _pad_end2: 0.0,
-        _pad_end3: 0.0,
-        _pad_end4: 0.0,
+        has_dcp_lut: 0,
+        hsl_uniformity: if color_mixer_visible {
+            (js_adjustments
+                .get("hslUniformity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32
+                / 100.0)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        cg_shadows_pivot: if color_grading_visible {
+            (js_adjustments
+                .get("colorGradingShadowsPivot")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32
+                / 100.0)
+                .clamp(-1.0, 1.0)
+        } else {
+            0.0
+        },
+        cg_highlights_pivot: if color_grading_visible {
+            (js_adjustments
+                .get("colorGradingHighlightsPivot")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32
+                / 100.0)
+                .clamp(-1.0, 1.0)
+        } else {
+            0.0
+        },
 
         glow_amount: get_val("creative", "glowAmount", SCALES.glow, None),
         halation_amount: get_val("creative", "halationAmount", SCALES.halation, None),

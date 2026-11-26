@@ -125,10 +125,10 @@ struct GlobalAdjustments {
     red_curve_count: u32,
     green_curve_count: u32,
     blue_curve_count: u32,
-    _pad_end1: f32,
-    _pad_end2: f32,
-    _pad_end3: f32,
-    _pad_end4: f32,
+    has_dcp_lut: u32,
+    hsl_uniformity: f32,
+    cg_shadows_pivot: f32,
+    cg_highlights_pivot: f32,
 
     glow_amount: f32,
     halation_amount: f32,
@@ -259,6 +259,7 @@ const HSL_RANGES: array<HslRange, 8> = array<HslRange, 8>(
 @group(0) @binding(5) var lut_sampler: sampler;
 
 @group(0) @binding(6) var sharpness_blur_texture: texture_2d<f32>;
+@group(0) @binding(7) var dcp_lut_texture: texture_3d<f32>;
 @group(0) @binding(9) var bloom_texture: texture_2d<f32>;
 @group(0) @binding(10) var flare_texture: texture_2d<f32>;
 @group(0) @binding(11) var light_sampler: sampler;
@@ -1080,8 +1081,47 @@ fn apply_hsl_tetrahedral(safe_color: vec3<f32>, hsl_adjustments: array<HslColor,
     return fit_grade_gamut(max(blended, vec3<f32>(0.0)), 0.0);
 }
 
+fn apply_hsl_uniformity(safe_color: vec3<f32>, uniformity: f32) -> vec3<f32> {
+    if (uniformity <= 0.0001) {
+        return safe_color;
+    }
+    let hsv = working_to_hsv(safe_color);
+    let sat_mask = smoothstep(0.06, 0.25, hsv.y);
+    if (sat_mask <= 0.0001) {
+        return safe_color;
+    }
+
+    var total_w: f32 = 0.0;
+    var best_w: f32 = 0.0;
+    var target_hue: f32 = hsv.x;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let range = HSL_RANGES[i];
+        let w = get_raw_hsl_influence(hsv.x, range.center, range.width);
+        total_w += w;
+        if (w > best_w) {
+            best_w = w;
+            target_hue = range.center;
+        }
+    }
+    if (total_w <= 1e-5) {
+        return safe_color;
+    }
+
+    var diff = target_hue - hsv.x;
+    if (diff > 180.0) { diff -= 360.0; }
+    if (diff < -180.0) { diff += 360.0; }
+    let shifted_h = (hsv.x + diff * uniformity * sat_mask * 0.65 + 360.0) % 360.0;
+    let shifted = hsv_to_working(vec3<f32>(shifted_h, hsv.y, hsv.z));
+    let orig_luma = get_luma(safe_color);
+    let new_luma = get_luma(shifted);
+    if (new_luma > 1e-4) {
+        return shifted * (orig_luma / new_luma);
+    }
+    return safe_color;
+}
+
 fn apply_hsl_panel(color: vec3<f32>, hsl_adjustments: array<HslColor, 8>, coords_i: vec2<i32>) -> vec3<f32> {
-    var has_adjustments = false;
+    var has_adjustments = adjustments.global.hsl_uniformity > 0.0001;
     for (var i = 0u; i < 8u; i = i + 1u) {
         if (abs(hsl_adjustments[i].hue) > 0.0001 ||
             abs(hsl_adjustments[i].saturation) > 0.0001 ||
@@ -1105,7 +1145,8 @@ fn apply_hsl_panel(color: vec3<f32>, hsl_adjustments: array<HslColor, 8>, coords
     }
 
     if (adjustments.global.hsl_mode == 1u) {
-        let tetra_out = apply_hsl_tetrahedral(safe_color, hsl_adjustments);
+        var tetra_out = apply_hsl_tetrahedral(safe_color, hsl_adjustments);
+        tetra_out = apply_hsl_uniformity(tetra_out, adjustments.global.hsl_uniformity);
         return mix(safe_color, tetra_out, skin_factor);
     }
 
@@ -1162,6 +1203,7 @@ fn apply_hsl_panel(color: vec3<f32>, hsl_adjustments: array<HslColor, 8>, coords
             classic_out = hs_shifted_rgb * (target_luma / new_luma);
         }
     }
+    classic_out = apply_hsl_uniformity(classic_out, adjustments.global.hsl_uniformity);
     return mix(safe_color, classic_out, skin_factor);
 }
 
@@ -1195,10 +1237,11 @@ fn display_lightness(scene_lightness: f32) -> f32 {
     return signed_cbrt(get_luma(srgb_to_linear(display)));
 }
 
-fn color_grade_regions(lightness: f32, feather: f32, balance: f32) -> vec3<f32> {
+fn color_grade_regions(lightness: f32, feather: f32, balance: f32, shadows_pivot: f32, highlights_pivot: f32) -> vec3<f32> {
     let shift = balance * CG_BALANCE_SHIFT;
-    let shadow_split = 1.0 / 3.0 - shift;
-    let highlight_split = 2.0 / 3.0 - shift;
+    var shadow_split = clamp(1.0 / 3.0 - shift + shadows_pivot * 0.22, 0.05, 0.90);
+    let highlight_split = clamp(2.0 / 3.0 - shift + highlights_pivot * 0.22, 0.10, 0.95);
+    shadow_split = min(shadow_split, highlight_split - 0.05);
     let shadow = 1.0 - smoothstep(shadow_split - feather, shadow_split + feather, lightness);
     let highlight = smoothstep(highlight_split - feather, highlight_split + feather, lightness);
     return vec3<f32>(shadow, max(1.0 - shadow - highlight, 0.0), highlight);
@@ -1216,7 +1259,7 @@ fn fit_grade_gamut(graded: vec3<f32>, lower_bound: f32) -> vec3<f32> {
     return luma + (graded - luma) * ((luma - lower_bound) / (luma - lowest));
 }
 
-fn apply_color_grading(color: vec3<f32>, shadows: ColorGradeSettings, midtones: ColorGradeSettings, highlights: ColorGradeSettings, global: ColorGradeSettings, blending: f32, balance: f32) -> vec3<f32> {
+fn apply_color_grading(color: vec3<f32>, shadows: ColorGradeSettings, midtones: ColorGradeSettings, highlights: ColorGradeSettings, global: ColorGradeSettings, blending: f32, balance: f32, shadows_pivot: f32, highlights_pivot: f32) -> vec3<f32> {
     let amount = abs(shadows.tint_a) + abs(shadows.tint_b) + abs(shadows.luminance)
         + abs(midtones.tint_a) + abs(midtones.tint_b) + abs(midtones.luminance)
         + abs(highlights.tint_a) + abs(highlights.tint_b) + abs(highlights.luminance)
@@ -1232,8 +1275,8 @@ fn apply_color_grading(color: vec3<f32>, shadows: ColorGradeSettings, midtones: 
     let slope = clamp((upper - lower) / (2.0 * CG_SLOPE_STEP), CG_SLOPE_MIN, CG_SLOPE_MAX);
 
     let feather = CG_FEATHER_MIN + CG_FEATHER_RANGE * blending;
-    let tint_regions = color_grade_regions(lightness, feather, balance);
-    let luminance_regions = color_grade_regions(lightness, max(feather, CG_LUMINANCE_FEATHER_MIN), balance);
+    let tint_regions = color_grade_regions(lightness, feather, balance, shadows_pivot, highlights_pivot);
+    let luminance_regions = color_grade_regions(lightness, max(feather, CG_LUMINANCE_FEATHER_MIN), balance, shadows_pivot, highlights_pivot);
 
     let tint = vec2<f32>(shadows.tint_a, shadows.tint_b) * tint_regions.x
         + vec2<f32>(midtones.tint_a, midtones.tint_b) * tint_regions.y
@@ -2142,6 +2185,55 @@ fn sample_lut_tetrahedral(uv: vec3<f32>) -> vec3<f32> {
     return res;
 }
 
+fn sample_dcp_lut_tetrahedral(uv: vec3<f32>) -> vec3<f32> {
+    let dims = vec3<f32>(textureDimensions(dcp_lut_texture));
+    let size = dims - vec3<f32>(1.0);
+    let scaled = clamp(uv, vec3<f32>(0.0), vec3<f32>(1.0)) * size;
+    let i_base = floor(scaled);
+    let f = scaled - i_base;
+    let coord0 = vec3<i32>(i_base);
+    let coord1 = min(coord0 + vec3<i32>(1), vec3<i32>(dims) - vec3<i32>(1));
+    let c000 = textureLoad(dcp_lut_texture, coord0, 0).rgb;
+    let c111 = textureLoad(dcp_lut_texture, coord1, 0).rgb;
+
+    if (f.r > f.g) {
+        if (f.g > f.b) {
+            let c100 = textureLoad(dcp_lut_texture, vec3<i32>(coord1.x, coord0.y, coord0.z), 0).rgb;
+            let c110 = textureLoad(dcp_lut_texture, vec3<i32>(coord1.x, coord1.y, coord0.z), 0).rgb;
+            return c000 * (1.0 - f.r) + c100 * (f.r - f.g) + c110 * (f.g - f.b) + c111 * f.b;
+        } else if (f.r > f.b) {
+            let c100 = textureLoad(dcp_lut_texture, vec3<i32>(coord1.x, coord0.y, coord0.z), 0).rgb;
+            let c101 = textureLoad(dcp_lut_texture, vec3<i32>(coord1.x, coord0.y, coord1.z), 0).rgb;
+            return c000 * (1.0 - f.r) + c100 * (f.r - f.b) + c101 * (f.b - f.g) + c111 * f.g;
+        } else {
+            let c001 = textureLoad(dcp_lut_texture, vec3<i32>(coord0.x, coord0.y, coord1.z), 0).rgb;
+            let c101 = textureLoad(dcp_lut_texture, vec3<i32>(coord1.x, coord0.y, coord1.z), 0).rgb;
+            return c000 * (1.0 - f.b) + c001 * (f.b - f.r) + c101 * (f.r - f.g) + c111 * f.g;
+        }
+    } else {
+        if (f.b > f.g) {
+            let c001 = textureLoad(dcp_lut_texture, vec3<i32>(coord0.x, coord0.y, coord1.z), 0).rgb;
+            let c011 = textureLoad(dcp_lut_texture, vec3<i32>(coord0.x, coord1.y, coord1.z), 0).rgb;
+            return c000 * (1.0 - f.b) + c001 * (f.b - f.g) + c011 * (f.g - f.r) + c111 * f.r;
+        } else if (f.b > f.r) {
+            let c010 = textureLoad(dcp_lut_texture, vec3<i32>(coord0.x, coord1.y, coord0.z), 0).rgb;
+            let c011 = textureLoad(dcp_lut_texture, vec3<i32>(coord0.x, coord1.y, coord1.z), 0).rgb;
+            return c000 * (1.0 - f.g) + c010 * (f.g - f.b) + c011 * (f.b - f.r) + c111 * f.r;
+        } else {
+            let c010 = textureLoad(dcp_lut_texture, vec3<i32>(coord0.x, coord1.y, coord0.z), 0).rgb;
+            let c110 = textureLoad(dcp_lut_texture, vec3<i32>(coord1.x, coord1.y, coord0.z), 0).rgb;
+            return c000 * (1.0 - f.g) + c010 * (f.g - f.r) + c110 * (f.r - f.b) + c111 * f.b;
+        }
+    }
+}
+
+fn apply_dcp_lut(rgb: vec3<f32>) -> vec3<f32> {
+    let clamped = clamp(rgb, vec3<f32>(0.0), vec3<f32>(4.0));
+    let u = sqrt(clamped * 0.25);
+    let mapped = sample_dcp_lut_tetrahedral(u);
+    return mapped + max(rgb - vec3<f32>(4.0), vec3<f32>(0.0));
+}
+
 fn output_transform(display: vec3<f32>) -> vec3<f32> {
     let compression = adjustments.global.gamut_compression;
     let curve = adjustments.global.output_transfer;
@@ -2865,6 +2957,9 @@ fn main(
 
     var composite_rgb_linear = processed_rgb;
     composite_rgb_linear = apply_white_balance(composite_rgb_linear, t_wb_log_gains);
+    if (adjustments.global.has_dcp_lut == 1u) {
+        composite_rgb_linear = apply_dcp_lut(composite_rgb_linear);
+    }
     composite_rgb_linear = apply_centre_tonal_and_color(composite_rgb_linear, adjustments.global.centre, vec2<f32>(adjustments.global.centre_x, adjustments.global.centre_y), absolute_coord_i);
     let tone_stats = textureLoad(airlight_texture, vec2<i32>(2, 0), 0);
     let white_level = tone_stats.x + t_exposure;
@@ -2924,7 +3019,9 @@ fn main(
         adjustments.global.color_grading_highlights,
         adjustments.global.color_grading_global,
         adjustments.global.color_grading_blending,
-        adjustments.global.color_grading_balance
+        adjustments.global.color_grading_balance,
+        adjustments.global.cg_shadows_pivot,
+        adjustments.global.cg_highlights_pivot
     );
 
     for (var i = 0u; has_feature(F_MASKS) && i < adjustments.mask_count; i = i + 1u) {
@@ -2933,7 +3030,9 @@ fn main(
             let m = adjustments.mask_adjustments[i];
             let mask_graded = apply_color_grading(
                 composite_rgb_linear,
-                m.color_grading_shadows, m.color_grading_midtones, m.color_grading_highlights, m.color_grading_global, m.color_grading_blending, m.color_grading_balance
+                m.color_grading_shadows, m.color_grading_midtones, m.color_grading_highlights, m.color_grading_global, m.color_grading_blending, m.color_grading_balance,
+                0.0,
+                0.0
             );
             composite_rgb_linear = mix(composite_rgb_linear, mask_graded, influence);
         }

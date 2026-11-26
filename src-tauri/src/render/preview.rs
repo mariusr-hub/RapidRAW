@@ -322,6 +322,7 @@ pub struct EditorRender {
     masks: crate::masks::generation::GeneratedMasks,
     mask_cache_key: u64,
     lut: Option<Arc<crate::adjustments::lut_processing::Lut>>,
+    dcp_lut: Option<Arc<crate::adjustments::lut_processing::Lut>>,
     motion_blur: crate::effects::motion_blur::MotionBlurs,
 }
 
@@ -368,6 +369,10 @@ impl EditorRender {
             lut: adjustments["lutPath"]
                 .as_str()
                 .and_then(|p| crate::adjustments::lut_processing::get_or_load_lut(state, p).ok()),
+            dcp_lut: crate::decode::camera_profile::resolve_dcp_gpu_lut(
+                adjustments,
+                Some(loaded_image.as_shot.white_balance),
+            ),
             motion_blur: crate::effects::motion_blur::MotionBlurs::new(
                 &loaded_image.path,
                 adjustments,
@@ -388,6 +393,7 @@ impl EditorRender {
             mask_bitmaps: &self.masks.bitmaps,
             mask_cache_key: Some(self.mask_cache_key),
             lut: self.lut.clone(),
+            dcp_lut: self.dcp_lut.clone(),
             roi,
             hsl_probe,
             motion_blur: self.motion_blur.clone(),

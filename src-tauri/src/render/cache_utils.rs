@@ -173,7 +173,6 @@ pub fn calculate_patch_hash(adjustments: &serde_json::Value) -> u64 {
     hash_effect_keys(
         adjustments,
         &[
-            "cameraProfileId",
             "defringeEnabled",
             "defringePurpleAmount",
             "defringeGreenAmount",
@@ -429,7 +428,6 @@ pub fn calculate_transform_hash(adjustments: &serde_json::Value) -> u64 {
     hash_effect_keys(
         adjustments,
         &[
-            "cameraProfileId",
             "defringeEnabled",
             "defringePurpleAmount",
             "defringeGreenAmount",

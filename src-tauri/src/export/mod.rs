@@ -333,6 +333,10 @@ fn process_image_for_export_pipeline(
 
     let lut_path = js_adjustments["lutPath"].as_str();
     let lut = lut_path.and_then(|p| get_or_load_lut(state, p).ok());
+    let dcp_lut = crate::decode::camera_profile::resolve_dcp_gpu_lut(
+        js_adjustments,
+        Some(as_shot(path).white_balance),
+    );
 
     renders
         .iter()
@@ -350,6 +354,7 @@ fn process_image_for_export_pipeline(
                     mask_bitmaps: &mask_bitmaps,
                     mask_cache_key: None,
                     lut: lut.clone(),
+                    dcp_lut: dcp_lut.clone(),
                     roi: None,
                     hsl_probe: false,
                     motion_blur: crate::effects::motion_blur::MotionBlurs::new(

@@ -303,6 +303,7 @@ pub fn run() {
                 render::gpu::fallback::choose_backend(settings.processing_backend.as_deref());
 
             adjustments::lens_correction::init_lensfun_db(&app_handle);
+            decode::camera_profile::init_camera_profiles_dir(&app_handle);
 
             #[cfg(target_os = "linux")]
             let webkit_transport = platform::linux_graphics::configure_webkit_transport(

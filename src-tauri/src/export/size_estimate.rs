@@ -175,6 +175,10 @@ pub async fn estimate_export_sizes(
         let lut = adjustments_clone["lutPath"]
             .as_str()
             .and_then(|p| get_or_load_lut(&state, p).ok());
+        let dcp_lut = crate::decode::camera_profile::resolve_dcp_gpu_lut(
+            &adjustments_clone,
+            Some(loaded_image.as_shot.white_balance),
+        );
         let render = |render: RenderOptions, precision: RenderOutputPrecision| {
             let mut all_adjustments = get_all_adjustments_from_json(
                 &adjustments_clone,
@@ -193,6 +197,7 @@ pub async fn estimate_export_sizes(
                         mask_bitmaps: &mask_bitmaps,
                         mask_cache_key: None,
                         lut: lut.clone(),
+                        dcp_lut: dcp_lut.clone(),
                         roi: None,
                         hsl_probe: false,
                         motion_blur: crate::effects::motion_blur::MotionBlurs::new(
@@ -328,6 +333,10 @@ pub async fn estimate_export_sizes(
             .as_str()
             .and_then(|p| get_or_load_lut(&state, p).ok());
         let source_as_shot = as_shot(&source_path_str);
+        let dcp_lut = crate::decode::camera_profile::resolve_dcp_gpu_lut(
+            &js_adjustments,
+            Some(source_as_shot.white_balance),
+        );
         let render = |render: RenderOptions, precision: RenderOutputPrecision| {
             let mut all_adjustments =
                 get_all_adjustments_from_json(&js_adjustments, is_raw, source_as_shot, render);
@@ -342,6 +351,7 @@ pub async fn estimate_export_sizes(
                         mask_bitmaps: &mask_bitmaps,
                         mask_cache_key: None,
                         lut: lut.clone(),
+                        dcp_lut: dcp_lut.clone(),
                         roi: None,
                         hsl_probe: false,
                         motion_blur: crate::effects::motion_blur::MotionBlurs::new(

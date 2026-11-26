@@ -81,7 +81,9 @@ pub fn shader_features(adjustments: &AllAdjustments) -> u32 {
     );
     set(
         F_HSL,
-        hsl_nonzero(&g.hsl) || masks.iter().any(|m| hsl_nonzero(&m.hsl)),
+        hsl_nonzero(&g.hsl)
+            || g.hsl_uniformity > 0.0
+            || masks.iter().any(|m| hsl_nonzero(&m.hsl)),
     );
     set(F_MASKS, adjustments.mask_count > 0);
     set(F_SHARPEN, any(g.sharpness, |m| m.sharpness));
@@ -436,6 +438,16 @@ impl GpuPipelines {
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Float { filterable: false },
                 view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        });
+        bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 6 + MAX_MASK_BINDINGS,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D3,
                 multisampled: false,
             },
             count: None,

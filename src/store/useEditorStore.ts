@@ -1,7 +1,14 @@
 import { RefObject } from 'react';
 import { create } from 'zustand';
 import debounce from 'lodash.debounce';
-import { Adjustments, INITIAL_ADJUSTMENTS, MaskContainer, CropGeometry, pickCropGeometry } from '../utils/adjustments';
+import {
+  ActiveChannel,
+  Adjustments,
+  INITIAL_ADJUSTMENTS,
+  MaskContainer,
+  CropGeometry,
+  pickCropGeometry,
+} from '../utils/adjustments';
 import {
   SelectedImage,
   WaveformData,
@@ -46,6 +53,16 @@ interface BaseRenderSize extends ImageDimensions {
   offsetY: number;
 }
 
+export interface HoveredPixel {
+  r: number;
+  g: number;
+  b: number;
+  luma: number;
+  okL: number;
+  okA: number;
+  okB: number;
+}
+
 export type WgpuPhase = 'hidden' | 'arming' | 'live';
 
 interface EditorState {
@@ -80,6 +97,7 @@ interface EditorState {
   displayRevision: number;
   activeWaveformChannel: string;
   waveformHeight: number;
+  hoveredPixel: HoveredPixel | null;
 
   // Interaction State
   isSliderDragging: boolean;
@@ -101,6 +119,9 @@ interface EditorState {
   activeRelightLightId: string | null;
   activeCenterMarker: CenterMarker | null;
   mixerPickerProperty: HslMixerProperty | null;
+  isTargetedCurveActive: boolean;
+  targetedCurveChannel: ActiveChannel;
+  targetedCurveHover: { x: number; y: number } | null;
   isGuidedPerspectiveActive: boolean;
   liveRotation: number | null;
   cropSessionSnapshot: { path: string | null; geometry: CropGeometry } | null;
@@ -187,7 +208,7 @@ export const debouncedSetHistory = debounce((newAdj: Adjustments, label?: string
 
 type CanvasToolState = Pick<
   EditorState,
-  'isWbPickerActive' | 'isRelightPickerActive' | 'activeCenterMarker' | 'mixerPickerProperty'
+  'isWbPickerActive' | 'isRelightPickerActive' | 'activeCenterMarker' | 'mixerPickerProperty' | 'isTargetedCurveActive'
 >;
 
 export const canvasToolState = (activeTool: Partial<CanvasToolState> = {}): CanvasToolState => ({
@@ -195,6 +216,7 @@ export const canvasToolState = (activeTool: Partial<CanvasToolState> = {}): Canv
   isRelightPickerActive: false,
   activeCenterMarker: null,
   mixerPickerProperty: null,
+  isTargetedCurveActive: false,
   ...activeTool,
 });
 
@@ -223,6 +245,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   displayRevision: 0,
   activeWaveformChannel: 'luma',
   waveformHeight: 220,
+  hoveredPixel: null,
 
   isSliderDragging: false,
   speedEditTarget: null,
@@ -252,6 +275,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   activeRelightLightId: null,
   activeCenterMarker: null,
   mixerPickerProperty: null,
+  isTargetedCurveActive: false,
+  targetedCurveChannel: ActiveChannel.Luma,
+  targetedCurveHover: null,
   isGuidedPerspectiveActive: false,
   liveRotation: null,
   cropSessionSnapshot: null,
@@ -360,7 +386,8 @@ export const cancelCanvasTool = (): boolean => {
     state.isRelightPickerActive ||
     state.activeCenterMarker !== null ||
     state.mixerPickerProperty !== null ||
+    state.isTargetedCurveActive ||
     state.isStraightenActive;
-  if (isActive) state.setEditor({ ...canvasToolState(), isStraightenActive: false });
+  if (isActive) state.setEditor({ ...canvasToolState(), isStraightenActive: false, targetedCurveHover: null });
   return isActive;
 };

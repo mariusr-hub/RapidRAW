@@ -138,6 +138,10 @@ pub async fn generate_preset_preview(
                 mask_bitmaps: &mask_bitmaps,
                 mask_cache_key: None,
                 lut,
+                dcp_lut: crate::decode::camera_profile::resolve_dcp_gpu_lut(
+                    &js_adjustments,
+                    Some(loaded_image.as_shot.white_balance),
+                ),
                 roi: None,
                 hsl_probe: false,
                 motion_blur: crate::effects::motion_blur::MotionBlurs::new(
@@ -342,6 +346,10 @@ pub async fn generate_all_community_previews(
                             mask_bitmaps: &mask_bitmaps,
                             mask_cache_key: None,
                             lut,
+                            dcp_lut: crate::decode::camera_profile::resolve_dcp_gpu_lut(
+                                &scaled_adjustments,
+                                Some(as_shot.white_balance),
+                            ),
                             roi: None,
                             hsl_probe: false,
                             motion_blur: crate::effects::motion_blur::MotionBlurs::new(

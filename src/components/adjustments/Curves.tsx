@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { RotateCcw, Copy, ClipboardPaste, Spline, Settings2 } from 'lucide-react';
+import { RotateCcw, Copy, ClipboardPaste, Spline, Settings2, Crosshair } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   ActiveChannel,
@@ -18,7 +18,8 @@ import { useContextMenu } from '../../context/ContextMenuContext';
 import Text from '../ui/Text';
 import Slider from '../ui/Slider';
 import { TextColors, TextVariants, TextWeights } from '../../types/typography';
-import { useEditorStore } from '../../store/useEditorStore';
+import { canvasToolState, useEditorStore } from '../../store/useEditorStore';
+import { evalMonotoneCurveY } from '../../hooks/useTargetedCurveTool';
 import { FINE_ADJUSTMENT_MULTIPLIER, hasFineAdjustmentModifier } from '../../utils/fineAdjustment';
 
 let curveClipboard: Array<Coord> | null = null;
@@ -275,11 +276,14 @@ function convertParametricToPoints(settings: ParametricCurveSettings): Array<Coo
 const POINT_HIT_RADIUS_PX = 12;
 const MIN_POINT_GAP_X = 1;
 
-function CurveGraph({ adjustments, setAdjustments, theme, onDragStateChange }: CurveGraphProps) {
+function CurveGraph({ adjustments, isForMask = false, setAdjustments, theme, onDragStateChange }: CurveGraphProps) {
   const { t } = useTranslation();
   const { showContextMenu } = useContextMenu();
   const [curveMode, setCurveMode] = useState<'point' | 'parametric'>(adjustments.curveMode || 'point');
   const [activeChannel, setActiveChannel] = useState<ActiveChannel>(ActiveChannel.Luma);
+  const isTargetedCurveActive = useEditorStore((state) => !isForMask && state.isTargetedCurveActive);
+  const targetedCurveHover = useEditorStore((state) => (!isForMask ? state.targetedCurveHover : null));
+  const setEditor = useEditorStore((state) => state.setEditor);
   const [draggingPointIndex, setDraggingPointIndex] = useState<number | null>(null);
   const [draggingSplitKey, setDraggingSplitKey] = useState<'split1' | 'split2' | 'split3' | null>(null);
   const [localPoints, setLocalPoints] = useState<Array<Coord> | null>(null);
@@ -309,10 +313,18 @@ function CurveGraph({ adjustments, setAdjustments, theme, onDragStateChange }: C
     setCurveMode(adjustments.curveMode || 'point');
   }, [adjustments.curveMode]);
 
+  useEffect(() => {
+    if (isForMask) return;
+    setEditor({ targetedCurveChannel: activeChannel });
+  }, [activeChannel, isForMask, setEditor]);
+
   const activeParametricSettings =
     (draggingSplitKey ? localParametricSettings : null) ?? parametricCurves[activeChannel];
 
   const handleToggleMode = (newMode: 'point' | 'parametric') => {
+    if (newMode === 'parametric' && !isForMask && isTargetedCurveActive) {
+      setEditor({ isTargetedCurveActive: false, targetedCurveHover: null });
+    }
     if (newMode === curveMode) return;
     setCurveMode(newMode);
 
@@ -339,6 +351,21 @@ function CurveGraph({ adjustments, setAdjustments, theme, onDragStateChange }: C
         };
       }
     });
+  };
+
+  const handleToggleTargetedCurve = () => {
+    if (isForMask) return;
+    if (isParametricMode) {
+      handleToggleMode('point');
+    }
+    setEditor(
+      canvasToolState({
+        isTargetedCurveActive: !isTargetedCurveActive,
+      }),
+    );
+    if (isTargetedCurveActive) {
+      setEditor({ targetedCurveHover: null });
+    }
   };
 
   const updateParametricValue = (key: keyof ParametricCurveSettings, value: number) => {
@@ -852,6 +879,18 @@ function CurveGraph({ adjustments, setAdjustments, theme, onDragStateChange }: C
           >
             <Settings2 size={16} />
           </button>
+          {!isForMask && (
+            <button
+              className={`w-8 h-8 rounded-md flex items-center justify-center transition-all ${
+                isTargetedCurveActive ? 'bg-accent text-button-text' : 'text-text-secondary hover:text-text-primary'
+              }`}
+              onClick={handleToggleTargetedCurve}
+              data-tooltip={t('adjustments.curves.targetedCurve')}
+              type="button"
+            >
+              <Crosshair size={16} />
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
@@ -935,6 +974,31 @@ function CurveGraph({ adjustments, setAdjustments, theme, onDragStateChange }: C
               ))}
 
             <path d={getCurvePath(activePoints)} fill="none" stroke={color} strokeWidth="2.5" />
+
+            {!isForMask && isTargetedCurveActive && targetedCurveHover && !isParametricMode && (
+              <>
+                <line
+                  x1={targetedCurveHover.x}
+                  y1="0"
+                  x2={targetedCurveHover.x}
+                  y2="255"
+                  stroke={color}
+                  strokeOpacity={0.45}
+                  strokeWidth="1"
+                  strokeDasharray="3 3"
+                  pointerEvents="none"
+                />
+                <circle
+                  cx={targetedCurveHover.x}
+                  cy={255 - evalMonotoneCurveY(activePoints, targetedCurveHover.x)}
+                  r="4.5"
+                  fill="#ffffff"
+                  stroke={color}
+                  strokeWidth="2"
+                  pointerEvents="none"
+                />
+              </>
+            )}
 
             {isParametricMode && activePoints.length >= 2 && (
               <>

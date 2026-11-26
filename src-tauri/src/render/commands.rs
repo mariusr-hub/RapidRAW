@@ -386,6 +386,10 @@ pub async fn generate_uncropped_preview(
                 mask_bitmaps: &mask_bitmaps,
                 mask_cache_key: None,
                 lut,
+                dcp_lut: crate::decode::camera_profile::resolve_dcp_gpu_lut(
+                    &adjustments_clone,
+                    Some(loaded_image.as_shot.white_balance),
+                ),
                 roi: None,
                 hsl_probe: false,
                 motion_blur: crate::effects::motion_blur::MotionBlurs::new(
@@ -496,6 +500,10 @@ pub async fn generate_preview_for_path(
                 mask_bitmaps: &mask_bitmaps,
                 mask_cache_key: None,
                 lut,
+                dcp_lut: crate::decode::camera_profile::resolve_dcp_gpu_lut(
+                    &js_adjustments,
+                    Some(crate::decode::as_shot::as_shot(&source_path_str).white_balance),
+                ),
                 roi: None,
                 hsl_probe: false,
                 motion_blur: crate::effects::motion_blur::MotionBlurs::new(

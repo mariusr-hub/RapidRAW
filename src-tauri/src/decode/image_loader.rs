@@ -120,9 +120,8 @@ fn prepare_reduced_base_image<'a>(
 ) -> Result<Cow<'a, DynamicImage>> {
     let denoised = crate::ai::denoise::apply_ai_denoise(base_image, path, adjustments);
     let upscaled = crate::ai::upscale::apply_ai_upscale(base_image, denoised, path, adjustments);
-    let profiled = crate::decode::camera_profile::apply_camera_profile_if_enabled(upscaled, adjustments);
     let prepared = crate::adjustments::negative_conversion::apply_negative_conversion(
-        profiled,
+        upscaled,
         is_raw_file(path),
         adjustments,
     );

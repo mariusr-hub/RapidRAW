@@ -41,9 +41,12 @@
         "blending": "Blending",
         "global": "Global",
         "highlights": "Highlights",
+        "highlightsPivot": "Highlights Pivot",
         "midtones": "Midtones",
-        "shadows": "Shadows"
+        "shadows": "Shadows",
+        "shadowsPivot": "Shadows Pivot"
       },
+      "hslUniformity": "Hue Uniformity (%)",
       "hue": "Hue",
       "kelvinModeTooltip": "Show temperature in Kelvin",
       "localHue": "Local Hue",
@@ -143,6 +146,7 @@
       "pasteParametric": "Paste Parametric Curve",
       "pastePoint": "Paste Point Curve",
       "pointCurve": "Point Curve",
+      "targetedCurve": "Targeted Curve Tool (drag vertically on photo)",
       "resetAllParametric": "Reset All Parametric Curves",
       "resetAllPoint": "Reset All Point Curves",
       "resetParametric": "Reset {{channel}} Parametric Curve",

@@ -50,6 +50,7 @@ pub struct RenderRequest<'a> {
     pub mask_bitmaps: &'a [ImageBuffer<Luma<u8>, Vec<u8>>],
     pub mask_cache_key: Option<u64>,
     pub lut: Option<Arc<Lut>>,
+    pub dcp_lut: Option<Arc<Lut>>,
     pub roi: Option<Roi>,
     pub hsl_probe: bool,
     pub motion_blur: crate::effects::motion_blur::MotionBlurs,
@@ -200,6 +201,7 @@ pub struct GpuProcessor {
     motion_cache: std::sync::Mutex<Vec<(u64, Arc<MotionBlurred>)>>,
     motion_grain: std::sync::Mutex<Vec<(u64, f32)>>,
     lut_cache: std::sync::Mutex<Option<LutCache>>,
+    dcp_lut_cache: std::sync::Mutex<Option<LutCache>>,
     ping_pong_view: wgpu::TextureView,
     sharpness_blur_view: wgpu::TextureView,
     blur_source: std::sync::Mutex<Option<(u64, BlurParams)>>,
@@ -457,6 +459,7 @@ impl GpuProcessor {
             motion_cache: std::sync::Mutex::new(Vec::new()),
             motion_grain: std::sync::Mutex::new(Vec::new()),
             lut_cache: std::sync::Mutex::new(None),
+            dcp_lut_cache: std::sync::Mutex::new(None),
             ping_pong_view,
             sharpness_blur_view,
             blur_source: std::sync::Mutex::new(None),
@@ -1116,8 +1119,13 @@ impl GpuProcessor {
         Ok(Some(blurred))
     }
 
-    fn lut_view(&self, lut: &Arc<Lut>) -> (wgpu::TextureView, wgpu::Sampler) {
-        let mut cache = self.lut_cache.lock().unwrap_or_else(|e| e.into_inner());
+    fn upload_3d_lut_cached(
+        &self,
+        slot: &std::sync::Mutex<Option<LutCache>>,
+        lut: &Arc<Lut>,
+        label: &'static str,
+    ) -> (wgpu::TextureView, wgpu::Sampler) {
+        let mut cache = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cache.as_ref()
             && Arc::ptr_eq(&c.lut, lut)
         {
@@ -1137,7 +1145,7 @@ impl GpuProcessor {
         let lut_texture = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
-                label: Some("LUT 3D Texture"),
+                label: Some(label),
                 size: wgpu::Extent3d {
                     width: size,
                     height: size,
@@ -1168,6 +1176,15 @@ impl GpuProcessor {
             sampler: sampler.clone(),
         });
         (view, sampler)
+    }
+
+    fn lut_view(&self, lut: &Arc<Lut>) -> (wgpu::TextureView, wgpu::Sampler) {
+        self.upload_3d_lut_cached(&self.lut_cache, lut, "LUT 3D Texture")
+    }
+
+    fn dcp_lut_view(&self, lut: &Arc<Lut>) -> wgpu::TextureView {
+        self.upload_3d_lut_cached(&self.dcp_lut_cache, lut, "DCP Camera Profile 3D Texture")
+            .0
     }
 
     fn main_pipeline_for(
@@ -1511,8 +1528,13 @@ impl GpuProcessor {
                 self.pipelines.dummy_lut_sampler.clone(),
             ),
         };
+        let dcp_lut_texture_view = match &request.dcp_lut {
+            Some(lut) => self.dcp_lut_view(lut),
+            None => self.pipelines.dummy_lut_view.clone(),
+        };
 
-        let adjustments = request.adjustments;
+        let mut adjustments = request.adjustments;
+        adjustments.global.has_dcp_lut = if request.dcp_lut.is_some() { 1 } else { 0 };
         let light = match crate::effects::light::LightJob::new(input.id, &adjustments) {
             Some(job) => Some(self.light_maps(input, job)?),
             None => None,
@@ -1727,6 +1749,10 @@ impl GpuProcessor {
                     } else {
                         &self.pipelines.dummy_blur_view
                     }),
+                });
+                bind_group_entries.push(wgpu::BindGroupEntry {
+                    binding: 6 + MAX_MASK_BINDINGS,
+                    resource: wgpu::BindingResource::TextureView(&dcp_lut_texture_view),
                 });
                 bind_group_entries.push(wgpu::BindGroupEntry {
                     binding: 8 + MAX_MASK_BINDINGS,

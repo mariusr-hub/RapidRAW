@@ -307,6 +307,9 @@ pub fn all_available_adjustments() -> HashSet<String> {
         "cameraProfileId",
         "hslMode",
         "hslSkinLock",
+        "hslUniformity",
+        "colorGradingShadowsPivot",
+        "colorGradingHighlightsPivot",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -396,6 +399,9 @@ pub fn default_included_adjustments() -> HashSet<String> {
         "cameraProfileId",
         "hslMode",
         "hslSkinLock",
+        "hslUniformity",
+        "colorGradingShadowsPivot",
+        "colorGradingHighlightsPivot",
     ];
 
     for item in off_by_default.iter() {

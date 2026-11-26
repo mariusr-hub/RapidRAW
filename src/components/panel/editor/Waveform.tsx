@@ -74,6 +74,55 @@ const SdrWhiteMarker = memo(({ horizontal }: { horizontal: boolean }) => {
   );
 });
 
+const IRE_TICKS = [0, 25, 50, 75, 100] as const;
+
+const WaveformGraticule = memo(() => {
+  const sdrWhite = useEditorStore((state) => state.scopeWhite);
+  const isHdr = sdrWhite < 0.999;
+
+  return (
+    <svg className="absolute inset-0 w-full h-full z-10 pointer-events-none select-none">
+      {IRE_TICKS.map((ire) => {
+        const yPct = (1 - (ire / 100) * sdrWhite) * 100;
+        if (yPct < 2 || yPct > 98) return null;
+        return (
+          <g key={ire}>
+            <line
+              x1="0%"
+              y1={`${yPct}%`}
+              x2="100%"
+              y2={`${yPct}%`}
+              stroke="rgba(255,255,255,0.12)"
+              strokeWidth="1"
+              strokeDasharray={ire === 0 || ire === 100 ? undefined : '2 3'}
+            />
+            <text
+              x="4"
+              y={`${yPct}%`}
+              dy={ire === 100 ? '8' : '-2'}
+              fill="rgba(255,255,255,0.45)"
+              fontSize="8"
+              fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+            >
+              {isHdr ? `${Math.round(ire * 2.03)}` : ire}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+});
+
+const LivePixelReadout = memo(() => {
+  const hoveredPixel = useEditorStore((state) => state.hoveredPixel);
+  if (!hoveredPixel) return null;
+  return (
+    <div className="pointer-events-none absolute top-1.5 right-1.5 z-20 max-w-[calc(100%-12px)] truncate rounded bg-black/65 px-1.5 py-0.5 font-mono text-[10px] leading-tight text-white/90 tabular-nums backdrop-blur-xs">
+      {`R ${hoveredPixel.r} G ${hoveredPixel.g} B ${hoveredPixel.b} · Y ${hoveredPixel.luma} · L ${hoveredPixel.okL.toFixed(2)} a ${hoveredPixel.okA >= 0 ? '+' : ''}${hoveredPixel.okA.toFixed(2)} b ${hoveredPixel.okB >= 0 ? '+' : ''}${hoveredPixel.okB.toFixed(2)}`}
+    </div>
+  );
+});
+
 const HistogramView = memo(() => {
   const histogram: any = useEditorStore((state) => state.histogram);
   if (!histogram || !histogram.red || !histogram.green || !histogram.blue) return null;
@@ -579,8 +628,10 @@ function Waveform({
             </motion.div>
           ) : null}
         </AnimatePresence>
+        {isReady && !isHistogram && !isVectorscope && <WaveformGraticule />}
         {isReady && !isVectorscope && <SdrWhiteMarker horizontal={!isHistogram} />}
       </div>
+      {!isHovered && <LivePixelReadout />}
 
       <AnimatePresence>
         {isHovered && (

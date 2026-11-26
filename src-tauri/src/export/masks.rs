@@ -117,6 +117,10 @@ pub fn export_masks_for_image(
             get_all_adjustments_from_json(js_adjustments, is_raw, as_shot(source_path_str), render);
         let lut_path = js_adjustments["lutPath"].as_str();
         let lut = lut_path.and_then(|p| get_or_load_lut(state, p).ok());
+        let dcp_lut = crate::decode::camera_profile::resolve_dcp_gpu_lut(
+            js_adjustments,
+            Some(as_shot(source_path_str).white_balance),
+        );
         let output_dir = output_path_obj.parent().unwrap_or(output_path_obj);
         let stem = output_path_obj
             .file_stem()
@@ -138,6 +142,7 @@ pub fn export_masks_for_image(
                     mask_bitmaps: &single_bitmaps,
                     mask_cache_key: None,
                     lut: lut.clone(),
+                    dcp_lut: dcp_lut.clone(),
                     roi: None,
                     hsl_probe: false,
                     motion_blur: Default::default(),
