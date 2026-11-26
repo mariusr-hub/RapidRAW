@@ -26,6 +26,7 @@ import { HslMixerProperty } from '../utils/hslMixer';
 import { getCroppedDimensions } from '../utils/cropUtils';
 import { getDevicePixelRatio } from '../utils/displayScale';
 import { IsophoteGuide, ShieldRegion } from '../components/panel/editor/overlays/InpaintGuideOverlay';
+import type { DetectedSpot } from '../enhanced/panels/DustScratchProSection';
 
 export type CenterMarker = 'vignette' | 'centre';
 export type CompareMode = 'none' | 'vertical_split' | 'horizontal_split' | 'side_by_side' | 'matrix_4way';
@@ -122,6 +123,8 @@ interface EditorState {
   isTargetedCurveActive: boolean;
   targetedCurveChannel: ActiveChannel;
   targetedCurveHover: { x: number; y: number } | null;
+  isDustSpotEditActive: boolean;
+  dustSpotCandidates: DetectedSpot[];
   isGuidedPerspectiveActive: boolean;
   liveRotation: number | null;
   cropSessionSnapshot: { path: string | null; geometry: CropGeometry } | null;
@@ -208,7 +211,12 @@ export const debouncedSetHistory = debounce((newAdj: Adjustments, label?: string
 
 type CanvasToolState = Pick<
   EditorState,
-  'isWbPickerActive' | 'isRelightPickerActive' | 'activeCenterMarker' | 'mixerPickerProperty' | 'isTargetedCurveActive'
+  | 'isWbPickerActive'
+  | 'isRelightPickerActive'
+  | 'activeCenterMarker'
+  | 'mixerPickerProperty'
+  | 'isTargetedCurveActive'
+  | 'isDustSpotEditActive'
 >;
 
 export const canvasToolState = (activeTool: Partial<CanvasToolState> = {}): CanvasToolState => ({
@@ -217,6 +225,7 @@ export const canvasToolState = (activeTool: Partial<CanvasToolState> = {}): Canv
   activeCenterMarker: null,
   mixerPickerProperty: null,
   isTargetedCurveActive: false,
+  isDustSpotEditActive: false,
   ...activeTool,
 });
 
@@ -278,6 +287,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   isTargetedCurveActive: false,
   targetedCurveChannel: ActiveChannel.Luma,
   targetedCurveHover: null,
+  isDustSpotEditActive: false,
+  dustSpotCandidates: [],
   isGuidedPerspectiveActive: false,
   liveRotation: null,
   cropSessionSnapshot: null,
@@ -343,6 +354,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       ...(restored ?? { history: [initialState], historyLabels: [''], historyIndex: 0 }),
       adjustments: initialState,
       pendingAutoEdit: null,
+      isDustSpotEditActive: false,
+      dustSpotCandidates: [],
       ...(state.cropSessionSnapshot
         ? {
             cropSessionSnapshot: {
@@ -387,6 +400,7 @@ export const cancelCanvasTool = (): boolean => {
     state.activeCenterMarker !== null ||
     state.mixerPickerProperty !== null ||
     state.isTargetedCurveActive ||
+    state.isDustSpotEditActive ||
     state.isStraightenActive;
   if (isActive) state.setEditor({ ...canvasToolState(), isStraightenActive: false, targetedCurveHover: null });
   return isActive;

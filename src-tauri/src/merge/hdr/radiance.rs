@@ -114,6 +114,20 @@ impl Accumulator {
         valid: &[f32],
         ghost: Option<&Raster>,
     ) {
+        self.add_with_override(clip, role, image, valid, ghost, None, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_override(
+        &mut self,
+        clip: f32,
+        role: FrameRole,
+        image: &Raster,
+        valid: &[f32],
+        ghost: Option<&Raster>,
+        override_self: Option<&[f32]>,
+        override_any: Option<&[f32]>,
+    ) {
         assert_eq!(image.width, self.width, "frame width must match the merge");
         assert_eq!(
             image.height, self.height,
@@ -144,6 +158,17 @@ impl Accumulator {
                             &mut sample,
                         );
                         w *= 1.0 - sample[0].clamp(0.0, 1.0);
+                    }
+                    if let Some(any) = override_any
+                        && i < any.len()
+                    {
+                        w *= (1.0 - any[i]).clamp(0.0, 1.0);
+                    }
+                    if let Some(ovr) = override_self
+                        && i < ovr.len()
+                        && ovr[i] > 0.0
+                    {
+                        w += ovr[i].clamp(0.0, 1.0) * 64.0 * role.exposure.max(0.01) * valid[i].max(0.05);
                     }
                     if w <= 0.0 {
                         continue;
@@ -664,5 +689,41 @@ mod tests {
             "Saturated darkest frame must not produce magenta cast: {:?}",
             px
         );
+    }
+
+    #[test]
+    fn test_hdr_override_brush_locks_chosen_bracket() {
+        let (w, h) = (16usize, 16usize);
+        let r_ref = Raster::from_data(w, h, 3, vec![0.1; w * h * 3]);
+        let r_alt = Raster::from_data(w, h, 3, vec![0.9; w * h * 3]);
+        let valid = vec![1.0f32; w * h];
+        let mut override_alt = vec![0.0f32; w * h];
+        for y in 4..12 {
+            for x in 4..12 {
+                override_alt[y * w + x] = 1.0;
+            }
+        }
+        let mut acc = Accumulator::new(w, h);
+        acc.add_with_override(
+            1.0,
+            FrameRole { exposure: 1.0, darkest: false, reference: true },
+            &r_ref,
+            &valid,
+            None,
+            None,
+            Some(&override_alt),
+        );
+        acc.add_with_override(
+            1.0,
+            FrameRole { exposure: 1.0, darkest: false, reference: false },
+            &r_alt,
+            &valid,
+            None,
+            Some(&override_alt),
+            Some(&override_alt),
+        );
+        let merged = acc.finish();
+        assert!(merged.pixel(8, 8)[0] > 0.85, "painted region should lock alt bracket");
+        assert!(merged.pixel(1, 1)[0] < 0.65);
     }
 }

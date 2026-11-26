@@ -1711,6 +1711,7 @@
       "descriptionWithCount_other": "Combine {{count}} images with varying focus distances into a single perfectly sharp image.",
       "failed": "Focus Stack Failed",
       "method": "Method",
+      "methodDepthMap": "Depth Map",
       "methodDetail": "Detail",
       "methodHint": "Detail keeps the finest structures like hairs and bristles. Smooth gives softer transitions and less noise.",
       "methodSmooth": "Smooth",

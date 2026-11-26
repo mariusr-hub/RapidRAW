@@ -5,7 +5,7 @@ import { Loader2, Search, Sparkles, X } from 'lucide-react';
 import CollapsibleSection from '../../components/ui/CollapsibleSection';
 import Button from '../../components/ui/Button';
 import Switch from '../../components/ui/Switch';
-import { useEditorStore } from '../../store/useEditorStore';
+import { canvasToolState, useEditorStore } from '../../store/useEditorStore';
 import { useEditorActions } from '../../hooks/useEditorActions';
 import { AiPatch } from '../../utils/adjustments';
 import { Invokes } from '../../types/invokes';
@@ -53,28 +53,35 @@ export interface ShootDustMapReport {
 export default function DustScratchProSection() {
   const selectedImage = useEditorStore((state) => state.selectedImage);
   const adjustments = useEditorStore((state) => state.adjustments);
+  const spots = useEditorStore((state) => state.dustSpotCandidates);
+  const isDustSpotEditActive = useEditorStore((state) => state.isDustSpotEditActive);
+  const setEditor = useEditorStore((state) => state.setEditor);
   const { setAdjustments } = useEditorActions();
 
   const [isOpen, setIsOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [isHealing, setIsHealing] = useState(false);
   const [routeLargeToLama, setRouteLargeToLama] = useState(true);
-  const [spots, setSpots] = useState<DetectedSpot[]>([]);
 
   useEffect(() => {
-    setSpots([]);
-  }, [selectedImage?.path]);
+    setEditor({ dustSpotCandidates: [], isDustSpotEditActive: false });
+  }, [selectedImage?.path, setEditor]);
 
   const handleScanDefects = async () => {
     if (!selectedImage || isScanning || isHealing) return;
     setIsScanning(true);
     try {
       const result = await invoke<AutoDefectRepairResult>(Invokes.AutoRemoveDustAndBlemishes);
-      setSpots(result.spots || []);
-      if ((result.spots || []).length === 0) {
+      const found = result.spots || [];
+      if (found.length === 0) {
+        setEditor({ dustSpotCandidates: [], isDustSpotEditActive: false });
         toast.info(result.message || 'No dust spots or scratches detected.');
       } else {
         setIsOpen(true);
+        setEditor({
+          ...canvasToolState({ isDustSpotEditActive: true }),
+          dustSpotCandidates: found,
+        });
         toast.success(result.message || `Detected ${result.total_detected} defect(s).`);
       }
     } catch (err) {
@@ -96,11 +103,16 @@ export default function DustScratchProSection() {
         flipVertical: adjustments.flipVertical,
         orientationSteps: adjustments.orientationSteps,
       });
-      setSpots(result.spots || []);
-      if ((result.spots || []).length === 0) {
+      const found = result.spots || [];
+      if (found.length === 0) {
+        setEditor({ dustSpotCandidates: [], isDustSpotEditActive: false });
         toast.info(result.message || 'No portrait skin blemishes detected.');
       } else {
         setIsOpen(true);
+        setEditor({
+          ...canvasToolState({ isDustSpotEditActive: true }),
+          dustSpotCandidates: found,
+        });
         toast.success(result.message || `Detected ${result.total_detected} blemish(es).`);
       }
     } catch (err) {
@@ -119,7 +131,9 @@ export default function DustScratchProSection() {
         normX: spot.norm_x,
         normY: spot.norm_y,
       });
-      setSpots((prev) => prev.filter((_, i) => i !== index));
+      setEditor((prev) => ({
+        dustSpotCandidates: prev.dustSpotCandidates.filter((_, i) => i !== index),
+      }));
     } catch (err) {
       toast.error(`Failed to record spot rejection: ${err}`);
     }
@@ -151,7 +165,12 @@ export default function DustScratchProSection() {
       fastSpots.forEach((spot, idx) => {
         newPatches.push({
           id: `dust-heal-${stamp}-${idx}`,
-          name: spot.kind === 'scratch' ? `Scratch Heal #${idx + 1}` : `Dust Heal #${idx + 1}`,
+          name:
+            spot.kind === 'scratch'
+              ? `Scratch Heal #${idx + 1}`
+              : spot.kind === 'blemish'
+                ? `Blemish Heal #${idx + 1}`
+                : `Dust Heal #${idx + 1}`,
           isLoading: false,
           invert: false,
           patchData: null,
@@ -175,9 +194,9 @@ export default function DustScratchProSection() {
             ...adjustments,
             aiPatches: [...(adjustments.aiPatches || []), ...newPatches],
           },
-          'Dust & Scratch Pro'
+          'Heal Defects',
         );
-        setSpots([]);
+        setEditor({ ...canvasToolState(), dustSpotCandidates: [] });
         toast.success(`Applied ${newPatches.length} defect heal layer(s).`);
       }
     } catch (err) {
@@ -205,7 +224,7 @@ export default function DustScratchProSection() {
             onChange={(checked: boolean) => setRouteLargeToLama(checked)}
           />
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             <Button
               size="sm"
               className="flex-1 text-xs flex items-center justify-center gap-1.5"
@@ -225,6 +244,22 @@ export default function DustScratchProSection() {
             >
               <Sparkles size={12} />
               <span>Blemishes</span>
+            </Button>
+
+            <Button
+              size="sm"
+              className={`text-xs px-2 ${isDustSpotEditActive ? 'bg-cyan-500/25 border border-cyan-400/50 text-cyan-200' : ''}`}
+              disabled={!selectedImage || isHealing}
+              onClick={() =>
+                setEditor(
+                  isDustSpotEditActive
+                    ? canvasToolState()
+                    : canvasToolState({ isDustSpotEditActive: true }),
+                )
+              }
+              title="Toggle On-Canvas Spot Editor (click empty area to add spot, click × or right-click ring to keep freckle/beauty mark)"
+            >
+              {isDustSpotEditActive ? 'Editing Canvas' : 'Edit Spots'}
             </Button>
 
             {spots.length > 0 && (

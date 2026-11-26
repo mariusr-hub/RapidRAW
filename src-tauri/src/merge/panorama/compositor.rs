@@ -2,7 +2,7 @@ use super::camera::{Camera, Lens, Orientation};
 use super::layout::{OutputLayout, plan_layout};
 use super::photometric::Photometric;
 use super::projection::{Projection, ProjectionMode, plan_canvas_with_info};
-use super::seams::{NO_LABEL, SeamLayer, find_seams};
+use super::seams::{NO_LABEL, SeamConstraints, SeamLayer, find_seams_with_constraints};
 use crate::merge::blending::{MultiBandBlender, band_count};
 use crate::merge::raster::{Raster, Rect, push_pull_fill};
 use crate::render::color_space::srgb_transfer;
@@ -25,6 +25,7 @@ pub struct PlanKey {
     pub yaw_bits: u64,
     pub pitch_bits: u64,
     pub roll_bits: u64,
+    pub brush_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +61,8 @@ pub struct StitchSettings {
     pub shadow_lift: f32,
     #[serde(default = "default_detail_boost")]
     pub detail_boost: f32,
+    #[serde(default)]
+    pub brush_strokes: Vec<crate::merge::MergeBrushStroke>,
 }
 
 impl StitchSettings {
@@ -73,6 +76,7 @@ impl StitchSettings {
             yaw_bits: norm_bits(self.yaw_deg),
             pitch_bits: norm_bits(self.pitch_deg),
             roll_bits: norm_bits(self.roll_deg),
+            brush_hash: crate::merge::stroke_mask_hash(&self.brush_strokes),
         }
     }
 }
@@ -121,6 +125,7 @@ impl Default for StitchSettings {
             highlight_recovery: default_highlight_recovery(),
             shadow_lift: default_shadow_lift(),
             detail_boost: default_detail_boost(),
+            brush_strokes: Vec::new(),
         }
     }
 }
@@ -397,7 +402,75 @@ pub fn plan_composition(
         .collect();
 
     let wraps = layout.canvas.wraps;
-    let labels = find_seams(seam_width, seam_height, &seam_layers, wraps);
+    let layer_images: Vec<usize> = layers.iter().map(|l| l.image).collect();
+    let labels = if settings.brush_strokes.is_empty() {
+        find_seams_with_constraints(
+            seam_width,
+            seam_height,
+            &seam_layers,
+            Some(&layer_images),
+            wraps,
+            None,
+        )
+    } else {
+        let seam_rect = Rect {
+            x: 0,
+            y: 0,
+            width: seam_width,
+            height: seam_height,
+        };
+        let num_images = scene.sources.len();
+        let mut keep = vec![None; seam_width * seam_height];
+        let mut exclude = vec![None; seam_width * seam_height];
+        for img_idx in 0..num_images {
+            if settings.brush_strokes.iter().any(|s| {
+                s.frame_index == Some(img_idx) && s.seam_role.as_deref() != Some("exclude")
+            }) {
+                let m = crate::merge::rasterize_strokes_for_rect(
+                    &settings.brush_strokes,
+                    seam_width,
+                    seam_height,
+                    &seam_rect,
+                    |s| s.frame_index == Some(img_idx) && s.seam_role.as_deref() != Some("exclude"),
+                );
+                for (i, &v) in m.iter().enumerate() {
+                    if v > 0.25 {
+                        keep[i] = Some(img_idx);
+                    }
+                }
+            }
+            if settings.brush_strokes.iter().any(|s| {
+                s.frame_index == Some(img_idx) && s.seam_role.as_deref() == Some("exclude")
+            }) {
+                let m = crate::merge::rasterize_strokes_for_rect(
+                    &settings.brush_strokes,
+                    seam_width,
+                    seam_height,
+                    &seam_rect,
+                    |s| s.frame_index == Some(img_idx) && s.seam_role.as_deref() == Some("exclude"),
+                );
+                for (i, &v) in m.iter().enumerate() {
+                    if v > 0.25 {
+                        exclude[i] = Some(img_idx);
+                    }
+                }
+            }
+        }
+        let constraints = SeamConstraints {
+            width: seam_width,
+            height: seam_height,
+            keep,
+            exclude,
+        };
+        find_seams_with_constraints(
+            seam_width,
+            seam_height,
+            &seam_layers,
+            Some(&layer_images),
+            wraps,
+            Some(&constraints),
+        )
+    };
 
     Ok(CompositionPlan {
         layout,

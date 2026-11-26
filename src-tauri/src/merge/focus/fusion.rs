@@ -15,19 +15,20 @@ pub enum Method {
     #[default]
     Detail,
     Smooth,
+    DepthMap,
 }
 
 impl Method {
     fn pooling(self) -> f32 {
         match self {
-            Method::Detail => 1.0,
+            Method::Detail | Method::DepthMap => 1.0,
             Method::Smooth => 4.0,
         }
     }
 
     fn exponent(self, level: usize) -> f32 {
         let fine = match self {
-            Method::Detail => 12.0,
+            Method::Detail | Method::DepthMap => 12.0,
             Method::Smooth => 8.0,
         };
         (fine * 0.75f32.powi(level as i32)).max(3.0)
@@ -294,5 +295,189 @@ impl Fusion {
             });
         }
         (result.expect("fusion has at least one level"), self.depth)
+    }
+}
+
+#[inline]
+pub fn depth_slice_weight(frame_index: usize, depth_index: f32) -> f32 {
+    let diff = frame_index as f32 - depth_index;
+    (-0.5 * (diff / 0.65).powi(2)).exp()
+}
+
+pub fn compute_regularized_depth_index(
+    frames: &[(&Raster, &[f32])],
+) -> (Vec<f32>, Depth) {
+    let (w, h) = (frames[0].0.width, frames[0].0.height);
+    let len = w * h;
+    let max_idx = frames.len().saturating_sub(1);
+    let measures: Vec<Raster> = frames
+        .par_iter()
+        .map(|(img, _)| focus_measure(&luma(img), 2.0))
+        .collect();
+    let guide_luma = luma(frames[frames.len() / 2].0);
+
+    let mut winner = vec![0u16; len];
+    let mut best_scores = vec![0.0f32; len];
+    for i in 0..len {
+        let mut best_k = 0usize;
+        let mut best_m = f32::NEG_INFINITY;
+        for (k, (meas, (_, valid))) in measures.iter().zip(frames.iter()).enumerate() {
+            if valid[i] < MIN_VALID {
+                continue;
+            }
+            let m = meas.data[i];
+            if m > best_m {
+                best_m = m;
+                best_k = k;
+            }
+        }
+        winner[i] = best_k as u16;
+        best_scores[i] = best_m.max(0.0);
+    }
+
+    // 3x3 median filter on winner depth index
+    let mut median_idx = vec![0.0f32; len];
+    median_idx
+        .par_chunks_exact_mut(w)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let mut window = [0u16; 9];
+            for x in 0..w {
+                let mut count = 0usize;
+                for dy in -1isize..=1 {
+                    let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                    for dx in -1isize..=1 {
+                        let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                        window[count] = winner[yy * w + xx];
+                        count += 1;
+                    }
+                }
+                window[..count].sort_unstable();
+                out_row[x] = window[count / 2] as f32;
+            }
+        });
+
+    // Edge-aware joint bilateral depth smoothing
+    const RADIUS: isize = 4;
+    const INV_2_SPATIAL2: f32 = 1.0 / (2.0 * 9.0);
+    const INV_2_RANGE2: f32 = 1.0 / (2.0 * 0.0064);
+    let mut smooth_idx = vec![0.0f32; len];
+    smooth_idx
+        .par_chunks_exact_mut(w)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            for x in 0..w {
+                let lc = guide_luma.data[y * w + x];
+                let mut acc = 0.0f32;
+                let mut w_sum = 0.0f32;
+                for dy in -RADIUS..=RADIUS {
+                    let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                    for dx in -RADIUS..=RADIUS {
+                        let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                        let nidx = yy * w + xx;
+                        let dl = guide_luma.data[nidx] - lc;
+                        let ds2 = (dx * dx + dy * dy) as f32;
+                        let wt = (-ds2 * INV_2_SPATIAL2 - (dl * dl) * INV_2_RANGE2).exp();
+                        acc += median_idx[nidx] * wt;
+                        w_sum += wt;
+                    }
+                }
+                out_row[x] = if w_sum > 1e-6 {
+                    (acc / w_sum).clamp(0.0, max_idx as f32)
+                } else {
+                    median_idx[y * w + x]
+                };
+            }
+        });
+
+    let labels = smooth_idx
+        .iter()
+        .map(|&d| d.round().clamp(0.0, max_idx as f32) as u16)
+        .collect();
+    let depth = Depth {
+        width: w,
+        height: h,
+        labels,
+        best: best_scores,
+    };
+    (smooth_idx, depth)
+}
+
+pub fn fuse_depth_map_from_previews(frames: &[(&Raster, &[f32])]) -> (Raster, Depth) {
+    let (w, h) = (frames[0].0.width, frames[0].0.height);
+    let (smooth_idx, depth) = compute_regularized_depth_index(frames);
+    let mut num = vec![0.0f32; w * h * 3];
+    let mut den = vec![0.0f32; w * h];
+
+    num.par_chunks_exact_mut(w * 3)
+        .zip(den.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(y, (num_row, den_row))| {
+            let row_off = y * w;
+            for x in 0..w {
+                let d = smooth_idx[row_off + x];
+                let mut acc = [0.0f32; 3];
+                let mut w_tot = 0.0f32;
+                for (k, (img, valid)) in frames.iter().enumerate() {
+                    if valid[row_off + x] < MIN_VALID {
+                        continue;
+                    }
+                    let wt = depth_slice_weight(k, d) * valid[row_off + x];
+                    let px = img.pixel(x, y);
+                    acc[0] += px[0] * wt;
+                    acc[1] += px[1] * wt;
+                    acc[2] += px[2] * wt;
+                    w_tot += wt;
+                }
+                if w_tot > 1e-6 {
+                    let inv = 1.0 / w_tot;
+                    num_row[x * 3] = acc[0] * inv;
+                    num_row[x * 3 + 1] = acc[1] * inv;
+                    num_row[x * 3 + 2] = acc[2] * inv;
+                    den_row[x] = w_tot;
+                }
+            }
+        });
+
+    (Raster::from_data(w, h, 3, num), depth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_depth_map_focus_fusion_suppresses_halo_and_selects_sharp_slice() {
+        let (w, h) = (32usize, 32usize);
+        let mk_img = |sharp_left: bool| -> Raster {
+            let mut data = Vec::with_capacity(w * h * 3);
+            for y in 0..h {
+                for x in 0..w {
+                    let v = if x < 16 {
+                        if sharp_left && (x + y) % 2 == 0 {
+                            0.9
+                        } else if sharp_left {
+                            0.2
+                        } else {
+                            0.55
+                        }
+                    } else if !sharp_left && (x + y) % 2 == 0 {
+                        0.85
+                    } else if !sharp_left {
+                        0.15
+                    } else {
+                        0.50
+                    };
+                    data.extend_from_slice(&[v, v, v]);
+                }
+            }
+            Raster::from_data(w, h, 3, data)
+        };
+        let f0 = mk_img(true);
+        let f1 = mk_img(false);
+        let valid = vec![1.0f32; w * h];
+        let (_fused, depth) = fuse_depth_map_from_previews(&[(&f0, &valid), (&f1, &valid)]);
+        assert_eq!(depth.labels[16 * w + 4], 0);
+        assert_eq!(depth.labels[16 * w + 28], 1);
     }
 }

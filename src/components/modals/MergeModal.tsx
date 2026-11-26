@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import {
+  Brush,
   CheckCircle,
   Columns,
   Compass,
@@ -15,12 +16,14 @@ import {
   Loader2,
   LucideIcon,
   Map as MapIcon,
+  RotateCcw,
   Save,
   ShieldAlert,
   ShieldCheck,
   Square,
   SquaresUnite,
   Sun,
+  Trash2,
   TriangleAlert,
   WandSparkles,
   XCircle,
@@ -42,6 +45,7 @@ import {
   HdrDeghostSensitivity,
   HdrSettings,
   HdrToneProfile,
+  MergeBrushStroke,
   MergeKind,
   MergeOutputFormat,
   MergeSettings,
@@ -144,6 +148,18 @@ const PROJECTION_OPTIONS = [
 const METHOD_OPTIONS = [
   { value: 'detail', label: 'modals.focusStack.methodDetail' },
   { value: 'smooth', label: 'modals.focusStack.methodSmooth' },
+  { value: 'depthMap', label: 'modals.focusStack.methodDepthMap' },
+] as const;
+
+const BRUSH_FRAME_PALETTE = [
+  '#38bdf8',
+  '#f59e0b',
+  '#34d399',
+  '#a78bfa',
+  '#fb7185',
+  '#22d3ee',
+  '#f472b6',
+  '#facc15',
 ] as const;
 
 interface SegmentedOption<T extends string> {
@@ -246,6 +262,11 @@ export default function MergeModal({
   });
   const [sessionHalfSize, setSessionHalfSize] = useState(false);
   const [showHorizonGrid, setShowHorizonGrid] = useState(false);
+  const [isDraggingHorizon, setIsDraggingHorizon] = useState(false);
+  const [brushActive, setBrushActive] = useState(false);
+  const [brushSize, setBrushSize] = useState(0.06);
+  const [brushMode, setBrushMode] = useState<'keep' | 'exclude'>('keep');
+  const [brushFrameIdx, setBrushFrameIdx] = useState(0);
   const [showPreflight, setShowPreflight] = useState(false);
   const [healthReport, setHealthReport] = useState<BracketHealthReport | null>(null);
   const [draftSettings, setDraftSettings] = useState<MergeSettings>(settings);
@@ -259,12 +280,19 @@ export default function MergeModal({
   const mouseDownTarget = useRef<EventTarget | null>(null);
   const previewContainerRef = useRef<HTMLDivElement | null>(null);
   const previewImageWrapRef = useRef<HTMLDivElement | null>(null);
+  const brushCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const brushDraftRef = useRef<{ active: boolean; points: Array<[number, number]> }>({
+    active: false,
+    points: [],
+  });
   const horizonDragRef = useRef<{
     active: boolean;
     startX: number;
     startY: number;
     startYaw: number;
     startPitch: number;
+    startRoll: number;
+    isRoll: boolean;
   } | null>(null);
   const commitTimer = useRef<number | null>(null);
   const pendingSettings = useRef<MergeSettings | null>(null);
@@ -368,6 +396,10 @@ export default function MergeModal({
       setLoupeEnabled(false);
       setSessionHalfSize(false);
       setShowHorizonGrid(false);
+      setIsDraggingHorizon(false);
+      setBrushActive(false);
+      setBrushFrameIdx(0);
+      setBrushMode('keep');
     }, 300);
     return () => clearTimeout(timer);
   }, [isOpen]);
@@ -457,6 +489,18 @@ export default function MergeModal({
   }, []);
 
   const handleSave = async () => {
+    if (kind === 'panorama') {
+      const currentPano = (pendingSettings.current ?? draftSettings) as PanoramaSettings;
+      const targetFastDraft = Boolean(currentPano.halfSize);
+      if (Boolean(currentPano.fastDraft) !== targetFastDraft) {
+        const normalized = { ...currentPano, fastDraft: targetFastDraft };
+        pendingSettings.current = normalized;
+        setDraftSettings(normalized);
+        useUIStore.getState().setUI((s) => ({
+          mergeModalState: { ...s.mergeModalState, settings: normalized },
+        }));
+      }
+    }
     flushSettings();
     setIsSaving(true);
     try {
@@ -900,6 +944,7 @@ export default function MergeModal({
         {t('modals.focusStack.method')}
       </Text>
       <Segmented
+        cols={3}
         options={METHOD_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))}
         value={focusStack.method}
         onChange={(method) => updateSettings({ method })}
@@ -938,6 +983,85 @@ export default function MergeModal({
     );
   };
 
+  const strokeStrokeColor = useCallback(
+    (stroke: Pick<MergeBrushStroke, 'seamRole' | 'frameIndex'>) => {
+      if (kind === 'panorama') {
+        return stroke.seamRole === 'exclude' ? '#f87171' : '#34d399';
+      }
+      const idx = stroke.frameIndex ?? 0;
+      return BRUSH_FRAME_PALETTE[idx % BRUSH_FRAME_PALETTE.length];
+    },
+    [kind],
+  );
+
+  const redrawBrushCanvas = useCallback(
+    (draftPoints?: Array<[number, number]>) => {
+      const canvas = brushCanvasRef.current;
+      const wrap = previewImageWrapRef.current;
+      if (!canvas || !wrap) return;
+      const rect = wrap.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const targetW = Math.max(1, Math.round(rect.width * dpr));
+      const targetH = Math.max(1, Math.round(rect.height * dpr));
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.save();
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      if (!brushActive) {
+        ctx.restore();
+        return;
+      }
+      const minDim = Math.min(rect.width, rect.height);
+      const drawStroke = (pts: Array<[number, number]>, radiusNorm: number, color: string) => {
+        if (pts.length === 0) return;
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        const lineW = Math.max(4, radiusNorm * minDim * 2);
+        ctx.lineWidth = lineW;
+        ctx.globalAlpha = 0.42;
+        if (pts.length === 1) {
+          ctx.beginPath();
+          ctx.arc(pts[0][0] * rect.width, pts[0][1] * rect.height, lineW / 2, 0, Math.PI * 2);
+          ctx.fill();
+          return;
+        }
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0] * rect.width, pts[0][1] * rect.height);
+        for (let i = 1; i < pts.length; i += 1) {
+          ctx.lineTo(pts[i][0] * rect.width, pts[i][1] * rect.height);
+        }
+        ctx.stroke();
+      };
+
+      const committed = draftSettings.brushStrokes ?? [];
+      for (const s of committed) {
+        drawStroke(s.points, s.radiusNorm, strokeStrokeColor(s));
+      }
+      const activePts = draftPoints ?? (brushDraftRef.current.active ? brushDraftRef.current.points : []);
+      if (activePts.length > 0) {
+        drawStroke(
+          activePts,
+          brushSize,
+          strokeStrokeColor(kind === 'panorama' ? { seamRole: brushMode } : { frameIndex: brushFrameIdx }),
+        );
+      }
+      ctx.restore();
+    },
+    [brushActive, brushFrameIdx, brushMode, brushSize, draftSettings.brushStrokes, kind, strokeStrokeColor],
+  );
+
+  useEffect(() => {
+    redrawBrushCanvas();
+  }, [redrawBrushCanvas, preview?.base64, preview?.overlayBase64]);
+
   const switchHdrViewMode = (nextMode: 'sdr' | 'hdr10' | 'headroom') => {
     setShowOverlay(false);
     setShowSplit(false);
@@ -952,9 +1076,16 @@ export default function MergeModal({
     const hasSplit = Boolean(kind === 'hdr' && preview?.referenceBase64);
     const hasHdrViews = kind === 'hdr' && Boolean(preview?.isSceneReferred);
     const hasLoupe = kind === 'panorama' || kind === 'hdr';
-    if (!hasOverlay && !hasSplit && !hasHdrViews && !hasLoupe) return null;
+    const hasBrush = Boolean(preview && !isProcessing);
+    if (!hasOverlay && !hasSplit && !hasHdrViews && !hasLoupe && !hasBrush) return null;
     const OverlayIcon = tool.overlayIcon;
     const ToolIcon = tool.icon;
+    const brushLabel =
+      kind === 'panorama'
+        ? t('modals.merge.seamBrush', 'Seam Brush')
+        : kind === 'hdr'
+          ? t('modals.merge.deghostBrush', 'Deghost Brush')
+          : t('modals.merge.retouchBrush', 'Frame Brush');
     return (
       <div className="flex flex-wrap items-center gap-1 bg-bg-primary/80 border border-border-color/40 p-1 rounded-lg">
         {(hasOverlay || hasSplit || hasHdrViews) && (
@@ -1068,6 +1199,36 @@ export default function MergeModal({
             <span>2.5× Loupe</span>
           </button>
         )}
+        {hasBrush && (
+          <button
+            type="button"
+            onClick={() =>
+              setBrushActive((prev) => {
+                const next = !prev;
+                if (next) {
+                  setShowSplit(false);
+                  setLoupeEnabled(false);
+                  setLoupe((l) => ({ ...l, active: false }));
+                }
+                return next;
+              })
+            }
+            className={clsx(
+              'flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-colors select-none cursor-pointer whitespace-nowrap',
+              brushActive ? 'bg-accent text-button-text' : 'text-text-secondary hover:bg-card-active hover:text-text-primary',
+            )}
+            title={
+              kind === 'panorama'
+                ? 'Paint areas to Keep or Exclude from panorama seams'
+                : kind === 'hdr'
+                  ? 'Paint regions to lock to a specific exposure bracket'
+                  : 'Paint regions to sample sharpness from a specific source frame'
+            }
+          >
+            <Brush size={13} />
+            <span>{brushLabel}</span>
+          </button>
+        )}
         {hasHdrViews && preview?.hdrPeakNits != null && (
           <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[11px] font-mono text-amber-300 whitespace-nowrap">
             {Math.round(preview.hdrPeakNits)} nits
@@ -1113,11 +1274,28 @@ export default function MergeModal({
         setSplitPos(Math.max(2, Math.min(98, ((clientX - rect.left) / rect.width) * 100)));
       };
       const handlePreviewMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-        if (horizonDragRef.current?.active && kind === 'panorama' && showHorizonGrid && !showSplit && !loupeEnabled) {
-          const { startX, startY, startYaw, startPitch } = horizonDragRef.current;
-          const nextYaw = Math.max(-180, Math.min(180, Math.round(startYaw + (e.clientX - startX) * 0.25)));
-          const nextPitch = Math.max(-45, Math.min(45, Math.round((startPitch + (e.clientY - startY) * 0.15) * 2) / 2));
-          updateSettings({ yawDeg: nextYaw, pitchDeg: nextPitch });
+        if (
+          horizonDragRef.current?.active &&
+          kind === 'panorama' &&
+          !brushActive &&
+          !showSplit &&
+          !loupeEnabled
+        ) {
+          const { startX, startY, startYaw, startPitch, startRoll, isRoll } = horizonDragRef.current;
+          if (isRoll || e.shiftKey) {
+            const nextRoll = Math.max(
+              -45,
+              Math.min(45, Math.round((startRoll + (e.clientX - startX) * 0.15) * 2) / 2),
+            );
+            updateSettings({ rollDeg: nextRoll });
+          } else {
+            const nextYaw = Math.max(-180, Math.min(180, Math.round(startYaw + (e.clientX - startX) * 0.25)));
+            const nextPitch = Math.max(
+              -45,
+              Math.min(45, Math.round((startPitch + (e.clientY - startY) * 0.15) * 2) / 2),
+            );
+            updateSettings({ yawDeg: nextYaw, pitchDeg: nextPitch });
+          }
           return;
         }
         if (isDraggingSplit && showSplit) {
@@ -1143,6 +1321,65 @@ export default function MergeModal({
           });
         }
       };
+
+      const strokes = draftSettings.brushStrokes ?? [];
+      const frameCount = Math.max(preview.imageCount || sourcePaths.length, 2);
+
+      const normalizeBrushPoint = (clientX: number, clientY: number): [number, number] | null => {
+        const wrap = previewImageWrapRef.current;
+        if (!wrap) return null;
+        const rect = wrap.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return null;
+        return [
+          Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+          Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)),
+        ];
+      };
+
+      const handleBrushPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        if (!brushActive || isUpdatingPreview || showSplit || e.button !== 0) return;
+        e.stopPropagation();
+        const pt = normalizeBrushPoint(e.clientX, e.clientY);
+        if (!pt) return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        brushDraftRef.current = { active: true, points: [pt] };
+        redrawBrushCanvas(brushDraftRef.current.points);
+      };
+
+      const handleBrushPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        if (!brushDraftRef.current.active) return;
+        e.stopPropagation();
+        const pt = normalizeBrushPoint(e.clientX, e.clientY);
+        if (!pt) return;
+        const pts = brushDraftRef.current.points;
+        const last = pts[pts.length - 1];
+        if (!last || Math.hypot(pt[0] - last[0], pt[1] - last[1]) >= 0.003) {
+          pts.push(pt);
+          redrawBrushCanvas(pts);
+        }
+      };
+
+      const finishBrushStroke = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        if (!brushDraftRef.current.active) return;
+        e.stopPropagation();
+        const pts = brushDraftRef.current.points.slice();
+        brushDraftRef.current = { active: false, points: [] };
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+        if (pts.length === 0) return;
+        const newStroke: MergeBrushStroke =
+          kind === 'panorama'
+            ? { seamRole: brushMode, points: pts, radiusNorm: brushSize }
+            : { frameIndex: brushFrameIdx, points: pts, radiusNorm: brushSize };
+        const nextStrokes = [...strokes, newStroke];
+        updateSettings(
+          kind === 'panorama'
+            ? ({ brushStrokes: nextStrokes, fastDraft: true } as Partial<PanoramaSettings>)
+            : ({ brushStrokes: nextStrokes } as Partial<MergeSettings>),
+        );
+      };
+
       return (
         <div className="w-full">
           {kind === 'hdr' && healthReport && (
@@ -1170,13 +1407,15 @@ export default function MergeModal({
             onMouseLeave={() => {
               setIsDraggingSplit(false);
               if (horizonDragRef.current) horizonDragRef.current.active = false;
+              setIsDraggingHorizon(false);
               setLoupe((prev) => ({ ...prev, active: false }));
             }}
             onMouseDown={(e) => {
+              if (brushActive) return;
               if (showSplit) {
                 setIsDraggingSplit(true);
                 updateSplitFromClientX(e.clientX);
-              } else if (kind === 'panorama' && showHorizonGrid && !loupeEnabled) {
+              } else if (kind === 'panorama' && !loupeEnabled) {
                 const pano = draftSettings as PanoramaSettings;
                 horizonDragRef.current = {
                   active: true,
@@ -1184,22 +1423,28 @@ export default function MergeModal({
                   startY: e.clientY,
                   startYaw: pano.yawDeg ?? 0,
                   startPitch: pano.pitchDeg ?? 0,
+                  startRoll: pano.rollDeg ?? 0,
+                  isRoll: e.shiftKey,
                 };
+                setIsDraggingHorizon(true);
               }
             }}
             onMouseUp={() => {
               setIsDraggingSplit(false);
               if (horizonDragRef.current) horizonDragRef.current.active = false;
+              setIsDraggingHorizon(false);
             }}
             className={clsx(
               'group relative w-full h-[clamp(180px,36vh,340px)] bg-[#111] rounded-lg overflow-hidden border border-surface flex items-center justify-center select-none',
-              showSplit
-                ? 'cursor-ew-resize'
-                : kind === 'panorama' && showHorizonGrid && !loupeEnabled
-                  ? 'cursor-move'
-                  : loupeEnabled
-                    ? 'cursor-crosshair'
-                    : '',
+              brushActive
+                ? 'cursor-crosshair'
+                : showSplit
+                  ? 'cursor-ew-resize'
+                  : kind === 'panorama' && !loupeEnabled
+                    ? 'cursor-grab active:cursor-grabbing'
+                    : loupeEnabled
+                      ? 'cursor-crosshair'
+                      : '',
             )}
           >
             <div
@@ -1212,7 +1457,17 @@ export default function MergeModal({
                 className="block max-w-full max-h-[clamp(176px,35vh,336px)] w-auto h-auto object-contain"
                 draggable={false}
               />
-              {kind === 'panorama' && showHorizonGrid && (
+              {brushActive && (
+                <canvas
+                  ref={brushCanvasRef}
+                  onPointerDown={handleBrushPointerDown}
+                  onPointerMove={handleBrushPointerMove}
+                  onPointerUp={finishBrushStroke}
+                  onPointerCancel={finishBrushStroke}
+                  className="absolute inset-0 w-full h-full z-20 touch-none cursor-crosshair"
+                />
+              )}
+              {kind === 'panorama' && (showHorizonGrid || isDraggingHorizon) && (
                 <svg
                   className="absolute inset-0 w-full h-full pointer-events-none z-10"
                   viewBox="0 0 300 200"
@@ -1289,6 +1544,121 @@ export default function MergeModal({
           </div>
 
           <div className="mt-2">{renderOverlayToggle()}</div>
+          {brushActive && (
+            <div className="mt-2 px-3 py-1.5 rounded-lg bg-bg-primary/90 border border-border-color/40 flex flex-wrap items-center justify-between gap-2 text-xs">
+              {kind === 'panorama' ? (
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setBrushMode('keep')}
+                    className={clsx(
+                      'px-2.5 py-0.5 rounded font-medium cursor-pointer border',
+                      brushMode === 'keep'
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50'
+                        : 'border-border-color/40 text-text-secondary hover:text-text-primary',
+                    )}
+                  >
+                    Keep
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBrushMode('exclude')}
+                    className={clsx(
+                      'px-2.5 py-0.5 rounded font-medium cursor-pointer border',
+                      brushMode === 'exclude'
+                        ? 'bg-red-500/20 text-red-300 border-red-500/50'
+                        : 'border-border-color/40 text-text-secondary hover:text-text-primary',
+                    )}
+                  >
+                    Exclude
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1 flex-wrap">
+                  <span className="text-text-secondary text-[11px] mr-1">
+                    {kind === 'hdr' ? 'Bracket:' : 'Frame:'}
+                  </span>
+                  {Array.from({ length: Math.min(frameCount, 12) }).map((_, idx) => {
+                    const dotColor = BRUSH_FRAME_PALETTE[idx % BRUSH_FRAME_PALETTE.length];
+                    return (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => setBrushFrameIdx(idx)}
+                        className={clsx(
+                          'flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border cursor-pointer',
+                          brushFrameIdx === idx
+                            ? 'bg-accent text-button-text border-accent'
+                            : 'border-border-color/40 text-text-secondary hover:text-text-primary',
+                        )}
+                      >
+                        <span
+                          className="w-2 h-2 rounded-full inline-block"
+                          style={{ backgroundColor: dotColor }}
+                        />
+                        {idx + 1}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-1.5 text-[11px] text-text-secondary">
+                  <span>Size</span>
+                  <input
+                    type="range"
+                    min={0.02}
+                    max={0.18}
+                    step={0.01}
+                    value={brushSize}
+                    onChange={(e) => setBrushSize(Number(e.target.value))}
+                    className="w-20 accent-accent cursor-pointer"
+                  />
+                </label>
+                {strokes.length > 0 && (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextStrokes = strokes.slice(0, -1);
+                        updateSettings(
+                          kind === 'panorama'
+                            ? ({
+                                brushStrokes: nextStrokes,
+                                fastDraft: nextStrokes.length > 0 || Boolean(draftSettings.halfSize),
+                              } as Partial<PanoramaSettings>)
+                            : ({ brushStrokes: nextStrokes } as Partial<MergeSettings>),
+                        );
+                      }}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded border border-border-color/40 text-text-secondary hover:text-text-primary cursor-pointer"
+                      title="Undo last stroke"
+                    >
+                      <RotateCcw size={11} />
+                      <span>Undo</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateSettings(
+                          kind === 'panorama'
+                            ? ({
+                                brushStrokes: [],
+                                fastDraft: Boolean(draftSettings.halfSize),
+                              } as Partial<PanoramaSettings>)
+                            : ({ brushStrokes: [] } as Partial<MergeSettings>),
+                        )
+                      }
+                      className="flex items-center gap-1 px-2 py-0.5 rounded border border-border-color/40 text-text-secondary hover:text-red-400 cursor-pointer"
+                      title="Clear all brush strokes"
+                    >
+                      <Trash2 size={11} />
+                      <span>Clear ({strokes.length})</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center justify-between gap-2 mt-2">
             <div className="flex flex-wrap items-center gap-2">

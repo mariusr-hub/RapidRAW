@@ -58,6 +58,8 @@ pub struct HdrSettings {
     pub highlight_recovery: f32,
     pub shadow_lift: f32,
     pub detail_boost: f32,
+    #[serde(default)]
+    pub brush_strokes: Vec<crate::merge::MergeBrushStroke>,
 }
 
 impl Default for HdrSettings {
@@ -75,6 +77,7 @@ impl Default for HdrSettings {
             highlight_recovery: 50.0,
             shadow_lift: 30.0,
             detail_boost: 1.05,
+            brush_strokes: Vec::new(),
         }
     }
 }
@@ -222,6 +225,7 @@ pub struct HdrSession {
     merged_preview: Raster,
     deghost_sensitivity: DeghostSensitivity,
     deghost_mode: DeghostMode,
+    brush_hash: u64,
     reference_base64: Option<String>,
 }
 
@@ -432,7 +436,21 @@ fn merge_radiance(
         .fold(0.0f32, f32::max)
         .max(1e-3);
     refine_exposures(clip, frames, reference);
-    recompute_radiance_preview(clip, frames, reference, sensitivity, deghost_mode)
+    let full_preview = Rect {
+        x: 0,
+        y: 0,
+        width: frames[0].preview.width,
+        height: frames[0].preview.height,
+    };
+    recompute_radiance_preview(
+        clip,
+        frames,
+        reference,
+        sensitivity,
+        deghost_mode,
+        &full_preview,
+        &[],
+    )
 }
 
 fn recompute_radiance_preview(
@@ -441,6 +459,8 @@ fn recompute_radiance_preview(
     reference: usize,
     sensitivity: DeghostSensitivity,
     deghost_mode: DeghostMode,
+    crop_rect: &Rect,
+    brush_strokes: &[crate::merge::MergeBrushStroke],
 ) -> (Merge, Raster) {
     let previews: Vec<PreviewFrame> = (0..frames.len())
         .map(|i| PreviewFrame {
@@ -457,11 +477,80 @@ fn recompute_radiance_preview(
         }
     };
     let (pw, ph) = (frames[0].preview.width, frames[0].preview.height);
+    let has_brushes = !brush_strokes.is_empty();
+    let override_any = has_brushes.then(|| {
+        crate::merge::rasterize_strokes_for_rect(brush_strokes, pw, ph, crop_rect, |s| {
+            s.frame_index.is_some()
+        })
+    });
     let mut accumulator = Accumulator::new(pw, ph);
-    for (frame, mask) in previews.iter().zip(&masks) {
-        accumulator.add(clip, frame.role, frame.image, frame.valid, mask.as_ref());
+    for (idx, (frame, mask)) in previews.iter().zip(&masks).enumerate() {
+        let override_self = if has_brushes && brush_strokes.iter().any(|s| s.frame_index == Some(idx))
+        {
+            Some(crate::merge::rasterize_strokes_for_rect(
+                brush_strokes,
+                pw,
+                ph,
+                crop_rect,
+                |s| s.frame_index == Some(idx),
+            ))
+        } else {
+            None
+        };
+        accumulator.add_with_override(
+            clip,
+            frame.role,
+            frame.image,
+            frame.valid,
+            mask.as_ref(),
+            override_self.as_deref(),
+            override_any.as_deref(),
+        );
     }
     (Merge::Radiance { clip, masks }, accumulator.finish())
+}
+
+fn fuse_previews_with_override(
+    frames: &[Frame],
+    crop_rect: &Rect,
+    brush_strokes: &[crate::merge::MergeBrushStroke],
+) -> Raster {
+    let (pw, ph) = (frames[0].preview.width, frames[0].preview.height);
+    let weights: Vec<Vec<f32>> = frames
+        .iter()
+        .map(|f| exposure_fusion::weights(&f.preview, &f.valid))
+        .collect();
+    let total = sum_maps(&weights, pw * ph);
+    let mut fusion = ExposureFusion::new(pw, ph);
+    for (frame, w) in frames.iter().zip(&weights) {
+        fusion.add(&frame.preview, w, &total);
+    }
+    let mut out = fusion.finish();
+    if !brush_strokes.is_empty() {
+        for (idx, frame) in frames.iter().enumerate() {
+            if !brush_strokes.iter().any(|s| s.frame_index == Some(idx)) {
+                continue;
+            }
+            let mask =
+                crate::merge::rasterize_strokes_for_rect(brush_strokes, pw, ph, crop_rect, |s| {
+                    s.frame_index == Some(idx)
+                });
+            out.data
+                .par_chunks_exact_mut(3)
+                .zip(frame.preview.data.par_chunks_exact(3))
+                .zip(mask.par_iter())
+                .zip(frame.valid.par_iter())
+                .for_each(|(((dst, src), &alpha), &valid)| {
+                    let a = (alpha * valid).clamp(0.0, 1.0);
+                    if a > 0.0 {
+                        for c in 0..3 {
+                            dst[c] = dst[c] * (1.0 - a) + src[c] * a;
+                        }
+                    }
+                });
+        }
+    }
+    out
 }
 
 fn physical_exif_exposure(path: &str) -> Option<f64> {
@@ -581,6 +670,7 @@ pub fn build_session(
         merged_preview,
         deghost_sensitivity: default_deghost,
         deghost_mode: default_deghost_mode,
+        brush_hash: 0,
         reference_base64,
     })
 }
@@ -644,14 +734,24 @@ pub(crate) fn build_linear_hdr_panel(
         return Ok((decoded.image, rendition, paths[0].clone()));
     }
     let session = build_session(paths, half_size, apply_edits, context)?;
+    let full_rect = Rect {
+        x: 0,
+        y: 0,
+        width: session.width,
+        height: session.height,
+    };
     let mut merged = match &session.merge {
         Merge::Radiance { clip, masks } => session.render_radiance(
             *clip,
             masks,
+            &full_rect,
+            &[],
             &context.loader_for_hdr_brackets(true, session.half_size, session.apply_edits),
             context,
         )?,
         Merge::Fusion => session.render_fusion(
+            &full_rect,
+            &[],
             &context.loader_with_options(false, session.half_size, session.apply_edits),
             context,
         )?,
@@ -693,21 +793,47 @@ impl HdrSession {
         &self,
         clip: f32,
         masks: &[Option<Raster>],
+        crop_rect: &Rect,
+        brush_strokes: &[crate::merge::MergeBrushStroke],
         loader: &SourceLoader,
         context: &MergeContext,
     ) -> Result<Raster, String> {
+        let has_brushes = !brush_strokes.is_empty();
+        let override_any = has_brushes.then(|| {
+            crate::merge::rasterize_strokes_for_rect(
+                brush_strokes,
+                self.width,
+                self.height,
+                crop_rect,
+                |s| s.frame_index.is_some(),
+            )
+        });
         let accumulator = Mutex::new(Accumulator::new(self.width, self.height));
         let paths: Vec<String> = self.frames.iter().map(|f| f.path.clone()).collect();
         loader.load_all(&paths, |index, path| {
             context.check_cancelled()?;
             context.report(format!("Merging '{}'", file_name(path)));
             let (aligned, valid) = self.load_aligned(loader, index)?;
-            accumulator.lock().unwrap().add(
+            let override_self =
+                if has_brushes && brush_strokes.iter().any(|s| s.frame_index == Some(index)) {
+                    Some(crate::merge::rasterize_strokes_for_rect(
+                        brush_strokes,
+                        self.width,
+                        self.height,
+                        crop_rect,
+                        |s| s.frame_index == Some(index),
+                    ))
+                } else {
+                    None
+                };
+            accumulator.lock().unwrap().add_with_override(
                 clip,
                 frame_role(&self.frames, self.reference, index),
                 &aligned,
                 &valid,
                 masks[index].as_ref(),
+                override_self.as_deref(),
+                override_any.as_deref(),
             );
             Ok(())
         })?;
@@ -719,6 +845,8 @@ impl HdrSession {
 
     fn render_fusion(
         &self,
+        crop_rect: &Rect,
+        brush_strokes: &[crate::merge::MergeBrushStroke],
         loader: &SourceLoader,
         context: &MergeContext,
     ) -> Result<Raster, String> {
@@ -730,7 +858,7 @@ impl HdrSession {
             .saturating_mul(self.height)
             .saturating_mul(16);
 
-        if estimated_bytes <= SINGLE_PASS_FUSION_BUDGET_BYTES {
+        let mut out = if estimated_bytes <= SINGLE_PASS_FUSION_BUDGET_BYTES {
             let aligned_frames = Mutex::new(Vec::with_capacity(paths.len()));
             let total = Mutex::new(vec![0.0f32; self.width * self.height]);
             loader.load_all(&paths, |index, path| {
@@ -753,7 +881,7 @@ impl HdrSession {
                 context.check_cancelled()?;
                 fusion.add(&aligned, &weights, &total);
             }
-            Ok(fusion.finish())
+            fusion.finish()
         } else {
             // Streaming 2-pass fallback for huge multi-frame TIFF stacks (keeps only 1 frame in RAM).
             let total = Mutex::new(vec![0.0f32; self.width * self.height]);
@@ -777,31 +905,83 @@ impl HdrSession {
                 fusion.lock().unwrap().add(&aligned, &weights, &total);
                 Ok(())
             })?;
-            Ok(fusion
+            fusion
                 .into_inner()
                 .map_err(|_| "Merging the images failed unexpectedly.".to_string())?
-                .finish())
+                .finish()
+        };
+
+        if !brush_strokes.is_empty() {
+            for idx in 0..self.frames.len() {
+                if !brush_strokes.iter().any(|s| s.frame_index == Some(idx)) {
+                    continue;
+                }
+                context.check_cancelled()?;
+                let (aligned, valid) = self.load_aligned(loader, idx)?;
+                let mask = crate::merge::rasterize_strokes_for_rect(
+                    brush_strokes,
+                    self.width,
+                    self.height,
+                    crop_rect,
+                    |s| s.frame_index == Some(idx),
+                );
+                out.data
+                    .par_chunks_exact_mut(3)
+                    .zip(aligned.data.par_chunks_exact(3))
+                    .zip(mask.par_iter())
+                    .zip(valid.par_iter())
+                    .for_each(|(((dst, src), &alpha), &v)| {
+                        let a = (alpha * v).clamp(0.0, 1.0);
+                        if a > 0.0 {
+                            for c in 0..3 {
+                                dst[c] = dst[c] * (1.0 - a) + src[c] * a;
+                            }
+                        }
+                    });
+            }
         }
+        Ok(out)
     }
 }
 
 impl HdrSession {
     fn sync_radiance_deghost(&mut self, settings: &HdrSettings) {
-        if let Merge::Radiance { clip, .. } = self.merge
-            && (settings.deghost_sensitivity != self.deghost_sensitivity
-                || settings.deghost_mode != self.deghost_mode)
-        {
-            let (merge, preview_raster) = recompute_radiance_preview(
-                clip,
-                &self.frames,
-                self.reference,
-                settings.deghost_sensitivity,
-                settings.deghost_mode,
-            );
-            self.merge = merge;
-            self.merged_preview = preview_raster;
-            self.deghost_sensitivity = settings.deghost_sensitivity;
-            self.deghost_mode = settings.deghost_mode;
+        let next_brush_hash = crate::merge::stroke_mask_hash(&settings.brush_strokes);
+        let brush_changed = next_brush_hash != self.brush_hash;
+        match self.merge {
+            Merge::Radiance { clip, .. } => {
+                if settings.deghost_sensitivity != self.deghost_sensitivity
+                    || settings.deghost_mode != self.deghost_mode
+                    || brush_changed
+                {
+                    let (preview_rect, _) = self.crop_rects(settings);
+                    let (merge, preview_raster) = recompute_radiance_preview(
+                        clip,
+                        &self.frames,
+                        self.reference,
+                        settings.deghost_sensitivity,
+                        settings.deghost_mode,
+                        &preview_rect,
+                        &settings.brush_strokes,
+                    );
+                    self.merge = merge;
+                    self.merged_preview = preview_raster;
+                    self.deghost_sensitivity = settings.deghost_sensitivity;
+                    self.deghost_mode = settings.deghost_mode;
+                    self.brush_hash = next_brush_hash;
+                }
+            }
+            Merge::Fusion => {
+                if brush_changed {
+                    let (preview_rect, _) = self.crop_rects(settings);
+                    self.merged_preview = fuse_previews_with_override(
+                        &self.frames,
+                        &preview_rect,
+                        &settings.brush_strokes,
+                    );
+                    self.brush_hash = next_brush_hash;
+                }
+            }
         }
     }
 }
@@ -911,19 +1091,23 @@ impl MergeSession for HdrSession {
         let settings: HdrSettings = parse_settings(settings)?;
         self.sync_radiance_deghost(&settings);
         let is_scene = matches!(self.merge, Merge::Radiance { .. });
+        let (_, rect) = self.crop_rects(&settings);
         let merged = match &self.merge {
             Merge::Radiance { clip, masks } => self.render_radiance(
                 *clip,
                 masks,
+                &rect,
+                &settings.brush_strokes,
                 &context.loader_for_hdr_brackets(true, self.half_size, settings.apply_edits),
                 context,
             )?,
             Merge::Fusion => self.render_fusion(
+                &rect,
+                &settings.brush_strokes,
                 &context.loader_with_options(false, self.half_size, settings.apply_edits),
                 context,
             )?,
         };
-        let (_, rect) = self.crop_rects(&settings);
         let mut final_image = crop(&merged, &rect);
         if settings.half_size && !self.half_size {
             final_image = resize_area(

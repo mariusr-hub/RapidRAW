@@ -12,7 +12,10 @@ use crate::merge::source::{ensure_same_size, file_name};
 use crate::merge::{MergeContext, MergeSession, parse_settings};
 use crate::render::color_space::luminance;
 use align::{FramePose, LensWarp, MIN_QUALITY, align_stack};
-use fusion::{Depth, Fusion, Method, noise_floor, prepare};
+use fusion::{
+    Depth, Fusion, Method, compute_regularized_depth_index, depth_slice_weight,
+    fuse_depth_map_from_previews, noise_floor, prepare,
+};
 use image::RgbImage;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -25,12 +28,13 @@ const ALIGN_MAX_DIMENSION: usize = 2000;
 const IDENTITY_DISPLACEMENT: f64 = 0.25;
 const DEPTH_BACKGROUND: f32 = 0.08;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FocusSettings {
     pub method: Method,
     pub auto_crop: bool,
     pub half_size: bool,
+    pub brush_strokes: Vec<crate::merge::MergeBrushStroke>,
 }
 
 impl Default for FocusSettings {
@@ -39,6 +43,7 @@ impl Default for FocusSettings {
             method: Method::Detail,
             auto_crop: true,
             half_size: false,
+            brush_strokes: Vec::new(),
         }
     }
 }
@@ -285,21 +290,71 @@ impl MergeSession for FocusSession {
         }
         let (pw, ph) = (self.frames[0].preview.width, self.frames[0].preview.height);
         let noise = noise_floor(&srgb_encoded(&self.frames[self.reference].preview));
-        let mut fusion = Fusion::new(pw, ph, true);
-        for (i, frame) in self.frames.iter().enumerate() {
-            let contribution = prepare(
-                &srgb_encoded(&frame.preview),
-                &frame.valid,
-                settings.method,
-                noise,
-                true,
-            );
-            fusion.accumulate(i, contribution);
-        }
-        let (fused, labels) = fusion.finish();
         let (rect, full) = self.crop_rects(&settings);
+
+        let (mut fused, depth) = if settings.method == Method::DepthMap {
+            let encoded_previews: Vec<Raster> = self
+                .frames
+                .iter()
+                .map(|f| srgb_encoded(&f.preview))
+                .collect();
+            let pairs: Vec<(&Raster, &[f32])> = encoded_previews
+                .iter()
+                .zip(self.frames.iter())
+                .map(|(img, f)| (img, f.valid.as_slice()))
+                .collect();
+            fuse_depth_map_from_previews(&pairs)
+        } else {
+            let mut fusion = Fusion::new(pw, ph, true);
+            for (i, frame) in self.frames.iter().enumerate() {
+                let contribution = prepare(
+                    &srgb_encoded(&frame.preview),
+                    &frame.valid,
+                    settings.method,
+                    noise,
+                    true,
+                );
+                fusion.accumulate(i, contribution);
+            }
+            let (fused, labels) = fusion.finish();
+            (fused, labels.expect("preview fusion tracks depth"))
+        };
+
+        if !settings.brush_strokes.is_empty() {
+            for (k, frame) in self.frames.iter().enumerate() {
+                if !settings
+                    .brush_strokes
+                    .iter()
+                    .any(|s| s.frame_index == Some(k))
+                {
+                    continue;
+                }
+                let mask = crate::merge::rasterize_strokes_for_rect(
+                    &settings.brush_strokes,
+                    pw,
+                    ph,
+                    &rect,
+                    |s| s.frame_index == Some(k),
+                );
+                let slice = srgb_encoded(&frame.preview);
+                fused
+                    .data
+                    .par_chunks_exact_mut(3)
+                    .zip(slice.data.par_chunks_exact(3))
+                    .zip(mask.par_iter())
+                    .zip(frame.valid.par_iter())
+                    .for_each(|(((dst, src), &alpha), &valid)| {
+                        let a = (alpha * valid).clamp(0.0, 1.0);
+                        if a > 0.0 {
+                            for c in 0..3 {
+                                dst[c] = dst[c] * (1.0 - a) + src[c] * a;
+                            }
+                        }
+                    });
+            }
+        }
+
         let image = srgb_decoded(crop(&fused, &rect));
-        let depth = labels.expect("preview fusion tracks depth");
         let preview = MergePreview {
             base64: encode_jpeg_base64(&self.rendition.to_srgb8(&image))?,
             overlay_base64: Some(encode_jpeg_base64(&depth_image(
@@ -340,49 +395,203 @@ impl MergeSession for FocusSession {
             Ok((srgb_encoded(&warped), valid))
         };
 
-        let reference_path = self.frames[self.reference].path.clone();
-        let (reference_image, reference_valid) = load(self.reference, &reference_path)?;
-        let noise = noise_floor(&reference_image);
-        let fusion = Mutex::new(Fusion::new(width, height, false));
-        fusion.lock().unwrap().accumulate(
-            self.reference,
-            prepare(
-                &reference_image,
-                &reference_valid,
-                settings.method,
-                noise,
-                false,
-            ),
-        );
-        drop(reference_image);
+        let (_, full_rect) = self.crop_rects(&settings);
+        let fused = if settings.method == Method::DepthMap {
+            let encoded_previews: Vec<Raster> = self
+                .frames
+                .iter()
+                .map(|f| srgb_encoded(&f.preview))
+                .collect();
+            let preview_w = encoded_previews[0].width;
+            let preview_h = encoded_previews[0].height;
+            let pairs: Vec<(&Raster, &[f32])> = encoded_previews
+                .iter()
+                .zip(self.frames.iter())
+                .map(|(img, f)| (img, f.valid.as_slice()))
+                .collect();
+            let (preview_depth_idx, _) = compute_regularized_depth_index(&pairs);
+            drop(encoded_previews);
 
-        let others: Vec<String> = self
-            .frames
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != self.reference)
-            .map(|(_, f)| f.path.clone())
-            .collect();
-        let indices: Vec<usize> = (0..self.frames.len())
-            .filter(|&i| i != self.reference)
-            .collect();
-        loader.load_all(&others, |slot, path| {
-            context.check_cancelled()?;
-            let index = indices[slot];
-            let (image, valid) = load(index, path)?;
-            context.check_cancelled()?;
-            let contribution = prepare(&image, &valid, settings.method, noise, false);
-            drop(image);
-            fusion.lock().unwrap().accumulate(index, contribution);
-            Ok(())
-        })?;
+            let num_acc = Mutex::new(vec![0.0f32; width * height * 3]);
+            let den_acc = Mutex::new(vec![0.0f32; width * height]);
+            let paths: Vec<String> = self.frames.iter().map(|f| f.path.clone()).collect();
+            loader.load_all(&paths, |index, path| {
+                context.check_cancelled()?;
+                let (image, valid) = load(index, path)?;
+                context.check_cancelled()?;
+                let brush = if settings
+                    .brush_strokes
+                    .iter()
+                    .any(|s| s.frame_index == Some(index))
+                {
+                    Some(crate::merge::rasterize_strokes_for_rect(
+                        &settings.brush_strokes,
+                        width,
+                        height,
+                        &full_rect,
+                        |s| s.frame_index == Some(index),
+                    ))
+                } else {
+                    None
+                };
+                let brush_any = if !settings.brush_strokes.is_empty() {
+                    Some(crate::merge::rasterize_strokes_for_rect(
+                        &settings.brush_strokes,
+                        width,
+                        height,
+                        &full_rect,
+                        |s| s.frame_index.is_some(),
+                    ))
+                } else {
+                    None
+                };
 
-        let (fused, _) = fusion
-            .into_inner()
-            .map_err(|_| "Stacking the images failed unexpectedly.".to_string())?
-            .finish();
-        let (_, rect) = self.crop_rects(&settings);
-        let mut final_image = srgb_decoded(crop(&fused, &rect));
+                let sx = preview_w as f32 / width as f32;
+                let sy = preview_h as f32 / height as f32;
+                let mut num = num_acc.lock().unwrap();
+                let mut den = den_acc.lock().unwrap();
+                num.par_chunks_exact_mut(width * 3)
+                    .zip(den.par_chunks_exact_mut(width))
+                    .enumerate()
+                    .for_each(|(y, (num_row, den_row))| {
+                        let py = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, preview_h as f32 - 1.0);
+                        let y0 = py.floor() as usize;
+                        let y1 = (y0 + 1).min(preview_h - 1);
+                        let fy = py - y0 as f32;
+                        for x in 0..width {
+                            let idx = y * width + x;
+                            if valid[idx] < 1e-3 {
+                                continue;
+                            }
+                            let px = ((x as f32 + 0.5) * sx - 0.5)
+                                .clamp(0.0, preview_w as f32 - 1.0);
+                            let x0 = px.floor() as usize;
+                            let x1 = (x0 + 1).min(preview_w - 1);
+                            let fx = px - x0 as f32;
+                            let d00 = preview_depth_idx[y0 * preview_w + x0];
+                            let d10 = preview_depth_idx[y0 * preview_w + x1];
+                            let d01 = preview_depth_idx[y1 * preview_w + x0];
+                            let d11 = preview_depth_idx[y1 * preview_w + x1];
+                            let d = (d00 * (1.0 - fx) + d10 * fx) * (1.0 - fy)
+                                + (d01 * (1.0 - fx) + d11 * fx) * fy;
+
+                            let mut w = depth_slice_weight(index, d) * valid[idx];
+                            if let Some(ref any) = brush_any {
+                                w *= (1.0 - any[idx]).clamp(0.0, 1.0);
+                            }
+                            if let Some(ref br) = brush
+                                && br[idx] > 0.0
+                            {
+                                w += br[idx] * 64.0 * valid[idx];
+                            }
+                            if w > 0.0 {
+                                let p = image.pixel(x, y);
+                                num_row[x * 3] += p[0] * w;
+                                num_row[x * 3 + 1] += p[1] * w;
+                                num_row[x * 3 + 2] += p[2] * w;
+                                den_row[x] += w;
+                            }
+                        }
+                    });
+                Ok(())
+            })?;
+            let mut num = num_acc
+                .into_inner()
+                .map_err(|_| "Stacking the images failed unexpectedly.".to_string())?;
+            let den = den_acc
+                .into_inner()
+                .map_err(|_| "Stacking the images failed unexpectedly.".to_string())?;
+            num.par_chunks_exact_mut(3)
+                .zip(den.par_iter())
+                .for_each(|(p, &d)| {
+                    if d > 1e-6 {
+                        let inv = 1.0 / d;
+                        p[0] *= inv;
+                        p[1] *= inv;
+                        p[2] *= inv;
+                    }
+                });
+            Raster::from_data(width, height, 3, num)
+        } else {
+            let reference_path = self.frames[self.reference].path.clone();
+            let (reference_image, reference_valid) = load(self.reference, &reference_path)?;
+            let noise = noise_floor(&reference_image);
+            let fusion = Mutex::new(Fusion::new(width, height, false));
+            fusion.lock().unwrap().accumulate(
+                self.reference,
+                prepare(
+                    &reference_image,
+                    &reference_valid,
+                    settings.method,
+                    noise,
+                    false,
+                ),
+            );
+            drop(reference_image);
+
+            let others: Vec<String> = self
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != self.reference)
+                .map(|(_, f)| f.path.clone())
+                .collect();
+            let indices: Vec<usize> = (0..self.frames.len())
+                .filter(|&i| i != self.reference)
+                .collect();
+            loader.load_all(&others, |slot, path| {
+                context.check_cancelled()?;
+                let index = indices[slot];
+                let (image, valid) = load(index, path)?;
+                context.check_cancelled()?;
+                let contribution = prepare(&image, &valid, settings.method, noise, false);
+                drop(image);
+                fusion.lock().unwrap().accumulate(index, contribution);
+                Ok(())
+            })?;
+
+            let (mut fused, _) = fusion
+                .into_inner()
+                .map_err(|_| "Stacking the images failed unexpectedly.".to_string())?
+                .finish();
+
+            if !settings.brush_strokes.is_empty() {
+                for (index, frame) in self.frames.iter().enumerate() {
+                    if !settings
+                        .brush_strokes
+                        .iter()
+                        .any(|s| s.frame_index == Some(index))
+                    {
+                        continue;
+                    }
+                    let (image, valid) = load(index, &frame.path)?;
+                    let mask = crate::merge::rasterize_strokes_for_rect(
+                        &settings.brush_strokes,
+                        width,
+                        height,
+                        &full_rect,
+                        |s| s.frame_index == Some(index),
+                    );
+                    fused
+                        .data
+                        .par_chunks_exact_mut(3)
+                        .zip(image.data.par_chunks_exact(3))
+                        .zip(mask.par_iter())
+                        .zip(valid.par_iter())
+                        .for_each(|(((dst, src), &alpha), &v)| {
+                            let a = (alpha * v).clamp(0.0, 1.0);
+                            if a > 0.0 {
+                                for c in 0..3 {
+                                    dst[c] = dst[c] * (1.0 - a) + src[c] * a;
+                                }
+                            }
+                        });
+                }
+            }
+            fused
+        };
+
+        let mut final_image = srgb_decoded(crop(&fused, &full_rect));
         if settings.half_size && !self.half_size {
             final_image = resize_area(
                 &final_image,

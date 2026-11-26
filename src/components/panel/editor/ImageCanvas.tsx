@@ -27,7 +27,7 @@ import { Panel } from '../../../types/ui';
 import { RenderSize } from '../../../hooks/useImageRenderSize';
 import { useDelayedLoading } from '../../../hooks/useDelayedLoading';
 import { useTranslation } from 'react-i18next';
-import { useEditorStore, WgpuPhase } from '../../../store/useEditorStore';
+import { canvasToolState, useEditorStore, WgpuPhase } from '../../../store/useEditorStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { isDirectWgpuSwapchainActive } from '../../../utils/wgpuRenderer';
 import { MIXER_SAMPLE_SCREEN_SIZE, useHslMixerPicker } from '../../../hooks/useHslMixerPicker';
@@ -38,6 +38,7 @@ import CropRotateArea from './overlays/CropRotateArea';
 import RelightLightShape, { RelightBasis } from './overlays/RelightLightShape';
 import CenterMarkerShape, { CENTER_MARKERS } from './overlays/CenterMarkerShape';
 import CloneSourceOverlay from './overlays/CloneSourceOverlay';
+import DustSpotsOverlay from './overlays/DustSpotsOverlay';
 import InpaintGuideOverlay from './overlays/InpaintGuideOverlay';
 import { countPatchesOfType, createSubMask, getStrokeCenter } from '../../../utils/maskUtils';
 import { calculateStraightenAngle, getCropViewLayout, resolveAspectRatio } from '../../../utils/cropUtils';
@@ -1453,6 +1454,7 @@ const ImageCanvas = memo(
     const interactivePatch = useEditorStore((state) => state.interactivePatch);
     const isGuidedPerspectiveActive = useEditorStore((state) => state.isGuidedPerspectiveActive);
     const isRelightPickerActive = useEditorStore((state) => state.isRelightPickerActive);
+    const isDustSpotEditActive = useEditorStore((state) => state.isDustSpotEditActive);
     const activeRelightLightId = useEditorStore((state) => state.activeRelightLightId);
     const activeCenterMarker = useEditorStore((state) => state.activeCenterMarker);
     const inpaintGuideMode = useEditorStore((state) => state.inpaintGuideMode);
@@ -1824,6 +1826,16 @@ const ImageCanvas = memo(
         ? (activeCrop.y / 100) * effectiveImageDimensions.height
         : activeCrop.y
       : 0;
+    const cropW = activeCrop
+      ? isPercentCrop
+        ? (activeCrop.width / 100) * effectiveImageDimensions.width
+        : activeCrop.width
+      : effectiveImageDimensions.width;
+    const cropH = activeCrop
+      ? isPercentCrop
+        ? (activeCrop.height / 100) * effectiveImageDimensions.height
+        : activeCrop.height
+      : effectiveImageDimensions.height;
 
     const effectiveZoomScale = transformScale > 0 ? transformScale : 1;
 
@@ -3885,6 +3897,11 @@ const ImageCanvas = memo(
                         onMouseDown={handleStart}
                         onDblClick={isMixerPickerActive ? resetMixerPick : undefined}
                         onContextMenu={(e) => {
+                          if (isDustSpotEditActive) {
+                            e.evt.preventDefault();
+                            setEditor(canvasToolState());
+                            return;
+                          }
                           if (isTargetedCurveActive) {
                             e.evt.preventDefault();
                             exitTargetedCurve();
@@ -4155,6 +4172,17 @@ const ImageCanvas = memo(
                       tooltip={t('editor.ai.cloneHeal.dragSource')}
                     />
                   )}
+                  {isDustSpotEditActive &&
+                    !isShowingOriginal &&
+                    imageRenderSize.width > 0 &&
+                    imageRenderSize.height > 0 && (
+                      <DustSpotsOverlay
+                        crop={{ x: cropX, y: cropY, width: cropW, height: cropH }}
+                        effectiveDimensions={effectiveImageDimensions}
+                        imageRenderSize={imageRenderSize}
+                        zoom={effectiveZoomScale}
+                      />
+                    )}
                   <AnimatePresence>
                     {wbSwatchAnchor && wbSample && (
                       <div

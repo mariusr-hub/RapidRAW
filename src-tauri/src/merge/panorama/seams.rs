@@ -15,6 +15,13 @@ pub struct SeamLayer {
     pub valid: Vec<bool>,
 }
 
+pub struct SeamConstraints {
+    pub width: usize,
+    pub height: usize,
+    pub keep: Vec<Option<usize>>,
+    pub exclude: Vec<Option<usize>>,
+}
+
 impl SeamLayer {
     #[inline]
     fn is_valid(&self, x: usize, y: usize) -> bool {
@@ -156,8 +163,9 @@ fn refine_pair(
     (a, b): (usize, usize),
     region: Rect,
     wraps: bool,
+    layer_images: Option<&[usize]>,
+    constraints: Option<&SeamConstraints>,
 ) -> Vec<(usize, u16)> {
-    let (la, lb) = (&layers[a], &layers[b]);
     let (label_a, label_b) = (a as u16, b as u16);
     let margin = BORDER_MARGIN_FRACTION * ((width * height) as f32).sqrt();
 
@@ -169,20 +177,20 @@ fn refine_pair(
         for x in region.x..region.right() {
             let label = labels[y * width + x];
             if (label != label_a && label != label_b)
-                || !la.is_valid(x, y)
-                || !lb.is_valid(x, y)
-                || distances[a][la.local_index(x, y)] < margin
-                || distances[b][lb.local_index(x, y)] < margin
+                || !la_is_valid(&layers[a], x, y)
+                || !la_is_valid(&layers[b], x, y)
+                || distances[a][layers[a].local_index(x, y)] < margin
+                || distances[b][layers[b].local_index(x, y)] < margin
             {
                 continue;
             }
-            let ca = la.color_at(x, y);
-            let cb = lb.color_at(x, y);
+            let ca = layers[a].color_at(x, y);
+            let cb = layers[b].color_at(x, y);
             let d = (ca[0] - cb[0]).abs() + (ca[1] - cb[1]).abs() + (ca[2] - cb[2]).abs();
             node_of[(y - region.y) * region.width + x - region.x] = pixels.len() as u32;
             pixels.push((x, y));
             difference.push(d);
-            gradient.push(la.gradient_at(x, y) + lb.gradient_at(x, y));
+            gradient.push(layers[a].gradient_at(x, y) + layers[b].gradient_at(x, y));
         }
     }
     if pixels.is_empty() {
@@ -202,8 +210,23 @@ fn refine_pair(
         (n != NO_NODE).then_some(n)
     };
 
+    let img_a = layer_images.and_then(|li| li.get(a).copied()).unwrap_or(a);
+    let img_b = layer_images.and_then(|li| li.get(b).copied()).unwrap_or(b);
     let mut constrained = (false, false);
     for (n, &(x, y)) in pixels.iter().enumerate() {
+        if let Some(c) = constraints
+            && y < c.height
+            && x < c.width
+        {
+            let idx = y * c.width + x;
+            if c.keep[idx] == Some(img_a) || c.exclude[idx] == Some(img_b) {
+                graph.add_terminal_weights(n, 1.0e4, 0.0);
+                constrained.0 = true;
+            } else if c.keep[idx] == Some(img_b) || c.exclude[idx] == Some(img_a) {
+                graph.add_terminal_weights(n, 0.0, 1.0e4);
+                constrained.1 = true;
+            }
+        }
         for (dx, dy) in [(1isize, 0isize), (0, 1), (-1, 0), (0, -1)] {
             let nx = x as isize + dx;
             let ny = y as isize + dy;
@@ -255,6 +278,11 @@ fn refine_pair(
         .collect()
 }
 
+#[inline]
+fn la_is_valid(layer: &SeamLayer, x: usize, y: usize) -> bool {
+    layer.is_valid(x, y)
+}
+
 fn expanded(rect: &Rect, margin: usize) -> Rect {
     Rect {
         x: rect.x.saturating_sub(margin),
@@ -265,6 +293,17 @@ fn expanded(rect: &Rect, margin: usize) -> Rect {
 }
 
 pub fn find_seams(width: usize, height: usize, layers: &[SeamLayer], wraps: bool) -> Vec<u16> {
+    find_seams_with_constraints(width, height, layers, None, wraps, None)
+}
+
+pub fn find_seams_with_constraints(
+    width: usize,
+    height: usize,
+    layers: &[SeamLayer],
+    layer_images: Option<&[usize]>,
+    wraps: bool,
+    constraints: Option<&SeamConstraints>,
+) -> Vec<u16> {
     let distances: Vec<Vec<f32>> = layers
         .par_iter()
         .map(|layer| distance_to_border(layer, width, height, wraps))
@@ -292,7 +331,18 @@ pub fn find_seams(width: usize, height: usize, layers: &[SeamLayer], wraps: bool
         let updates: Vec<Vec<(usize, u16)>> = batch
             .par_iter()
             .map(|&(pair, region)| {
-                refine_pair(&labels, width, height, layers, &distances, pair, region, wraps)
+                refine_pair(
+                    &labels,
+                    width,
+                    height,
+                    layers,
+                    &distances,
+                    pair,
+                    region,
+                    wraps,
+                    layer_images,
+                    constraints,
+                )
             })
             .collect();
         for (index, label) in updates.into_iter().flatten() {
@@ -301,4 +351,36 @@ pub fn find_seams(width: usize, height: usize, layers: &[SeamLayer], wraps: bool
         pending = deferred;
     }
     labels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_seam_constraints_keep_and_exclude_override_maxflow() {
+        let (w, h) = (40usize, 40usize);
+        let mk_layer = |val: f32| SeamLayer {
+            roi: Rect { x: 0, y: 0, width: w, height: h },
+            color: Raster::from_data(w, h, 3, vec![val; w * h * 3]),
+            valid: vec![true; w * h],
+        };
+        let layers = vec![mk_layer(0.2), mk_layer(0.8)];
+        let mut keep = vec![None; w * h];
+        let mut exclude = vec![None; w * h];
+        for y in 15..25 {
+            for x in 15..25 {
+                keep[y * w + x] = Some(1);
+                exclude[y * w + x] = Some(0);
+            }
+        }
+        let constraints = SeamConstraints {
+            width: w,
+            height: h,
+            keep,
+            exclude,
+        };
+        let labels = find_seams_with_constraints(w, h, &layers, None, false, Some(&constraints));
+        assert_eq!(labels[20 * w + 20], 1);
+    }
 }

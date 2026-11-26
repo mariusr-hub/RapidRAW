@@ -3264,6 +3264,19 @@ impl RigidTransform2D {
             (cx + cos_t * rx - sin_t * ry + self.dx, cy + sin_t * rx + cos_t * ry + self.dy)
         }
     }
+
+    #[inline]
+    pub fn apply_inverse(&self, xr: f32, yr: f32, cx: f32, cy: f32) -> (f32, f32) {
+        let tx = xr - cx - self.dx;
+        let ty = yr - cy - self.dy;
+        if self.theta.abs() < 1e-6 {
+            (cx + tx, cy + ty)
+        } else {
+            let cos_t = self.theta.cos();
+            let sin_t = self.theta.sin();
+            (cx + cos_t * tx + sin_t * ty, cy - sin_t * tx + cos_t * ty)
+        }
+    }
 }
 
 /// Estimates sub-pixel shift (dx, dy) for a local image patch using normalized cross-correlation
@@ -3638,6 +3651,50 @@ pub(crate) fn drizzle_bayer_cfa_frames(
     let cx = orig_w as f32 * 0.5;
     let cy = orig_h as f32 * 0.5;
 
+    // Pass 1: Two-pass Kappa-Sigma outlier rejection (median + 3.0 * MAD sigma) on reference grid
+    let use_kappa_sigma = frames.len() >= 3;
+    let ref_stats: Vec<(f32, f32)> = if use_kappa_sigma {
+        let valid_frames: Vec<_> = frames
+            .iter()
+            .zip(transforms.iter())
+            .filter(|(f, _)| f.width == ref_f.width && f.height == ref_f.height)
+            .collect();
+        (0..ref_f.height)
+            .into_par_iter()
+            .flat_map(|ry| {
+                let mut row_stats = Vec::with_capacity(ref_f.width);
+                let mut vals = Vec::with_capacity(valid_frames.len());
+                for rx in 0..ref_f.width {
+                    let chan = ref_f.cfa[ry & 1][rx & 1] as usize;
+                    vals.clear();
+                    for &(f, tr) in &valid_frames {
+                        let (fx, fy) = tr.apply_inverse(rx as f32, ry as f32, cx, cy);
+                        let sx = ((fx / 2.0).round() as isize * 2 + (rx & 1) as isize)
+                            .clamp(0, ref_f.width as isize - 1) as usize;
+                        let sy = ((fy / 2.0).round() as isize * 2 + (ry & 1) as isize)
+                            .clamp(0, ref_f.height as isize - 1) as usize;
+                        if f.cfa[sy & 1][sx & 1] as usize == chan {
+                            vals.push(f.data[sy * f.width + sx] * f.wb[chan.min(2)]);
+                        }
+                    }
+                    if vals.len() >= 3 {
+                        vals.sort_by(|a, b| a.total_cmp(b));
+                        let med = vals[vals.len() / 2];
+                        let mut devs: Vec<f32> = vals.iter().map(|&v| (v - med).abs()).collect();
+                        devs.sort_by(|a, b| a.total_cmp(b));
+                        let mad_sigma = (devs[devs.len() / 2] * 1.4826).max(0.02);
+                        row_stats.push((med, mad_sigma));
+                    } else {
+                        row_stats.push((0.0, f32::INFINITY));
+                    }
+                }
+                row_stats
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     for (frame, transform) in frames.iter().zip(transforms.iter()) {
         if frame.width != ref_f.width || frame.height != ref_f.height {
             continue;
@@ -3651,6 +3708,14 @@ pub(crate) fn drizzle_bayer_cfa_frames(
                 let wb_val = raw_val * frame.wb[chan.min(2)];
 
                 let (xr, yr) = transform.apply(x as f32, y as f32, cx, cy);
+                if use_kappa_sigma {
+                    let rx = (xr.round() as isize).clamp(0, ref_f.width as isize - 1) as usize;
+                    let ry = (yr.round() as isize).clamp(0, ref_f.height as isize - 1) as usize;
+                    let (med, sigma) = ref_stats[ry * ref_f.width + rx];
+                    if sigma.is_finite() && (wb_val - med).abs() > 3.0 * sigma {
+                        continue;
+                    }
+                }
                 let target_xc = (xr + 0.5) * scale as f32;
                 let target_yc = (yr + 0.5) * scale as f32;
 
@@ -4895,6 +4960,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_bayer_drizzle_kappa_sigma_rejects_hot_pixel_outlier() {
+        let (w, h) = (16usize, 16usize);
+        let cfa = [[0, 1], [1, 2]];
+        let wb = [1.0f32; 3];
+        let cam_to_working = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mk_frame = |spike: bool| {
+            let mut data = vec![0.25f32; w * h];
+            if spike {
+                for y in 6..10 {
+                    for x in 6..10 {
+                        data[y * w + x] = 5.0;
+                    }
+                }
+            }
+            crate::decode::raw_processing::LinearBayerFrame {
+                data,
+                width: w,
+                height: h,
+                cfa,
+                wb,
+                cam_to_working,
+                orientation: rawler::decoders::Orientation::Normal,
+            }
+        };
+        let frames = vec![
+            mk_frame(false),
+            mk_frame(false),
+            mk_frame(false),
+            mk_frame(true),
+        ];
+        let transforms = vec![RigidTransform2D::identity(); 4];
+        let out = drizzle_bayer_cfa_frames(&frames, &transforms, 2, 0.7).expect("CFA drizzle succeeds");
+        let p = out.get_pixel(16, 16);
+        assert!(
+            p[0] < 0.35 && p[1] < 0.35 && p[2] < 0.35,
+            "kappa-sigma rejection must suppress outlier spike, got {:?}",
+            p
+        );
     }
 
     #[test]

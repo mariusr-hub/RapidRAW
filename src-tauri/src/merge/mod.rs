@@ -21,9 +21,132 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use source::{SourceLoader, source_paths};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter};
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeBrushStroke {
+    pub points: Vec<[f32; 2]>,
+    pub radius_norm: f32,
+    #[serde(default)]
+    pub frame_index: Option<usize>,
+    #[serde(default)]
+    pub seam_role: Option<String>,
+}
+
+pub(crate) fn stroke_mask_hash(strokes: &[MergeBrushStroke]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    strokes.len().hash(&mut hasher);
+    for s in strokes {
+        s.points.len().hash(&mut hasher);
+        for &[nx, ny] in &s.points {
+            (nx * 10_000.0).round().to_bits().hash(&mut hasher);
+            (ny * 10_000.0).round().to_bits().hash(&mut hasher);
+        }
+        (s.radius_norm * 10_000.0).round().to_bits().hash(&mut hasher);
+        s.frame_index.hash(&mut hasher);
+        s.seam_role.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn dist_sq_point_segment(px: f32, py: f32, a: [f32; 2], b: [f32; 2]) -> f32 {
+    let vx = b[0] - a[0];
+    let vy = b[1] - a[1];
+    let len2 = vx * vx + vy * vy;
+    if len2 <= 1e-6 {
+        let dx = px - a[0];
+        let dy = py - a[1];
+        return dx * dx + dy * dy;
+    }
+    let t = (((px - a[0]) * vx + (py - a[1]) * vy) / len2).clamp(0.0, 1.0);
+    let cx = a[0] + t * vx;
+    let cy = a[1] + t * vy;
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy
+}
+
+/// Rasterizes normalized `[0..1]` preview-space strokes matching `filter` onto `(full_w, full_h)`
+/// mapped through `crop_rect`. Returns feathered mask values in `[0.0, 1.0]`.
+pub(crate) fn rasterize_strokes_for_rect(
+    strokes: &[MergeBrushStroke],
+    full_w: usize,
+    full_h: usize,
+    crop_rect: &raster::Rect,
+    filter: impl Fn(&MergeBrushStroke) -> bool,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; full_w * full_h];
+    if full_w == 0 || full_h == 0 || crop_rect.width == 0 || crop_rect.height == 0 {
+        return out;
+    }
+    let ref_dim = crop_rect.width.min(crop_rect.height) as f32;
+    let cw = crop_rect.width as f32;
+    let ch = crop_rect.height as f32;
+    let ox = crop_rect.x as f32;
+    let oy = crop_rect.y as f32;
+
+    for stroke in strokes {
+        if !filter(stroke) || stroke.points.is_empty() {
+            continue;
+        }
+        let r = (stroke.radius_norm * ref_dim).max(2.0);
+        let r2 = r * r;
+        let inner = r * 0.55;
+        let pts: Vec<[f32; 2]> = stroke
+            .points
+            .iter()
+            .map(|&[nx, ny]| [ox + nx.clamp(0.0, 1.0) * cw, oy + ny.clamp(0.0, 1.0) * ch])
+            .collect();
+
+        let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &[px, py] in &pts {
+            min_x = min_x.min(px);
+            max_x = max_x.max(px);
+            min_y = min_y.min(py);
+            max_y = max_y.max(py);
+        }
+        let pad = r.ceil();
+        let x0 = ((min_x - pad).floor() as isize).max(0) as usize;
+        let x1 = ((max_x + pad).ceil() as isize).min(full_w as isize - 1).max(0) as usize;
+        let y0 = ((min_y - pad).floor() as isize).max(0) as usize;
+        let y1 = ((max_y + pad).ceil() as isize).min(full_h as isize - 1).max(0) as usize;
+        if x0 > x1 || y0 > y1 {
+            continue;
+        }
+
+        for y in y0..=y1 {
+            let py = y as f32 + 0.5;
+            let row = y * full_w;
+            for x in x0..=x1 {
+                let px = x as f32 + 0.5;
+                let mut best_d2 = f32::INFINITY;
+                if pts.len() == 1 {
+                    best_d2 = dist_sq_point_segment(px, py, pts[0], pts[0]);
+                } else {
+                    for seg in pts.windows(2) {
+                        best_d2 = best_d2.min(dist_sq_point_segment(px, py, seg[0], seg[1]));
+                    }
+                }
+                if best_d2 < r2 {
+                    let d = best_d2.sqrt();
+                    let t = ((d - inner) / (r - inner).max(1e-3)).clamp(0.0, 1.0);
+                    let w = 1.0 - t * t * (3.0 - 2.0 * t);
+                    let slot = &mut out[row + x];
+                    if w > *slot {
+                        *slot = w;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 
 pub trait MergeSession: Send {
     fn preview(&mut self, settings: &Value) -> Result<MergePreview, String>;
@@ -280,4 +403,30 @@ pub async fn save_collage(base64_data: String, first_path_str: String) -> Result
         &decoded_bytes,
     )?;
     Ok(output_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rasterize_strokes_maps_normalized_crop_coords() {
+        let crop_rect = raster::Rect {
+            x: 10,
+            y: 20,
+            width: 40,
+            height: 40,
+        };
+        let strokes = vec![MergeBrushStroke {
+            points: vec![[0.5, 0.5]],
+            radius_norm: 0.15,
+            frame_index: Some(1),
+            seam_role: None,
+        }];
+        let mask = rasterize_strokes_for_rect(&strokes, 80, 80, &crop_rect, |s| {
+            s.frame_index == Some(1)
+        });
+        assert!(mask[40 * 80 + 30] > 0.9, "stroke midpoint inside crop must be saturated");
+        assert!(mask[2 * 80 + 2] == 0.0, "far corner must remain zero");
+    }
 }

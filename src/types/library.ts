@@ -116,6 +116,13 @@ export type HdrDeghostSensitivity = 'off' | 'low' | 'medium' | 'high';
 export type HdrDeghostMode = 'fast' | 'opticalFlow';
 export type HdrPreviewMode = 'sdr' | 'hdr10' | 'headroom';
 
+export interface MergeBrushStroke {
+  points: [number, number][];
+  radiusNorm: number;
+  frameIndex?: number | null;
+  seamRole?: 'keep' | 'exclude' | null;
+}
+
 export interface PanoramaSettings {
   autoCrop: boolean;
   boundaryWarp: number;
@@ -135,6 +142,7 @@ export interface PanoramaSettings {
   shadowLift?: number;
   detailBoost?: number;
   outputFormat?: MergeOutputFormat;
+  brushStrokes?: MergeBrushStroke[];
 }
 
 export type MergeOutputFormat = 'tiff' | 'jpeg' | 'ultrahdr' | 'png' | 'dng';
@@ -153,15 +161,17 @@ export interface HdrSettings {
   shadowLift?: number;
   detailBoost?: number;
   outputFormat?: MergeOutputFormat;
+  brushStrokes?: MergeBrushStroke[];
 }
 
-export type FocusStackMethod = 'detail' | 'smooth';
+export type FocusStackMethod = 'detail' | 'smooth' | 'depthMap';
 
 export interface FocusStackSettings {
   autoCrop: boolean;
   method: FocusStackMethod;
   halfSize?: boolean;
   outputFormat?: MergeOutputFormat;
+  brushStrokes?: MergeBrushStroke[];
 }
 
 export interface MergeSettingsByKind {
