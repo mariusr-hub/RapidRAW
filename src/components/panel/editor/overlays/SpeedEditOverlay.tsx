@@ -206,6 +206,37 @@ export default function SpeedEditOverlay() {
     return () => overlay.removeEventListener('wheel', forwardWheel);
   }, []);
 
+  // Scroll-wheel Speed Edit: while Speed Edit key is held, wheel adjusts the active parameter in +/-1 (Shift = +/-5) steps
+  useEffect(() => {
+    if (!isSpeedEditing) return;
+    const handleSpeedWheel = (e: WheelEvent) => {
+      const target = speedEditTarget?.current ?? nudgeRef.current;
+      if (!target) return;
+      e.preventDefault();
+      e.stopPropagation();
+      markUsed();
+      if (nudgeRef.current !== target) {
+        nudgeRef.current?.onDragStateChange(false);
+        nudgeRef.current = target;
+        target.onDragStateChange(true);
+      }
+      const stepScale = target.maxPosition - target.minPosition <= 20 ? 0.05 : 1;
+      const mult = e.shiftKey ? 5 : 1;
+      const dir = -Math.sign(e.deltaY);
+      if (dir === 0) return;
+      const next = target.toValue(
+        Math.max(
+          target.minPosition,
+          Math.min(target.maxPosition, target.toPosition(target.value) + dir * mult * stepScale),
+        ),
+      );
+      target.onChange(next);
+      setValue(next);
+    };
+    window.addEventListener('wheel', handleSpeedWheel, { passive: false, capture: true });
+    return () => window.removeEventListener('wheel', handleSpeedWheel, { capture: true });
+  }, [isSpeedEditing, speedEditTarget]);
+
   useLayoutEffect(() => {
     setValue(speedEditTarget?.current?.value ?? null);
   }, [speedEditTarget, adjustments, liveRotation]);

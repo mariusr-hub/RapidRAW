@@ -406,6 +406,31 @@ pub fn get_5x7_glyph(ch: char) -> [u8; 7] {
     }
 }
 
+fn draw_text_crisp(
+    img: &mut image::RgbImage,
+    start_x: i32,
+    start_y: i32,
+    text: &str,
+    color: image::Rgb<u8>,
+    scale: u32,
+) {
+    let px_size = match scale {
+        0 | 1 => 14.0,
+        2 => 26.0,
+        s => (s as f32) * 13.0,
+    };
+    if !crate::export::typography::draw_text_rgb8(
+        img,
+        start_x as f32,
+        start_y as f32,
+        text,
+        px_size,
+        color.0,
+    ) {
+        draw_text_bitmap(img, start_x, start_y, text, color, scale);
+    }
+}
+
 pub fn draw_text_bitmap(
     img: &mut image::RgbImage,
     start_x: i32,
@@ -567,10 +592,10 @@ pub fn render_contact_sheet_canvas(
 
     // Render Title Header
     let title = if custom_title.trim().is_empty() { "RAPIDRAW CLIENT PROOF SHEET" } else { custom_title.trim() };
-    draw_text_bitmap(&mut sheet, (margin_x + 8) as i32, 24, title, title_color, 2);
+    draw_text_crisp(&mut sheet, (margin_x + 8) as i32, 18, title, title_color, 2);
 
     let subtitle = format!("TOTAL: {} PHOTOS  |  COLUMNS: {}  |  RATIO: PRESERVED", cells.len(), cols);
-    draw_text_bitmap(&mut sheet, (margin_x + 8) as i32, 58, &subtitle, subtext_color, 1);
+    draw_text_crisp(&mut sheet, (margin_x + 8) as i32, 54, &subtitle, subtext_color, 1);
 
     // Top rule divider
     let divider_y = 82i32;
@@ -643,7 +668,7 @@ pub fn render_contact_sheet_canvas(
         } else {
             cell.filename.clone()
         };
-        draw_text_bitmap(&mut sheet, (ox + 16) as i32, meta_top as i32, &display_name, text_color, 1);
+        draw_text_crisp(&mut sheet, (ox + 16) as i32, meta_top as i32, &display_name, text_color, 1);
 
         // EXIF Metadata Badge
         if include_exif && !cell.exif_badge.is_empty() {
@@ -653,13 +678,13 @@ pub fn render_contact_sheet_canvas(
             } else {
                 cell.exif_badge.clone()
             };
-            draw_text_bitmap(&mut sheet, (ox + 16) as i32, (meta_top + 16) as i32, &display_exif, subtext_color, 1);
+            draw_text_crisp(&mut sheet, (ox + 16) as i32, (meta_top + 16) as i32, &display_exif, subtext_color, 1);
         }
     }
 
     // Footer copyright / signature
     let footer_y = grid_h - 32;
-    draw_text_bitmap(
+    draw_text_crisp(
         &mut sheet,
         (margin_x + 8) as i32,
         footer_y as i32,

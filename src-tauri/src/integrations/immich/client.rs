@@ -34,6 +34,10 @@ pub struct Asset {
     #[serde(default)]
     pub is_trashed: bool,
     #[serde(default)]
+    pub is_favorite: bool,
+    #[serde(default)]
+    pub rating: Option<i64>,
+    #[serde(default)]
     pub owner_id: String,
 }
 
@@ -210,6 +214,33 @@ impl ImmichClient {
             )
             .await?;
         Ok(asset.owner_id == self.me().await?.id)
+    }
+
+    pub async fn get_asset(&self, asset_id: &str) -> Result<Asset, String> {
+        self.json(
+            self.request(Method::GET, &format!("/assets/{asset_id}")),
+            "asset",
+        )
+        .await
+    }
+
+    pub async fn update_asset_favorite_rating(
+        &self,
+        asset_id: &str,
+        is_favorite: bool,
+        rating: Option<u8>,
+    ) -> Result<(), String> {
+        let mut body = json!({ "isFavorite": is_favorite });
+        if let Some(r) = rating {
+            body["rating"] = json!(r.min(5));
+        }
+        self.send(
+            self.request(Method::PUT, &format!("/assets/{asset_id}"))
+                .json(&body),
+            "updating favorite/rating",
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn albums(&self) -> Result<Vec<Album>, String> {

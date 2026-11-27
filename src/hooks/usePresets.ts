@@ -633,6 +633,23 @@ export function usePresets(currentAdjustments: Adjustments) {
     [setPresets],
   );
 
+  const importPresetsFromFolder = useCallback(
+    async (folderPath: string): Promise<PresetImportResult> => {
+      setIsLoading(true);
+      try {
+        const result: PresetImportResult = await invoke(Invokes.HandleImportPresetsFromFolder, { folderPath });
+        setPresets(result.presets);
+        return result;
+      } catch (error) {
+        console.error('Failed to import presets from folder:', error);
+        throw error;
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [setPresets],
+  );
+
   const exportPresetsToFile = useCallback(async (presetsToExport: Array<any>, filePath: string) => {
     try {
       await invoke(Invokes.HandleExportPresetsToFile, { presetsToExport, filePath });
@@ -651,6 +668,7 @@ export function usePresets(currentAdjustments: Adjustments) {
     exportPresetsToFile,
     importPresetsFromFile,
     importPresetsFromFiles,
+    importPresetsFromFolder,
     importLegacyPresetsFromFile,
     isLoading,
     movePreset,

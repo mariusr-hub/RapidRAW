@@ -90,6 +90,41 @@ fn read_sidecar(source: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(sidecar_of(source)).ok()?).ok()
 }
 
+pub fn extract_immich_favorite_and_rating(sidecar: &Value) -> (bool, Option<u8>) {
+    let is_fav = sidecar
+        .get("flag")
+        .and_then(Value::as_str)
+        .is_some_and(|f| f.eq_ignore_ascii_case("pick"));
+    let rating = sidecar
+        .get("rating")
+        .and_then(Value::as_u64)
+        .map(|r| (r as u8).min(5));
+    (is_fav, rating)
+}
+
+pub fn merge_immich_favorite_and_rating(
+    sidecar: &mut Value,
+    is_favorite: bool,
+    rating: Option<i64>,
+) -> bool {
+    let Some(map) = sidecar.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if is_favorite && map.get("flag").and_then(Value::as_str).is_none() {
+        map.insert("flag".to_string(), json!("pick"));
+        changed = true;
+    }
+    if let Some(r) = rating
+        && r > 0
+        && map.get("rating").and_then(Value::as_u64).unwrap_or(0) == 0
+    {
+        map.insert("rating".to_string(), json!(r.clamp(0, 5)));
+        changed = true;
+    }
+    changed
+}
+
 fn shared(mut value: Value) -> Value {
     if let Some(map) = value.as_object_mut() {
         map.remove("exif");
@@ -208,9 +243,12 @@ pub async fn pull(
     asset_id: &str,
     source: &Path,
 ) -> Result<(), String> {
-    let Some(remote) = client.metadata(asset_id, EDITS_KEY).await? else {
+    let Some(mut remote) = client.metadata(asset_id, EDITS_KEY).await? else {
         return Ok(());
     };
+    if let Ok(asset) = client.get_asset(asset_id).await {
+        merge_immich_favorite_and_rating(&mut remote.value, asset.is_favorite, asset.rating);
+    }
     if !apply_remote(app_handle, source, &remote)? {
         return Ok(());
     }
@@ -345,6 +383,10 @@ pub async fn push(
         }
         Err(e) => return Err(e),
     };
+    let (is_fav, rating) = extract_immich_favorite_and_rating(&local);
+    let _ = client
+        .update_asset_favorite_rating(asset_id, is_fav, rating)
+        .await;
     remember(source, modified, &local, Some(updated_at));
     Ok(true)
 }
@@ -409,4 +451,20 @@ pub fn start(app_handle: &AppHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_immich_bidirectional_favorite_and_rating_mapping() {
+        let sidecar = json!({ "flag": "pick", "rating": 4 });
+        assert_eq!(extract_immich_favorite_and_rating(&sidecar), (true, Some(4)));
+
+        let mut remote_sidecar = json!({});
+        assert!(merge_immich_favorite_and_rating(&mut remote_sidecar, true, Some(5)));
+        assert_eq!(remote_sidecar["flag"], json!("pick"));
+        assert_eq!(remote_sidecar["rating"], json!(5));
+    }
 }

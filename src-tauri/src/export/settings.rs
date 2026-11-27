@@ -248,7 +248,12 @@ pub enum WatermarkAnchor {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct WatermarkSettings {
+    #[serde(default)]
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<String>,
     pub anchor: WatermarkAnchor,
     pub scale: f32,
     pub spacing: f32,

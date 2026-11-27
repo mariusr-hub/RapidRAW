@@ -150,6 +150,283 @@ pub(crate) fn estimate_star_field_rigid_transform(
     (t.dx, t.dy, t.dtheta)
 }
 
+#[derive(Clone, Copy)]
+struct TriDesc {
+    r_mid: f32,
+    r_min: f32,
+    verts: [usize; 3], // ordered opposite to [d_min, d_mid, d_max]
+}
+
+fn build_triangle_descriptors(stars: &[StarPoint], max_stars: usize) -> (Vec<usize>, Vec<TriDesc>) {
+    let mut order: Vec<usize> = (0..stars.len()).collect();
+    order.sort_by(|&a, &b| stars[b].brightness.total_cmp(&stars[a].brightness));
+    order.truncate(max_stars);
+    let n = order.len();
+    let mut tris = Vec::new();
+    for i in 0..n {
+        let a = stars[order[i]];
+        for j in (i + 1)..n {
+            let b = stars[order[j]];
+            for k in (j + 1)..n {
+                let c = stars[order[k]];
+                let d_bc = (b.x - c.x).hypot(b.y - c.y); // opp i
+                let d_ac = (a.x - c.x).hypot(a.y - c.y); // opp j
+                let d_ab = (a.x - b.x).hypot(a.y - b.y); // opp k
+                let mut pairs = [(d_bc, i), (d_ac, j), (d_ab, k)];
+                pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
+                let d_min = pairs[0].0;
+                let d_mid = pairs[1].0;
+                let d_max = pairs[2].0;
+                if d_max < 20.0 || d_min < 8.0 {
+                    continue;
+                }
+                let area2 = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs();
+                if area2 < 0.06 * d_max * d_max {
+                    continue;
+                }
+                tris.push(TriDesc {
+                    r_mid: d_mid / d_max,
+                    r_min: d_min / d_max,
+                    verts: [pairs[0].1, pairs[1].1, pairs[2].1],
+                });
+            }
+        }
+    }
+    (order, tris)
+}
+
+/// Scale/rotation-invariant triangle-asterism matcher for wide-angle star fields.
+pub fn match_triangle_asterisms(
+    ref_stars: &[StarPoint],
+    target_stars: &[StarPoint],
+) -> Vec<([f32; 2], [f32; 2])> {
+    if ref_stars.len() < 4 || target_stars.len() < 4 {
+        return Vec::new();
+    }
+    let (ref_ord, ref_tris) = build_triangle_descriptors(ref_stars, 28);
+    let (tgt_ord, tgt_tris) = build_triangle_descriptors(target_stars, 28);
+    if ref_tris.is_empty() || tgt_tris.is_empty() {
+        return Vec::new();
+    }
+
+    let rn = ref_ord.len();
+    let tn = tgt_ord.len();
+    let mut votes = vec![0u32; rn * tn];
+    for tt in &tgt_tris {
+        let mut best_dist = 0.045f32 * 0.045f32;
+        let mut best_rt: Option<&TriDesc> = None;
+        for rt in &ref_tris {
+            let dm = tt.r_mid - rt.r_mid;
+            let dn = tt.r_min - rt.r_min;
+            let d2 = dm * dm + dn * dn;
+            if d2 < best_dist {
+                best_dist = d2;
+                best_rt = Some(rt);
+            }
+        }
+        if let Some(rt) = best_rt {
+            for slot in 0..3 {
+                votes[rt.verts[slot] * tn + tt.verts[slot]] += 1;
+            }
+        }
+    }
+
+    let mut scored: Vec<(u32, usize, usize)> = Vec::new();
+    for ri in 0..rn {
+        for ti in 0..tn {
+            let v = votes[ri * tn + ti];
+            if v >= 2 {
+                scored.push((v, ri, ti));
+            }
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut used_r = vec![false; rn];
+    let mut used_t = vec![false; tn];
+    let mut out = Vec::new();
+    for (_, ri, ti) in scored {
+        if !used_r[ri] && !used_t[ti] {
+            used_r[ri] = true;
+            used_t[ti] = true;
+            let rs = ref_stars[ref_ord[ri]];
+            let ts = target_stars[tgt_ord[ti]];
+            out.push(([rs.x, rs.y], [ts.x, ts.y]));
+            if out.len() >= 48 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn solve_normalized_dlt_homography(pairs: &[([f32; 2], [f32; 2])]) -> Option<[[f32; 3]; 3]> {
+    let n = pairs.len();
+    if n < 4 {
+        return None;
+    }
+    let norm_pts = |is_src: bool| -> (f64, f64, f64) {
+        let mut mx = 0.0f64;
+        let mut my = 0.0f64;
+        for (s, d) in pairs {
+            let p = if is_src { s } else { d };
+            mx += p[0] as f64;
+            my += p[1] as f64;
+        }
+        mx /= n as f64;
+        my /= n as f64;
+        let mut dist = 0.0f64;
+        for (s, d) in pairs {
+            let p = if is_src { s } else { d };
+            dist += ((p[0] as f64 - mx).hypot(p[1] as f64 - my)).max(1e-6);
+        }
+        let scale = (std::f64::consts::SQRT_2 * n as f64) / dist.max(1e-6);
+        (mx, my, scale)
+    };
+    let (smx, smy, ss) = norm_pts(true);
+    let (dmx, dmy, ds) = norm_pts(false);
+
+    let mut rows = Vec::with_capacity(n * 2 * 9);
+    for (s, d) in pairs {
+        let sx = (s[0] as f64 - smx) * ss;
+        let sy = (s[1] as f64 - smy) * ss;
+        let dx = (d[0] as f64 - dmx) * ds;
+        let dy = (d[1] as f64 - dmy) * ds;
+        rows.extend_from_slice(&[-sx, -sy, -1.0, 0.0, 0.0, 0.0, dx * sx, dx * sy, dx]);
+        rows.extend_from_slice(&[0.0, 0.0, 0.0, -sx, -sy, -1.0, dy * sx, dy * sy, dy]);
+    }
+    let mat = nalgebra::DMatrix::from_row_slice(n * 2, 9, &rows);
+    let ata = mat.transpose() * &mat;
+    let svd = ata.svd(false, true);
+    let v_t = svd.v_t?;
+    if v_t.nrows() < 9 {
+        return None;
+    }
+    let h_row = v_t.row(8);
+    let h_norm = nalgebra::Matrix3::new(
+        h_row[0], h_row[1], h_row[2],
+        h_row[3], h_row[4], h_row[5],
+        h_row[6], h_row[7], h_row[8],
+    );
+    let t_src = nalgebra::Matrix3::new(ss, 0.0, -ss * smx, 0.0, ss, -ss * smy, 0.0, 0.0, 1.0);
+    let t_dst_inv = nalgebra::Matrix3::new(
+        1.0 / ds, 0.0, dmx,
+        0.0, 1.0 / ds, dmy,
+        0.0, 0.0, 1.0,
+    );
+    let mut h = t_dst_inv * h_norm * t_src;
+    if h[(2, 2)].abs() < 1e-9 {
+        return None;
+    }
+    h /= h[(2, 2)];
+    if !h.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some([
+        [h[(0, 0)] as f32, h[(0, 1)] as f32, h[(0, 2)] as f32],
+        [h[(1, 0)] as f32, h[(1, 1)] as f32, h[(1, 2)] as f32],
+        [h[(2, 0)] as f32, h[(2, 1)] as f32, h[(2, 2)] as f32],
+    ])
+}
+
+/// Deterministic RANSAC 8-DOF homography fit mapping `(ref_x, ref_y) -> (target_x, target_y)`.
+pub fn estimate_homography_ransac(
+    correspondences: &[([f32; 2], [f32; 2])],
+    inlier_thresh_px: f32,
+) -> Option<[[f32; 3]; 3]> {
+    let n = correspondences.len();
+    if n < 6 {
+        return None;
+    }
+    let thresh2 = inlier_thresh_px * inlier_thresh_px;
+    let mut best_inliers: Vec<usize> = Vec::new();
+
+    for trial in 0..240usize {
+        let i0 = trial % n;
+        let i1 = (trial * 7 + 1) % n;
+        let i2 = (trial * 13 + 3) % n;
+        let i3 = (trial * 29 + 5) % n;
+        if i0 == i1 || i0 == i2 || i0 == i3 || i1 == i2 || i1 == i3 || i2 == i3 {
+            continue;
+        }
+        let sample = [
+            correspondences[i0],
+            correspondences[i1],
+            correspondences[i2],
+            correspondences[i3],
+        ];
+        let Some(h) = solve_normalized_dlt_homography(&sample) else {
+            continue;
+        };
+        let mut inliers = Vec::new();
+        for (idx, &(s, d)) in correspondences.iter().enumerate() {
+            let denom = h[2][0] * s[0] + h[2][1] * s[1] + h[2][2];
+            if denom.abs() < 1e-4 {
+                continue;
+            }
+            let px = (h[0][0] * s[0] + h[0][1] * s[1] + h[0][2]) / denom;
+            let py = (h[1][0] * s[0] + h[1][1] * s[1] + h[1][2]) / denom;
+            let err2 = (px - d[0]).powi(2) + (py - d[1]).powi(2);
+            if err2 <= thresh2 {
+                inliers.push(idx);
+            }
+        }
+        if inliers.len() > best_inliers.len() {
+            best_inliers = inliers;
+        }
+    }
+
+    if best_inliers.len() < 6 {
+        return None;
+    }
+    let refined_pairs: Vec<_> = best_inliers.iter().map(|&i| correspondences[i]).collect();
+    solve_normalized_dlt_homography(&refined_pairs)
+}
+
+pub fn warp_rgb32f_homography(
+    target_img: &Rgb32FImage,
+    h_ref_to_tgt: &[[f32; 3]; 3],
+    out_w: u32,
+    out_h: u32,
+) -> Rgb32FImage {
+    let (tw, th) = target_img.dimensions();
+    let src = target_img.as_raw();
+    let tw_usize = tw as usize;
+    let th_usize = th as usize;
+    let mut out = vec![0.0f32; (out_w * out_h * 3) as usize];
+    let stride = (out_w * 3) as usize;
+    out.par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
+        let yf = y as f32;
+        for x in 0..out_w as usize {
+            let xf = x as f32;
+            let w = h_ref_to_tgt[2][0] * xf + h_ref_to_tgt[2][1] * yf + h_ref_to_tgt[2][2];
+            if w.abs() < 1e-5 {
+                continue;
+            }
+            let sx = (h_ref_to_tgt[0][0] * xf + h_ref_to_tgt[0][1] * yf + h_ref_to_tgt[0][2]) / w;
+            let sy = (h_ref_to_tgt[1][0] * xf + h_ref_to_tgt[1][1] * yf + h_ref_to_tgt[1][2]) / w;
+            if sx < 0.0 || sy < 0.0 || sx >= (tw_usize.saturating_sub(1)) as f32 || sy >= (th_usize.saturating_sub(1)) as f32 {
+                continue;
+            }
+            let x0 = sx.floor() as usize;
+            let y0 = sy.floor() as usize;
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+            let i00 = (y0 * tw_usize + x0) * 3;
+            let i10 = (y0 * tw_usize + (x0 + 1)) * 3;
+            let i01 = ((y0 + 1) * tw_usize + x0) * 3;
+            let i11 = ((y0 + 1) * tw_usize + (x0 + 1)) * 3;
+            let dst = x * 3;
+            for c in 0..3 {
+                let top = src[i00 + c] * (1.0 - fx) + src[i10 + c] * fx;
+                let bot = src[i01 + c] * (1.0 - fx) + src[i11 + c] * fx;
+                row[dst + c] = top * (1.0 - fy) + bot * fy;
+            }
+        }
+    });
+    ImageBuffer::from_raw(out_w, out_h, out).unwrap_or_else(|| target_img.clone())
+}
+
 /// Detects star centroids in a frame using adaptive scene noise-floor statistics (mu + 3*sigma)
 fn detect_star_centroids(img: &Rgb32FImage) -> Vec<StarPoint> {
     let (width, height) = img.dimensions();
@@ -1533,20 +1810,27 @@ pub fn process_astro_stack(
         let q = calculate_subframe_quality(&loaded_raw_frames[i], &target_stars);
         frame_weights.push(q);
 
-        let transform = calculate_rigid_alignment(
-            &ref_stars,
-            &target_stars,
-            width as f32,
-            height as f32,
-            (width as f32 * 0.15).max(80.0),
-        );
-
-        if transform.dx.abs() > 0.05 || transform.dy.abs() > 0.05 || transform.dtheta.abs() > 0.0001 {
-            let k1 = estimate_radial_distortion(&ref_stars, &target_stars, transform, width as f32, height as f32);
-            let shifted = warp_rigid_radial(&loaded_raw_frames[i], transform, k1, width, height);
-            aligned_sky_frames.push(shifted);
+        // Prefer 8-DOF triangle-asterism RANSAC homography for wide-angle lens fields; fall back cleanly to rigid+k1.
+        let pairs = match_triangle_asterisms(&ref_stars, &target_stars);
+        if let Some(h_mat) = estimate_homography_ransac(&pairs, 2.5) {
+            let warped = warp_rgb32f_homography(&loaded_raw_frames[i], &h_mat, width, height);
+            aligned_sky_frames.push(warped);
         } else {
-            aligned_sky_frames.push(loaded_raw_frames[i].clone());
+            let transform = calculate_rigid_alignment(
+                &ref_stars,
+                &target_stars,
+                width as f32,
+                height as f32,
+                (width as f32 * 0.15).max(80.0),
+            );
+
+            if transform.dx.abs() > 0.05 || transform.dy.abs() > 0.05 || transform.dtheta.abs() > 0.0001 {
+                let k1 = estimate_radial_distortion(&ref_stars, &target_stars, transform, width as f32, height as f32);
+                let shifted = warp_rigid_radial(&loaded_raw_frames[i], transform, k1, width, height);
+                aligned_sky_frames.push(shifted);
+            } else {
+                aligned_sky_frames.push(loaded_raw_frames[i].clone());
+            }
         }
     }
 
@@ -3024,6 +3308,68 @@ mod tests {
             nebula_before,
             nebula_after
         );
+    }
+
+    #[test]
+    fn test_triangle_asterism_ransac_homography_recovers_wide_angle_projection() {
+        let ref_stars = vec![
+            StarPoint { x: 100.0, y: 120.0, brightness: 0.9 },
+            StarPoint { x: 420.0, y: 110.0, brightness: 0.85 },
+            StarPoint { x: 480.0, y: 390.0, brightness: 0.8 },
+            StarPoint { x: 130.0, y: 410.0, brightness: 0.78 },
+            StarPoint { x: 260.0, y: 240.0, brightness: 0.75 },
+            StarPoint { x: 320.0, y: 320.0, brightness: 0.7 },
+            StarPoint { x: 190.0, y: 180.0, brightness: 0.65 },
+            StarPoint { x: 370.0, y: 210.0, brightness: 0.6 },
+        ];
+        // Apply genuine 8-DOF projective transform (shift + slight rotation + keystone perspective)
+        let proj = |x: f32, y: f32| -> [f32; 2] {
+            let w = 1.0 + 0.00025 * x - 0.00015 * y;
+            [
+                (x * 0.996 - y * 0.087 + 22.0) / w,
+                (x * 0.087 + y * 0.996 - 14.0) / w,
+            ]
+        };
+        let target_stars: Vec<StarPoint> = ref_stars
+            .iter()
+            .map(|s| {
+                let p = proj(s.x, s.y);
+                StarPoint { x: p[0], y: p[1], brightness: s.brightness }
+            })
+            .collect();
+
+        let matched = match_triangle_asterisms(&ref_stars, &target_stars);
+        assert!(matched.len() >= 6, "Expected >= 6 asterism matches, got {}", matched.len());
+        let h = estimate_homography_ransac(&matched, 2.0).expect("RANSAC homography should converge");
+        for s in &ref_stars {
+            let expected = proj(s.x, s.y);
+            let w = h[2][0] * s.x + h[2][1] * s.y + h[2][2];
+            let px = (h[0][0] * s.x + h[0][1] * s.y + h[0][2]) / w;
+            let py = (h[1][0] * s.x + h[1][1] * s.y + h[1][2]) / w;
+            assert!((px - expected[0]).hypot(py - expected[1]) < 1.5);
+        }
+    }
+
+    #[test]
+    fn test_subframe_quality_weight_prefers_low_fwhm_and_low_noise() {
+        let mut sharp_clean = Rgb32FImage::from_pixel(192, 192, image::Rgb([0.004, 0.004, 0.004]));
+        let mut soft_noisy = Rgb32FImage::from_pixel(192, 192, image::Rgb([0.004, 0.004, 0.004]));
+        for y in 0..192 {
+            for x in 0..192 {
+                if (x + y) % 2 == 0 {
+                    soft_noisy.put_pixel(x, y, image::Rgb([0.020, 0.020, 0.020]));
+                }
+            }
+        }
+        let mut stars = Vec::new();
+        for &(sx, sy) in &[(40u32, 40u32), (100, 40), (40, 120), (140, 140), (96, 96)] {
+            stars.push(StarPoint { x: sx as f32, y: sy as f32, brightness: 0.9 });
+            sharp_clean.put_pixel(sx, sy, image::Rgb([0.9, 0.9, 0.9]));
+            sharp_clean.put_pixel(sx + 2, sy, image::Rgb([0.05, 0.05, 0.05]));
+            soft_noisy.put_pixel(sx, sy, image::Rgb([0.9, 0.9, 0.9]));
+            soft_noisy.put_pixel(sx + 2, sy, image::Rgb([0.75, 0.75, 0.75]));
+        }
+        assert!(calculate_subframe_quality(&sharp_clean, &stars) > calculate_subframe_quality(&soft_noisy, &stars));
     }
 }
 

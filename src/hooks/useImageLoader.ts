@@ -63,8 +63,22 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
           if (!isEffectActive) return;
 
           const initialAdjusts = adjustmentsFromMetadata(metadata.adjustments);
+          const loadedSnapshots = Array.isArray(metadata?.snapshots)
+            ? metadata.snapshots.map((s: any) => ({
+                id: String(s?.id ?? crypto.randomUUID()),
+                name: String(s?.name ?? 'Snapshot'),
+                adjustments: adjustmentsFromMetadata(s?.adjustments),
+                previewUrl: null,
+                timestamp: Number(s?.timestamp ?? Date.now()),
+              }))
+            : [];
 
-          setEditor({ adjustments: initialAdjusts });
+          setEditor({
+            adjustments: initialAdjusts,
+            snapshots: loadedSnapshots,
+            activeSnapshotId: null,
+            compareViewport: { zoom: 1, panX: 0, panY: 0 },
+          });
           resetHistory(initialAdjusts, selectedImage.path);
         } catch (err) {
           console.error('Failed to load metadata early:', err);

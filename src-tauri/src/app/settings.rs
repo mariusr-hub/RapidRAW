@@ -601,6 +601,20 @@ pub struct AdjustmentLayout {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct SavedWorkspacePreset {
+    pub id: String,
+    pub name: String,
+    pub workspace: WorkspaceState,
+    #[serde(default)]
+    pub hide_collapsed_panels: bool,
+    #[serde(default)]
+    pub active_tools_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_panel_height: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceState {
     pub left_panel_width: u32,
     pub right_panel_width: u32,
@@ -924,6 +938,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub workspace: WorkspaceState,
     #[serde(default)]
+    pub saved_workspace_presets: Vec<SavedWorkspacePreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace_preset: Option<String>,
+    #[serde(default)]
     pub immich: crate::integrations::immich::ImmichSettings,
     #[serde(default)]
     pub develop_defaults: crate::adjustments::develop_defaults::DevelopDefaultsSettings,
@@ -1133,6 +1151,8 @@ impl Default for AppSettings {
             edit_in_apps: Vec::new(),
             adjustment_layout: AdjustmentLayout::default(),
             workspace: WorkspaceState::default(),
+            saved_workspace_presets: Vec::new(),
+            active_workspace_preset: None,
             immich: crate::integrations::immich::ImmichSettings::default(),
             develop_defaults: Default::default(),
             slider_reset_target: None,

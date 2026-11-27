@@ -808,3 +808,30 @@ pub fn create_virtual_copy(
 
     Ok(new_virtual_path)
 }
+
+#[tauri::command]
+pub async fn save_image_snapshots(path: String, snapshots: Vec<Value>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let (source_path, sidecar_path) = parse_virtual_path(&path);
+        let cleaned: Vec<Value> = snapshots
+            .into_iter()
+            .map(|mut item| {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("previewUrl");
+                }
+                item
+            })
+            .collect();
+        crate::metadata::sidecar::update_sidecar(&sidecar_path, &source_path, |metadata| {
+            metadata.snapshots = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            };
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Failed to save snapshots: {}", e))?
+}

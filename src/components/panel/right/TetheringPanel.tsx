@@ -209,6 +209,7 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
   const [ghostBlobUrl, setGhostBlobUrl] = useState<string | null>(null);
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
   const [isFocusing, setIsFocusing] = useState(false);
+  const [autoApplyMode, setAutoApplyMode] = useState<'none' | 'copy_previous' | 'saved_preset'>('none');
   const [autoApplyPreset, setAutoApplyPreset] = useState<Preset | null>(null);
 
   const presetSelectBtnRef = useRef<HTMLButtonElement>(null);
@@ -417,13 +418,33 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
     try {
       const filePath: string = await invoke(Invokes.TetherCapture, { destinationFolder: currentFolderPath });
 
+      const previousShotPath = lastCapturedPath;
       setTethering({ lastCapturedPath: filePath });
 
-      if (autoApplyPreset) {
+      let adjustmentsToApply: any = null;
+      if (autoApplyMode === 'saved_preset' && autoApplyPreset) {
+        adjustmentsToApply = autoApplyPreset.adjustments;
+      } else if (autoApplyMode === 'copy_previous') {
+        if (previousShotPath) {
+          try {
+            const prevMeta: any = await invoke(Invokes.LoadMetadata, { path: previousShotPath });
+            if (prevMeta?.adjustments) {
+              adjustmentsToApply = prevMeta.adjustments;
+            }
+          } catch (err) {
+            console.warn('Failed to load previous shot adjustments:', err);
+          }
+        }
+        if (!adjustmentsToApply) {
+          adjustmentsToApply = useEditorStore.getState().adjustments;
+        }
+      }
+
+      if (adjustmentsToApply) {
         try {
           await invoke(Invokes.ApplyAdjustmentsToPaths, {
             paths: [filePath],
-            adjustments: autoApplyPreset.adjustments,
+            adjustments: adjustmentsToApply,
           });
         } catch {
           toast.error(t('tethering.toasts.presetApplyFailed'));
@@ -869,27 +890,56 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
                 {t('tethering.generalSettings')}
               </Text>
 
-              <div className="flex flex-col gap-1 bg-surface p-2.5 rounded-lg border border-surface">
+              <div className="flex flex-col gap-1.5 bg-surface p-2.5 rounded-lg border border-surface">
                 <div className="flex justify-between items-center">
                   <Text variant={TextVariants.label} className="select-none">
                     {t('tethering.autoApplyPreset')}
                   </Text>
-                  <button
-                    ref={presetSelectBtnRef}
-                    onClick={handleOpenPresetMenu}
-                    className="text-xs text-text-primary hover:text-accent font-medium transition-colors cursor-pointer"
-                  >
-                    {autoApplyPreset ? t('tethering.changePreset') : t('editor.masks.settings.select')}
-                  </button>
+                  {autoApplyMode === 'saved_preset' && (
+                    <button
+                      ref={presetSelectBtnRef}
+                      onClick={handleOpenPresetMenu}
+                      className="text-xs text-text-primary hover:text-accent font-medium transition-colors cursor-pointer"
+                    >
+                      {autoApplyPreset ? t('tethering.changePreset') : t('editor.masks.settings.select')}
+                    </button>
+                  )}
                 </div>
 
-                {autoApplyPreset && (
+                <div className="grid grid-cols-3 gap-1 bg-bg-primary p-1 rounded-md">
+                  {(
+                    [
+                      { id: 'none', label: 'None' },
+                      { id: 'copy_previous', label: 'Copy Prev' },
+                      { id: 'saved_preset', label: 'Preset' },
+                    ] as const
+                  ).map((mode) => (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      onClick={() => setAutoApplyMode(mode.id)}
+                      className={clsx(
+                        'px-1.5 py-1 rounded text-[11px] font-medium transition-colors',
+                        autoApplyMode === mode.id
+                          ? 'bg-accent text-button-text'
+                          : 'text-text-secondary hover:text-text-primary',
+                      )}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+
+                {autoApplyMode === 'saved_preset' && autoApplyPreset && (
                   <div className="flex items-center justify-between bg-bg-primary px-2.5 py-1.5 rounded-md border border-surface mt-1">
                     <Text variant={TextVariants.small} color={TextColors.primary} className="truncate font-medium">
                       {autoApplyPreset.name}
                     </Text>
                     <button
-                      onClick={() => setAutoApplyPreset(null)}
+                      onClick={() => {
+                        setAutoApplyPreset(null);
+                        setAutoApplyMode('none');
+                      }}
                       className="p-1 hover:text-red-500 text-text-secondary transition-colors"
                       data-tooltip={t('tethering.clearPreset')}
                     >

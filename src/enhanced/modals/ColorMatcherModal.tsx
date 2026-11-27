@@ -23,6 +23,8 @@ import Switch from '../../components/ui/Switch';
 import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { useEditorStore } from '../../store/useEditorStore';
 import { useLibraryStore } from '../../store/useLibraryStore';
+import { useEditorActions } from '../../hooks/useEditorActions';
+import { Invokes } from '../../types/invokes';
 import { save } from '@tauri-apps/plugin-dialog';
 
 interface ColorMatcherModalProps {
@@ -54,6 +56,7 @@ export const ColorMatcherModal: React.FC<ColorMatcherModalProps> = ({
   const [lutSize, setLutSize] = useState<number>(33);
   const [protectSkin, setProtectSkin] = useState<boolean>(true);
   const [isExportingLut, setIsExportingLut] = useState<boolean>(false);
+  const [isGeneratingSot, setIsGeneratingSot] = useState<boolean>(false);
   const [exportSuccessMsg, setExportSuccessMsg] = useState<string | null>(null);
 
   // Harmonizer state
@@ -64,7 +67,9 @@ export const ColorMatcherModal: React.FC<ColorMatcherModalProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const selectedImage = useEditorStore((state) => state.selectedImage);
+  const adjustments = useEditorStore((state) => state.adjustments);
   const setEditor = useEditorStore((state) => state.setEditor);
+  const { setAdjustments } = useEditorActions();
   const multiSelectedPaths = useLibraryStore((state) => state.multiSelectedPaths);
 
   useEffect(() => {
@@ -159,13 +164,36 @@ export const ColorMatcherModal: React.FC<ColorMatcherModalProps> = ({
 
   const handleApplyToActiveImage = () => {
     if (matchResult && matchResult.adjustments) {
-      setEditor((state) => ({
-        adjustments: {
-          ...state.adjustments,
-          ...matchResult.adjustments,
-        },
-      }));
+      setAdjustments({ ...adjustments, ...matchResult.adjustments }, 'Apply Color Match');
       onClose();
+    }
+  };
+
+  const handleApplySotLut = async () => {
+    if (!referenceBase64) return;
+    setIsGeneratingSot(true);
+    try {
+      const lutPath = await invoke<string>(Invokes.GenerateSotColorMatchLut, {
+        referenceBase64,
+        referencePath: null,
+        targetPath: selectedImage?.path ?? null,
+        skinProtect: protectSkin ? 0.75 : 0.0,
+      });
+      setAdjustments(
+        {
+          ...adjustments,
+          lutPath,
+          lutEnabled: true,
+          lutIntensity: Math.min(100, intensity),
+        },
+        'Apply 3D SOT LUT',
+      );
+      setExportSuccessMsg('Applied 33³ Sliced Optimal Transport 3D LUT!');
+      onClose();
+    } catch (err) {
+      console.error('Failed to generate 3D SOT LUT:', err);
+    } finally {
+      setIsGeneratingSot(false);
     }
   };
 
@@ -557,6 +585,21 @@ export const ColorMatcherModal: React.FC<ColorMatcherModalProps> = ({
                 >
                   Cancel
                 </button>
+
+                {referenceBase64 && (
+                  <Button
+                    onClick={handleApplySotLut}
+                    disabled={isGeneratingSot || isAnalyzing || !selectedImage}
+                    className="!bg-surface hover:!bg-surface-secondary border border-border-color text-text-primary text-xs"
+                  >
+                    {isGeneratingSot ? (
+                      <Loader2 size={14} className="mr-1.5 animate-spin text-accent" />
+                    ) : (
+                      <Film size={14} className="mr-1.5 text-accent" />
+                    )}
+                    Apply 3D SOT LUT (33³)
+                  </Button>
+                )}
 
                 <Button
                   onClick={handleApplyToActiveImage}

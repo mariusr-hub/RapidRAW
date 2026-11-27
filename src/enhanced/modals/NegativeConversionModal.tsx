@@ -2,7 +2,7 @@
 import { useTranslation, Trans } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { RotateCcw, ZoomIn, ZoomOut, Maximize, Save, Loader2, Eye, EyeOff, Info } from 'lucide-react';
+import { Lock, RotateCcw, Unlock, ZoomIn, ZoomOut, Maximize, Save, Loader2, Eye, EyeOff, Info } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import Button from '../../components/ui/Button';
 import Slider from '../../components/ui/Slider';
@@ -28,6 +28,9 @@ interface NegativeParams {
   shadow_crossover?: number;
   highlight_crossover?: number;
   auto_crop_borders?: boolean;
+  scanner_profile?: string;
+  roll_locked?: boolean;
+  shadow_neutralize?: number;
 }
 
 const DEFAULT_PARAMS: NegativeParams = {
@@ -45,7 +48,12 @@ const DEFAULT_PARAMS: NegativeParams = {
   shadow_crossover: 0.0,
   highlight_crossover: 0.0,
   auto_crop_borders: false,
+  scanner_profile: 'neutral_flat',
+  roll_locked: false,
+  shadow_neutralize: 0.25,
 };
+
+let lockedRollCalibration: Partial<NegativeParams> | null = null;
 
 interface NegativeConversionModalProps {
   isOpen: boolean;
@@ -61,7 +69,9 @@ export default function NegativeConversionModal({
   onSave,
 }: NegativeConversionModalProps) {
   const { t } = useTranslation();
-  const [params, setParams] = useState<NegativeParams>(DEFAULT_PARAMS);
+  const [params, setParams] = useState<NegativeParams>(() =>
+    lockedRollCalibration ? { ...DEFAULT_PARAMS, ...lockedRollCalibration, roll_locked: true } : DEFAULT_PARAMS,
+  );
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
@@ -510,6 +520,73 @@ export default function NegativeConversionModal({
             />
             <span>Auto-Crop Scanner Border (Prevents White-Edge Blowout)</span>
           </label>
+
+          {/* Roll Calibration Lock & Scanner Tone Profiles */}
+          <div className="mt-3 p-2.5 bg-surface rounded-lg border border-border-color space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-text-primary">Roll Film Base Lock</span>
+              <button
+                type="button"
+                onClick={() => {
+                  const nextLocked = !(params.roll_locked ?? false);
+                  if (nextLocked) {
+                    lockedRollCalibration = {
+                      base_mask_r: params.base_mask_r,
+                      base_mask_g: params.base_mask_g,
+                      base_mask_b: params.base_mask_b,
+                      red_weight: params.red_weight,
+                      green_weight: params.green_weight,
+                      blue_weight: params.blue_weight,
+                      film_profile: params.film_profile,
+                      scanner_profile: params.scanner_profile,
+                    };
+                  } else {
+                    lockedRollCalibration = null;
+                  }
+                  const nextParams = { ...params, roll_locked: nextLocked };
+                  setParams(nextParams);
+                  updatePreview(nextParams);
+                }}
+                className={clsx(
+                  'flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium border cursor-pointer transition-colors',
+                  params.roll_locked
+                    ? 'bg-amber-500/20 border-amber-500/60 text-amber-300'
+                    : 'bg-bg-primary border-border-color text-text-secondary hover:text-text-primary',
+                )}
+              >
+                {params.roll_locked ? <Lock size={12} /> : <Unlock size={12} />}
+                <span>{params.roll_locked ? 'Film Base Locked' : 'Lock Film Base for Roll'}</span>
+              </button>
+            </div>
+            <div>
+              <div className="text-[11px] font-medium text-text-secondary mb-1">Scanner Tone Profile</div>
+              <div className="grid grid-cols-3 gap-1 bg-bg-primary p-1 rounded-md border border-border-color/50">
+                {[
+                  { id: 'neutral_flat', label: 'Neutral Flat' },
+                  { id: 'frontier_sp3000', label: 'Frontier SP-3000' },
+                  { id: 'noritsu_hs1800', label: 'Noritsu HS-1800' },
+                ].map((prof) => (
+                  <button
+                    key={prof.id}
+                    type="button"
+                    onClick={() => {
+                      const nextParams = { ...params, scanner_profile: prof.id };
+                      setParams(nextParams);
+                      updatePreview(nextParams);
+                    }}
+                    className={clsx(
+                      'px-1.5 py-1 rounded text-[11px] font-medium cursor-pointer transition-colors truncate',
+                      (params.scanner_profile || 'neutral_flat') === prof.id
+                        ? 'bg-accent text-button-text shadow-xs'
+                        : 'text-text-secondary hover:text-text-primary',
+                    )}
+                  >
+                    {prof.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Color Timing Weights */}
@@ -606,6 +683,16 @@ export default function NegativeConversionModal({
               step={0.02}
               defaultValue={0}
               onChange={(e) => handleParamChange('shadow_crossover', Number(e.target.value))}
+            />
+            <Slider
+              label="Shadow Crossover Neutralizer"
+              value={params.shadow_neutralize ?? 0.25}
+              min={0}
+              max={1}
+              step={0.02}
+              defaultValue={0.25}
+              onChange={(e) => handleParamChange('shadow_neutralize', Number(e.target.value))}
+              fillOrigin="min"
             />
             <Slider
               label="Highlight Color Crossover"

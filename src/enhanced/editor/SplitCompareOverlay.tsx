@@ -19,11 +19,13 @@ export const SplitCompareOverlay: React.FC<SplitCompareOverlayProps> = ({
   offsetX,
   offsetY,
   originalSrc,
-  adjustedSrc,
+  adjustedSrc: _adjustedSrc,
   isMaxZoom = false,
 }) => {
   const compareMode = useEditorStore((state) => state.compareMode);
   const splitPosition = useEditorStore((state) => state.splitPosition);
+  const compareViewport = useEditorStore((state) => state.compareViewport);
+  const setCompareViewport = useEditorStore((state) => state.setCompareViewport);
   const setEditor = useEditorStore((state) => state.setEditor);
 
   const [isDragging, setIsDragging] = useState(false);
@@ -105,6 +107,15 @@ export const SplitCompareOverlay: React.FC<SplitCompareOverlayProps> = ({
       ? `polygon(0 0, ${splitPercent}% 0, ${splitPercent}% 100%, 0 100%)`
       : `polygon(0 0, 100% 0, 100% ${splitPercent}%, 0 ${splitPercent}%)`;
 
+  const handleWheelZoom = (e: React.WheelEvent) => {
+    if (!e.ctrlKey && Math.abs(e.deltaY) < 1) return;
+    const zoomDelta = e.deltaY < 0 ? 0.25 : -0.25;
+    const nextZoom = Math.max(1, Math.min(8, Number((compareViewport.zoom + zoomDelta).toFixed(2))));
+    setCompareViewport(
+      nextZoom === 1 ? { zoom: 1, panX: 0, panY: 0 } : { zoom: nextZoom },
+    );
+  };
+
   return (
     <div
       ref={containerRef}
@@ -118,6 +129,8 @@ export const SplitCompareOverlay: React.FC<SplitCompareOverlayProps> = ({
       }}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
+      onWheel={handleWheelZoom}
+      onDoubleClick={() => setCompareViewport({ zoom: 1, panX: 0, panY: 0 })}
     >
       {/* Original Image Layer with Clip Path */}
       {originalSrc && (
@@ -128,6 +141,10 @@ export const SplitCompareOverlay: React.FC<SplitCompareOverlayProps> = ({
           style={{
             clipPath: originalClipPath,
             imageRendering: isMaxZoom ? 'pixelated' : 'auto',
+            transform:
+              compareViewport.zoom > 1
+                ? `scale(${compareViewport.zoom}) translate(${compareViewport.panX / compareViewport.zoom}px, ${compareViewport.panY / compareViewport.zoom}px)`
+                : undefined,
           }}
         />
       )}

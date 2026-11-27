@@ -26,6 +26,7 @@ pub struct HeadlessExportSession {
     pub hdr_headroom: f32,
     pub keep_metadata: bool,
     pub adjustments_override: Option<String>,
+    pub preset: Option<String>,
     pub export_original: Option<OriginalExportOptions>,
     pub on_conflict: Option<ConflictAction>,
 }
@@ -77,6 +78,7 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
         let mut hdr_headroom = crate::render::hdr::Headroom::DEFAULT_STOPS;
         let mut keep_metadata = false;
         let mut adjustments_override = None;
+        let mut preset = None;
         let mut export_original = false;
         let mut original_crop = true;
         let mut original_keep_exposure = false;
@@ -177,6 +179,11 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
                         adjustments_override = Some(adj.clone());
                     }
                 }
+                "--preset" => {
+                    if let Some(p) = iter.next() {
+                        preset = Some(p.clone());
+                    }
+                }
                 "--on-conflict" => {
                     const EXPECTED: &str = "keep-both, overwrite, overwrite-if-changed or skip";
                     let Some(value) = iter.next() else {
@@ -215,6 +222,7 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
             hdr_headroom,
             keep_metadata,
             adjustments_override,
+            preset,
             export_original: export_original.then_some(OriginalExportOptions {
                 crop: original_crop,
                 keep_exposure: original_keep_exposure,
@@ -317,5 +325,126 @@ pub fn emit_launch_request(app_handle: &tauri::AppHandle, request: LaunchRequest
             log::error!("Invalid headless export request: {}", error);
         }
         LaunchRequest::None => {}
+    }
+}
+
+fn glob_match_ci(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+        for j in 1..=t.len() {
+            dp[i][j] = match p[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && c == t[j - 1],
+            };
+        }
+    }
+    dp[p.len()][t.len()]
+}
+
+/// Resolves a CLI export source specification (single file, directory, or wildcard glob like `photos/*.NEF`).
+pub fn resolve_headless_sources(raw_source: &str) -> Vec<PathBuf> {
+    let trimmed = raw_source.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.contains('*') || trimmed.contains('?') {
+        let path = Path::new(trimmed);
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let pattern = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("*");
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+            let p = entry.path();
+            if !p.is_file() || !crate::decode::formats::is_supported_image_file(p) {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && glob_match_ci(pattern, name)
+            {
+                out.push(p.to_path_buf());
+            }
+        }
+        out.sort();
+        return out;
+    }
+
+    let p = Path::new(trimmed);
+    if p.is_dir() {
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(p).into_iter().filter_map(Result::ok) {
+            let fp = entry.path();
+            if fp.is_file() && crate::decode::formats::is_supported_image_file(fp) {
+                out.push(fp.to_path_buf());
+            }
+        }
+        out.sort();
+        return out;
+    }
+
+    if p.exists() {
+        vec![p.to_path_buf()]
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_launch_args_extracts_preset_flag() {
+        let args: Vec<String> = [
+            "export",
+            "shots/*.ARW",
+            "--output",
+            "out",
+            "--preset",
+            "Portra 400",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        match parse_launch_args(&args) {
+            LaunchRequest::HeadlessExport(s) => {
+                assert_eq!(s.source, "shots/*.ARW");
+                assert_eq!(s.output, "out");
+                assert_eq!(s.preset.as_deref(), Some("Portra 400"));
+            }
+            other => panic!("Expected HeadlessExport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_headless_sources_handles_dir_and_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let jpg = dir.path().join("a.jpg");
+        let nef = nested.join("b.NEF");
+        let txt = nested.join("notes.txt");
+        std::fs::write(&jpg, b"x").unwrap();
+        std::fs::write(&nef, b"y").unwrap();
+        std::fs::write(&txt, b"z").unwrap();
+
+        let dir_found = resolve_headless_sources(&dir.path().to_string_lossy());
+        assert_eq!(dir_found.len(), 2);
+
+        let glob_pattern = dir.path().join("*.nef").to_string_lossy().to_string();
+        let glob_found = resolve_headless_sources(&glob_pattern);
+        assert_eq!(glob_found.len(), 1);
+        assert!(glob_found[0].ends_with("b.NEF"));
     }
 }

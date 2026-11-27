@@ -42,6 +42,7 @@ export function useExportSettings() {
   const [filenameTemplate, setFilenameTemplate] = useState('{original_filename}_edited');
   const [enableWatermark, setEnableWatermark] = useState(false);
   const [watermarkPath, setWatermarkPath] = useState<string | null>(null);
+  const [watermarkText, setWatermarkText] = useState<string>('');
   const [watermarkAnchor, setWatermarkAnchor] = useState<WatermarkAnchor>(WatermarkAnchor.BottomRight);
   const [watermarkScale, setWatermarkScale] = useState(10);
   const [watermarkSpacing, setWatermarkSpacing] = useState(5);
@@ -82,6 +83,7 @@ export function useExportSettings() {
     setFilenameTemplate(preset.filenameTemplate);
     setEnableWatermark(preset.enableWatermark);
     setWatermarkPath(preset.watermarkPath);
+    setWatermarkText(preset.watermarkText ?? '');
     setWatermarkAnchor(preset.watermarkAnchor as WatermarkAnchor);
     setWatermarkScale(preset.watermarkScale);
     setWatermarkSpacing(preset.watermarkSpacing);
@@ -124,6 +126,7 @@ export function useExportSettings() {
       filenameTemplate,
       enableWatermark,
       watermarkPath,
+      watermarkText,
       watermarkAnchor,
       watermarkScale,
       watermarkSpacing,
@@ -164,6 +167,7 @@ export function useExportSettings() {
       filenameTemplate,
       enableWatermark,
       watermarkPath,
+      watermarkText,
       watermarkAnchor,
       watermarkScale,
       watermarkSpacing,
@@ -237,6 +241,8 @@ export function useExportSettings() {
     setEnableWatermark,
     watermarkPath,
     setWatermarkPath,
+    watermarkText,
+    setWatermarkText,
     watermarkAnchor,
     setWatermarkAnchor,
     watermarkScale,

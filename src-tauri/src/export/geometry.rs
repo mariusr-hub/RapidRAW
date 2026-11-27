@@ -697,10 +697,24 @@ pub fn apply_export_geometry_and_watermark(
     export_settings: &ExportSettings,
     color_space: OutputColorSpace,
 ) -> Result<(DynamicImage, ExportGeometry), String> {
+    apply_export_geometry_and_watermark_with_exif(image, export_settings, color_space, None)
+}
+
+pub fn apply_export_geometry_and_watermark_with_exif(
+    image: DynamicImage,
+    export_settings: &ExportSettings,
+    color_space: OutputColorSpace,
+    exif: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(DynamicImage, ExportGeometry), String> {
     let (mut image, geometry) = apply_export_geometry(image, export_settings, color_space)?;
 
     if let Some(watermark_settings) = &export_settings.watermark {
-        apply_watermark(&mut image, watermark_settings, color_space)?;
+        crate::export::watermark::apply_watermark_with_exif(
+            &mut image,
+            watermark_settings,
+            color_space,
+            exif,
+        )?;
     }
     Ok((image, geometry))
 }

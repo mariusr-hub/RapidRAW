@@ -102,27 +102,105 @@ pub fn apply_watermark(
     watermark_settings: &WatermarkSettings,
     color_space: OutputColorSpace,
 ) -> Result<(), String> {
-    let watermark_img = load_watermark_image(&watermark_settings.path)?;
+    apply_watermark_with_exif(base_image, watermark_settings, color_space, None)
+}
 
+fn parse_hex_rgb(hex: Option<&str>) -> [u8; 3] {
+    let Some(raw) = hex else {
+        return [255, 255, 255];
+    };
+    let clean = raw.trim().trim_start_matches('#');
+    if clean.len() == 6
+        && let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&clean[0..2], 16),
+            u8::from_str_radix(&clean[2..4], 16),
+            u8::from_str_radix(&clean[4..6], 16),
+        )
+    {
+        return [r, g, b];
+    }
+    [255, 255, 255]
+}
+
+fn render_text_watermark_image(
+    text: &str,
+    target_height_px: f32,
+    rgb: [u8; 3],
+    color_space: OutputColorSpace,
+) -> Arc<DynamicImage> {
+    let px_size = target_height_px.clamp(14.0, 220.0);
+    let (tw, th) = crate::export::typography::measure_text(text, px_size);
+    let pad = (px_size * 0.25).ceil().max(4.0) as u32;
+    let w = (tw.ceil() as u32 + pad * 2).max(16);
+    let h = (th.ceil() as u32 + pad * 2).max(16);
+    let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+
+    let shadow_off = (px_size * 0.06).max(1.0);
+    let drew = crate::export::typography::draw_text_rgba8(
+        &mut canvas,
+        pad as f32 + shadow_off,
+        pad as f32 + shadow_off,
+        text,
+        px_size,
+        [0, 0, 0, 175],
+    );
+    if drew {
+        crate::export::typography::draw_text_rgba8(
+            &mut canvas,
+            pad as f32,
+            pad as f32,
+            text,
+            px_size,
+            [rgb[0], rgb[1], rgb[2], 255],
+        );
+    }
+    Arc::new(in_color_space(DynamicImage::ImageRgba8(canvas), color_space))
+}
+
+pub fn apply_watermark_with_exif(
+    base_image: &mut DynamicImage,
+    watermark_settings: &WatermarkSettings,
+    color_space: OutputColorSpace,
+    exif: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
     let (base_w, base_h) = base_image.dimensions();
     let base_min_dim = base_w.min(base_h) as f32;
 
-    let watermark_scale_factor =
-        (base_min_dim * (watermark_settings.scale / 100.0)) / watermark_img.width().max(1) as f32;
-    let new_wm_w = (watermark_img.width() as f32 * watermark_scale_factor).round() as u32;
-    let new_wm_h = (watermark_img.height() as f32 * watermark_scale_factor).round() as u32;
+    let scaled_watermark = if let Some(tpl) = watermark_settings
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let rendered_text = crate::export::typography::expand_exif_template(tpl, exif);
+        if rendered_text.is_empty() {
+            return Ok(());
+        }
+        let target_h = base_min_dim * (watermark_settings.scale / 100.0) * 0.35;
+        let rgb = parse_hex_rgb(watermark_settings.text_color.as_deref());
+        render_text_watermark_image(&rendered_text, target_h, rgb, color_space)
+    } else {
+        if watermark_settings.path.trim().is_empty() {
+            return Ok(());
+        }
+        let watermark_img = load_watermark_image(&watermark_settings.path)?;
+        let watermark_scale_factor =
+            (base_min_dim * (watermark_settings.scale / 100.0)) / watermark_img.width().max(1) as f32;
+        let new_wm_w = (watermark_img.width() as f32 * watermark_scale_factor).round() as u32;
+        let new_wm_h = (watermark_img.height() as f32 * watermark_scale_factor).round() as u32;
 
-    if new_wm_w == 0 || new_wm_h == 0 {
-        return Ok(());
-    }
+        if new_wm_w == 0 || new_wm_h == 0 {
+            return Ok(());
+        }
 
-    let scaled_watermark = scaled_watermark_image(
-        &watermark_settings.path,
-        &watermark_img,
-        new_wm_w,
-        new_wm_h,
-        color_space,
-    );
+        scaled_watermark_image(
+            &watermark_settings.path,
+            &watermark_img,
+            new_wm_w,
+            new_wm_h,
+            color_space,
+        )
+    };
     let opacity_factor = (watermark_settings.opacity / 100.0).clamp(0.0, 1.0);
 
     let spacing_pixels = (base_min_dim * (watermark_settings.spacing / 100.0)) as i64;

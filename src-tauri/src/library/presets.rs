@@ -766,19 +766,24 @@ fn parse_preset_file(file_path: &str) -> Result<Vec<PresetItem>, String> {
         return Ok(preset_file.presets);
     }
 
-    let xmp_content = if lower_path.ends_with(".lrtemplate") {
-        if let Some(caps) = regex!(r#"(?s)s.xmp = "(.*)""#).captures(&content) {
-            caps.get(1)
+    if lower_path.ends_with(".lrtemplate") {
+        if let Some(caps) = regex!(r#"(?s)s\.xmp\s*=\s*"(.*)""#).captures(&content) {
+            let xmp_content = caps
+                .get(1)
                 .map(|m| m.as_str().replace(r#"\""#, r#"""#))
-                .unwrap_or(content)
-        } else {
-            content
+                .unwrap_or(content);
+            let converted_preset = preset_converter::convert_xmp_to_preset(&xmp_content)?;
+            return Ok(vec![PresetItem::Preset(converted_preset)]);
         }
-    } else {
-        content
-    };
+        let stem = Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Imported Preset");
+        let converted_preset = preset_converter::convert_lrtemplate_to_preset(&content, stem)?;
+        return Ok(vec![PresetItem::Preset(converted_preset)]);
+    }
 
-    let converted_preset = preset_converter::convert_xmp_to_preset(&xmp_content)?;
+    let converted_preset = preset_converter::convert_xmp_to_preset(&content)?;
     Ok(vec![PresetItem::Preset(converted_preset)])
 }
 
@@ -881,6 +886,100 @@ pub fn handle_import_presets_from_files(
         presets: current_presets,
         failures,
     })
+}
+
+#[tauri::command]
+pub async fn handle_import_presets_from_folder(
+    folder_path: String,
+    app_handle: AppHandle,
+) -> Result<PresetImportResult, String> {
+    tokio::task::spawn_blocking(move || {
+        let root = Path::new(&folder_path);
+        if !root.is_dir() {
+            return Err(format!("Preset folder does not exist: {}", folder_path));
+        }
+
+        let mut current_presets = load_presets(app_handle.clone())?;
+        let mut taken_names = collect_top_level_preset_names(&current_presets);
+        let mut failures: Vec<PresetImportFailure> = Vec::new();
+        let mut grouped: std::collections::BTreeMap<String, Vec<Preset>> =
+            std::collections::BTreeMap::new();
+        let root_name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Imported Presets")
+            .to_string();
+
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "rrpreset" | "xmp" | "lrtemplate" | "json") {
+                continue;
+            }
+
+            let folder_key = p
+                .parent()
+                .and_then(|par| par.strip_prefix(root).ok())
+                .and_then(|rel| {
+                    let s = rel.to_string_lossy().replace('\\', "/");
+                    if s.is_empty() {
+                        Some(root_name.clone())
+                    } else {
+                        Some(s)
+                    }
+                })
+                .unwrap_or_else(|| root_name.clone());
+
+            let path_str = p.to_string_lossy().to_string();
+            match parse_preset_file(&path_str) {
+                Ok(items) => {
+                    let bucket = grouped.entry(folder_key).or_default();
+                    for item in items {
+                        match item {
+                            PresetItem::Preset(preset) => bucket.push(preset),
+                            PresetItem::Folder(f) => bucket.extend(f.children),
+                        }
+                    }
+                }
+                Err(error) => failures.push(PresetImportFailure {
+                    file_name: preset_file_display_name(&path_str),
+                    error,
+                }),
+            }
+        }
+
+        let mut folder_items = Vec::new();
+        for (folder_name, children) in grouped {
+            if !children.is_empty() {
+                folder_items.push(PresetItem::Folder(PresetFolder {
+                    id: Uuid::new_v4().to_string(),
+                    name: folder_name,
+                    children,
+                }));
+            }
+        }
+
+        let library_changed = !folder_items.is_empty();
+        if library_changed {
+            merge_imported_items(&mut current_presets, &mut taken_names, folder_items);
+            save_presets(current_presets.clone(), app_handle)?;
+        }
+
+        Ok(PresetImportResult {
+            presets: current_presets,
+            failures,
+        })
+    })
+    .await
+    .map_err(|e| format!("Preset folder import failed: {}", e))?
 }
 
 #[tauri::command]

@@ -39,6 +39,8 @@ import { useSettingsStore } from '../../../store/useSettingsStore';
 import { QuickEnhanceAction, useUIStore } from '../../../store/useUIStore';
 import { Panel } from '../../../types/ui';
 import { useDisplayStatus } from '../../../hooks/useDisplayStatus';
+import { useEditorActions } from '../../../hooks/useEditorActions';
+import { BUILTIN_WORKSPACE_PRESETS } from '../../../store/useUIStore';
 import { findGroupVariants, getVariantLabel } from '../../../utils/imageGrouping';
 
 const COMPARE_MODES = [
@@ -432,6 +434,44 @@ const EditorToolbar = memo(
     const [isHistoryVisible, setIsHistoryVisible] = useState(false);
     const historyButtonRef = useRef<HTMLDivElement>(null);
     useMenuDismiss(historyButtonRef, isHistoryVisible, setIsHistoryVisible);
+    const [isWorkspaceOpen, setIsWorkspaceOpen] = useState(false);
+    const [newWorkspaceName, setNewWorkspaceName] = useState('');
+    const workspaceMenuRef = useRef<HTMLDivElement>(null);
+    useMenuDismiss(workspaceMenuRef, isWorkspaceOpen, setIsWorkspaceOpen);
+
+    const { setAdjustments } = useEditorActions();
+    const snapshots = useEditorStore((state) => state.snapshots);
+    const currentAdjustments = useEditorStore((state) => state.adjustments);
+    const activeWorkspacePreset = useSettingsStore((s) => s.appSettings?.activeWorkspacePreset ?? 'default');
+    const savedWorkspacePresets = useSettingsStore((s) => s.appSettings?.savedWorkspacePresets ?? []);
+    const applyWorkspacePreset = useUIStore((s) => s.applyWorkspacePreset);
+    const saveCurrentWorkspacePreset = useUIStore((s) => s.saveCurrentWorkspacePreset);
+
+    const persistSnapshots = (nextSnapshots: typeof snapshots) => {
+      useEditorStore.getState().setEditor({ snapshots: nextSnapshots });
+      const sanitized = nextSnapshots.map(({ previewUrl: _previewUrl, ...rest }) => rest);
+      invoke(Invokes.SaveImageSnapshots, { path: selectedImage.path, snapshots: sanitized }).catch((err) =>
+        console.warn('SaveImageSnapshots failed:', err),
+      );
+    };
+
+    const handleCreateSnapshot = () => {
+      const next = [
+        ...snapshots,
+        {
+          id: `snap_${crypto.randomUUID().slice(0, 8)}`,
+          name: `Snapshot ${snapshots.length + 1}`,
+          adjustments: currentAdjustments,
+          previewUrl: null,
+          timestamp: Date.now(),
+        },
+      ];
+      persistSnapshots(next);
+    };
+
+    const handleDeleteSnapshot = (id: string) => {
+      persistSnapshots(snapshots.filter((s) => s.id !== id));
+    };
 
     const showResolution = !isAndroid && selectedImage.width > 0 && selectedImage.height > 0;
     const [displayedResolution, setDisplayedResolution] = useState('');
@@ -814,9 +854,42 @@ const EditorToolbar = memo(
 
             <ToolbarMenu
               className="w-96 max-w-[calc(100vw-1.5rem)]"
-              isOpen={isHistoryVisible && adjustmentsHistoryLabels.length > 1}
+              isOpen={isHistoryVisible && (adjustmentsHistoryLabels.length > 1 || snapshots.length > 0 || true)}
               title={t('editor.toolbar.history')}
             >
+              <div className="px-3 py-1.5 flex items-center justify-between border-b border-border-color/40">
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-text-secondary">
+                  Snapshots ({snapshots.length})
+                </span>
+                <button
+                  type="button"
+                  onClick={handleCreateSnapshot}
+                  className="px-2 py-0.5 rounded bg-accent/20 hover:bg-accent/30 text-accent text-[11px] font-medium transition-colors"
+                >
+                  + Snapshot
+                </button>
+              </div>
+              {snapshots.map((snap) => (
+                <div key={snap.id} className="flex items-center gap-1 pr-2">
+                  <div className="flex-1 min-w-0">
+                    <ToolbarMenuItem
+                      isSelected={false}
+                      label={snap.name}
+                      detail="Restore"
+                      onClick={() => setAdjustments(snap.adjustments, `Restore ${snap.name}`)}
+                      onKeyDown={handleButtonKeyDown}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteSnapshot(snap.id)}
+                    className="text-xs text-text-secondary hover:text-red-400 px-1.5 py-0.5 rounded"
+                    title="Delete snapshot"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
               {adjustmentsHistoryLabels.map((label, i) => (
                 <ToolbarMenuItem
                   key={i}
@@ -830,6 +903,67 @@ const EditorToolbar = memo(
                   wrap
                 />
               ))}
+            </ToolbarMenu>
+          </div>
+
+          <div className="relative" ref={workspaceMenuRef}>
+            <button
+              type="button"
+              onClick={() => setIsWorkspaceOpen((prev) => !prev)}
+              onKeyDown={handleButtonKeyDown}
+              className="bg-surface text-text-primary px-2.5 py-1.5 rounded-full hover:bg-card-active transition-colors flex items-center gap-1 text-xs font-medium"
+              data-tooltip="Workspace Presets"
+            >
+              <span>Workspace</span>
+              <ChevronDown size={14} />
+            </button>
+            <ToolbarMenu className="w-64" isOpen={isWorkspaceOpen} title="Workspaces">
+              {BUILTIN_WORKSPACE_PRESETS.map((preset) => (
+                <ToolbarMenuItem
+                  key={preset.id}
+                  isSelected={activeWorkspacePreset === preset.id}
+                  label={preset.name}
+                  onClick={() => {
+                    applyWorkspacePreset(preset.id);
+                    setIsWorkspaceOpen(false);
+                  }}
+                  onKeyDown={handleButtonKeyDown}
+                />
+              ))}
+              {savedWorkspacePresets.map((preset) => (
+                <ToolbarMenuItem
+                  key={preset.id}
+                  isSelected={activeWorkspacePreset === preset.id}
+                  label={preset.name}
+                  detail="Saved"
+                  onClick={() => {
+                    applyWorkspacePreset(preset.id);
+                    setIsWorkspaceOpen(false);
+                  }}
+                  onKeyDown={handleButtonKeyDown}
+                />
+              ))}
+              <div className="p-2 border-t border-border-color/40 flex items-center gap-1.5">
+                <input
+                  type="text"
+                  value={newWorkspaceName}
+                  onChange={(e) => setNewWorkspaceName(e.target.value)}
+                  placeholder="Save Current Layout..."
+                  className="flex-1 min-w-0 bg-bg-primary border border-surface rounded px-2 py-1 text-xs text-text-primary focus:outline-hidden focus:border-accent"
+                />
+                <button
+                  type="button"
+                  disabled={!newWorkspaceName.trim()}
+                  onClick={() => {
+                    saveCurrentWorkspacePreset(newWorkspaceName);
+                    setNewWorkspaceName('');
+                    setIsWorkspaceOpen(false);
+                  }}
+                  className="px-2 py-1 rounded bg-accent text-button-text text-xs font-medium disabled:opacity-40"
+                >
+                  Save
+                </button>
+              </div>
             </ToolbarMenu>
           </div>
 

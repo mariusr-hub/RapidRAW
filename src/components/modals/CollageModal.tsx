@@ -39,7 +39,10 @@ interface LoadedImage {
   url: string;
   width: number;
   height: number;
+  exifCaption?: string;
 }
+
+type FramePreset = 'standard' | 'gallery_mat' | 'polaroid_exif';
 
 interface ImageState {
   offsetX: number;
@@ -87,6 +90,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
   const [spacing, setSpacing] = useState(INITIAL_SPACING);
   const [borderRadius, setBorderRadius] = useState(INITIAL_BORDER_RADIUS);
   const [backgroundColor, setBackgroundColor] = useState('#FFFFFF');
+  const [framePreset, setFramePreset] = useState<FramePreset>('standard');
   const [exportWidth, setExportWidth] = useState(DEFAULT_EXPORT_WIDTH);
   const [exportHeight, setExportHeight] = useState(
     Math.round(DEFAULT_EXPORT_WIDTH / (ASPECT_RATIO_PRESETS[0].value || 1)),
@@ -132,6 +136,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
         setActiveAspectRatio(ASPECT_RATIO_PRESETS[0]);
         setKeepOriginalRatio(false);
         setBackgroundColor('#FFFFFF');
+        setFramePreset('standard');
         setSpacing(INITIAL_SPACING);
         setBorderRadius(INITIAL_BORDER_RADIUS);
       }, 300);
@@ -149,6 +154,15 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
         const imagePromises = sourceImages.map(async (imageFile) => {
           const metadata: any = await invoke(Invokes.LoadMetadata, { path: imageFile.path });
           const adjustments = metadata.adjustments && !metadata.adjustments.is_null ? metadata.adjustments : {};
+          const exif = metadata?.exif || {};
+          const exifParts = [
+            exif.Model || exif.CameraModelName,
+            exif.FocalLength,
+            exif.FNumber ? `f/${String(exif.FNumber).replace(/^f\//i, '')}` : '',
+            exif.ExposureTime,
+            exif.ISOSpeedRatings || exif.ISO ? `ISO ${exif.ISOSpeedRatings || exif.ISO}` : '',
+          ].filter(Boolean);
+          const exifCaption = exifParts.join(' · ');
 
           const imageData: Uint8Array = await invoke(Invokes.GeneratePreviewForPath, {
             path: imageFile.path,
@@ -161,7 +175,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
             const img = new Image();
             img.onload = () => {
               imageElementsRef.current[imageFile.path] = img;
-              resolve({ path: imageFile.path, url, width: img.width, height: img.height });
+              resolve({ path: imageFile.path, url, width: img.width, height: img.height, exifCaption });
             };
             img.onerror = () => reject(new Error(`Failed to load image: ${imageFile.path}`));
             img.src = url;
@@ -271,7 +285,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
 
       ctx.scale(dpr, dpr);
       ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-      ctx.fillStyle = backgroundColor;
+      ctx.fillStyle = framePreset === 'gallery_mat' ? '#F8F8F6' : backgroundColor;
       ctx.fillRect(0, 0, canvasWidth, canvasHeight);
 
       loadedImages.forEach((image, index) => {
@@ -280,7 +294,9 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
         const img = imageElementsRef.current[image.path];
         if (!img) return;
 
-        const scaledSpacing = spacing * exportScale;
+        const scaledSpacing =
+          (framePreset === 'gallery_mat' ? Math.max(spacing, 28) : framePreset === 'polaroid_exif' ? Math.max(spacing, 18) : spacing) *
+          exportScale;
         const scaledRadius = borderRadius * exportScale;
 
         const x1 = cell.x * canvasWidth;
@@ -295,13 +311,31 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
           x1 -
           (cell.x === 0 ? scaledSpacing : scaledSpacing / 2) -
           (cell.x + cell.width >= 1 ? scaledSpacing : scaledSpacing / 2);
-        const cellFinalHeight =
+        const rawCellHeight =
           y2 -
           y1 -
           (cell.y === 0 ? scaledSpacing : scaledSpacing / 2) -
           (cell.y + cell.height >= 1 ? scaledSpacing : scaledSpacing / 2);
+        const chinHeight =
+          framePreset === 'polaroid_exif' ? Math.max(24 * exportScale, rawCellHeight * 0.16) : 0;
+        const cellFinalHeight = rawCellHeight - chinHeight;
 
         if (cellFinalWidth <= 0 || cellFinalHeight <= 0) return;
+
+        if (framePreset === 'polaroid_exif') {
+          ctx.save();
+          ctx.fillStyle = '#FFFFFF';
+          ctx.shadowColor = 'rgba(0,0,0,0.18)';
+          ctx.shadowBlur = 14 * exportScale;
+          ctx.shadowOffsetY = 4 * exportScale;
+          ctx.fillRect(
+            cellFinalX - 6 * exportScale,
+            cellFinalY - 6 * exportScale,
+            cellFinalWidth + 12 * exportScale,
+            rawCellHeight + 12 * exportScale,
+          );
+          ctx.restore();
+        }
 
         ctx.save();
         ctx.beginPath();
@@ -343,6 +377,38 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
 
         ctx.drawImage(img, drawX, drawY, drawWidth, drawHeight);
         ctx.restore();
+
+        if (framePreset === 'gallery_mat') {
+          ctx.save();
+          ctx.strokeStyle = 'rgba(30, 30, 30, 0.22)';
+          ctx.lineWidth = Math.max(1, 1.5 * exportScale);
+          ctx.strokeRect(cellFinalX, cellFinalY, cellFinalWidth, cellFinalHeight);
+          if (image.exifCaption) {
+            const fontSize = Math.max(9, Math.round(cellFinalWidth * 0.022));
+            ctx.font = `${fontSize}px system-ui, -apple-system, sans-serif`;
+            ctx.fillStyle = 'rgba(40, 40, 44, 0.72)';
+            ctx.textAlign = 'right';
+            ctx.fillText(
+              image.exifCaption,
+              cellFinalX + cellFinalWidth,
+              cellFinalY + cellFinalHeight + fontSize * 1.4,
+            );
+          }
+          ctx.restore();
+        } else if (framePreset === 'polaroid_exif' && image.exifCaption) {
+          ctx.save();
+          const fontSize = Math.max(10, Math.round(cellFinalWidth * 0.026));
+          ctx.font = `500 ${fontSize}px ui-monospace, SFMono-Regular, monospace`;
+          ctx.fillStyle = '#27272a';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(
+            image.exifCaption,
+            cellFinalX + cellFinalWidth / 2,
+            cellFinalY + cellFinalHeight + chinHeight * 0.52,
+          );
+          ctx.restore();
+        }
       });
     },
     [
@@ -356,6 +422,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
       exportHeight,
       backgroundColor,
       keepOriginalRatio,
+      framePreset,
     ],
   );
 
@@ -687,6 +754,33 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
           checked={keepOriginalRatio}
           onChange={setKeepOriginalRatio}
         />
+      </div>
+
+      <div className="space-y-1.5">
+        <Text variant={TextVariants.label}>Frame Style</Text>
+        <div className="grid grid-cols-3 gap-1 bg-surface p-1 rounded-lg">
+          {(
+            [
+              { id: 'standard', label: 'Standard' },
+              { id: 'gallery_mat', label: 'Gallery Mat' },
+              { id: 'polaroid_exif', label: 'Polaroid EXIF' },
+            ] as const
+          ).map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => setFramePreset(preset.id)}
+              className={clsx(
+                'px-2 py-1 rounded text-[11px] font-medium transition-colors',
+                framePreset === preset.id
+                  ? 'bg-accent text-button-text'
+                  : 'text-text-secondary hover:text-text-primary',
+              )}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="space-y-2">

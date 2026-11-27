@@ -100,10 +100,54 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
         attrs.insert(cap[1].to_string(), cap[2].to_string());
     }
 
+    let mut curves_map = Map::new();
+    let curve_mappings = [
+        ("ToneCurvePV2012", "luma"),
+        ("ToneCurvePV2012Red", "red"),
+        ("ToneCurvePV2012Green", "green"),
+        ("ToneCurvePV2012Blue", "blue"),
+    ];
+    for (xmp_curve, rr_curve) in curve_mappings {
+        if let Some(points) = extract_tone_curve_points(xmp_content, xmp_curve) {
+            curves_map.insert(rr_curve.to_string(), Value::Array(points));
+        }
+    }
+
+    let preset_name =
+        extract_xmp_name(xmp_content).unwrap_or_else(|| "Imported Preset".to_string());
+
+    build_preset_from_maps(preset_name, &attrs, curves_map)
+}
+
+fn dampen_pv2012_y(curve_name: &str, x: u32, y: u32) -> u32 {
+    if curve_name == "ToneCurvePV2012" {
+        const SHADOW_RANGE_END: f64 = 64.0;
+        const SHADOW_DAMPEN_START: f64 = 0.8;
+        const SHADOW_DAMPEN_END: f64 = 1.0;
+
+        let x_f64 = x as f64;
+        let y_f64 = y as f64;
+        if y_f64 > x_f64 && x_f64 < SHADOW_RANGE_END {
+            let lift_amount = y_f64 - x_f64;
+            let progress = x_f64 / SHADOW_RANGE_END;
+            let dampening_factor =
+                SHADOW_DAMPEN_START + (SHADOW_DAMPEN_END - SHADOW_DAMPEN_START) * progress;
+            return (x_f64 + lift_amount * dampening_factor)
+                .round()
+                .clamp(0.0, 255.0) as u32;
+        }
+    }
+    y
+}
+
+fn build_preset_from_maps(
+    preset_name: String,
+    attrs: &HashMap<String, String>,
+    curves_map: Map<String, Value>,
+) -> Result<Preset, String> {
     let mut adjustments = Map::new();
     let mut hsl_map = Map::new();
     let mut color_grading_map = Map::new();
-    let mut curves_map = Map::new();
 
     let mappings = vec![
         ("Exposure2012", "exposure"),
@@ -151,12 +195,12 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
         }
     }
 
-    if let Some(shadows_val) = get_attr_as_f64(&attrs, "Shadows2012") {
+    if let Some(shadows_val) = get_attr_as_f64(attrs, "Shadows2012") {
         let adjusted_shadows = (shadows_val * 1.5).clamp(-100.0, 100.0);
         adjustments.insert("shadows".to_string(), json!(adjusted_shadows));
     }
 
-    if let Some(sharpness_val) = get_attr_as_f64(&attrs, "Sharpness") {
+    if let Some(sharpness_val) = get_attr_as_f64(attrs, "Sharpness") {
         let scaled_sharpness = (sharpness_val / 150.0) * 100.0;
         adjustments.insert(
             "sharpness".to_string(),
@@ -164,9 +208,9 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
         );
     }
 
-    if let Some(adjusted_k) = get_attr_as_f64(&attrs, "Temperature") {
+    if let Some(adjusted_k) = get_attr_as_f64(attrs, "Temperature") {
         const AS_SHOT_DEFAULT: f64 = 5500.0;
-        let as_shot_k = get_attr_as_f64(&attrs, "AsShotTemperature").unwrap_or(AS_SHOT_DEFAULT);
+        let as_shot_k = get_attr_as_f64(attrs, "AsShotTemperature").unwrap_or(AS_SHOT_DEFAULT);
         let mired_adjusted = 1_000_000.0 / adjusted_k;
         let mired_as_shot = 1_000_000.0 / as_shot_k;
         let mired_delta = mired_adjusted - mired_as_shot;
@@ -177,9 +221,65 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
         );
     }
 
-    if let Some(tint_val) = get_attr_as_f64(&attrs, "Tint") {
+    if let Some(tint_val) = get_attr_as_f64(attrs, "Tint") {
         let scaled_tint = tint_val / TINT_PER_RELATIVE_UNIT;
         adjustments.insert("tint".to_string(), json!(scaled_tint.clamp(-100.0, 100.0)));
+    }
+
+    // Parametric Tone Curve (ParametricDarks / ParametricLights / ParametricShadows / ParametricHighlights)
+    let mut param_luma = Map::new();
+    for (src_key, dst_key) in [
+        ("ParametricDarks", "darks"),
+        ("ParametricShadows", "shadows"),
+        ("ParametricLights", "lights"),
+        ("ParametricHighlights", "highlights"),
+    ] {
+        if let Some(val) = get_attr_as_f64(attrs, src_key) {
+            param_luma.insert(dst_key.to_string(), json!(val.clamp(-100.0, 100.0)));
+        }
+    }
+    if !param_luma.is_empty() {
+        param_luma.entry("darks").or_insert_with(|| json!(0));
+        param_luma.entry("shadows").or_insert_with(|| json!(0));
+        param_luma.entry("lights").or_insert_with(|| json!(0));
+        param_luma.entry("highlights").or_insert_with(|| json!(0));
+        param_luma.insert("whiteLevel".to_string(), json!(100));
+        param_luma.insert("blackLevel".to_string(), json!(0));
+        param_luma.insert("split1".to_string(), json!(25));
+        param_luma.insert("split2".to_string(), json!(50));
+        param_luma.insert("split3".to_string(), json!(75));
+        let default_ch = json!({
+            "darks": 0, "shadows": 0, "lights": 0, "highlights": 0,
+            "whiteLevel": 100, "blackLevel": 0, "split1": 25, "split2": 50, "split3": 75
+        });
+        adjustments.insert(
+            "parametricCurve".to_string(),
+            json!({
+                "luma": Value::Object(param_luma),
+                "red": default_ch,
+                "green": default_ch,
+                "blue": default_ch,
+            }),
+        );
+    }
+
+    // Camera Calibration (ShadowTint + Red/Green/Blue primaries)
+    let mut calib_map = Map::new();
+    for (src_key, dst_key) in [
+        ("ShadowTint", "shadowsTint"),
+        ("RedHue", "redHue"),
+        ("RedSaturation", "redSaturation"),
+        ("GreenHue", "greenHue"),
+        ("GreenSaturation", "greenSaturation"),
+        ("BlueHue", "blueHue"),
+        ("BlueSaturation", "blueSaturation"),
+    ] {
+        if let Some(val) = get_attr_as_f64(attrs, src_key) {
+            calib_map.insert(dst_key.to_string(), json!(val.clamp(-100.0, 100.0)));
+        }
+    }
+    if !calib_map.is_empty() {
+        adjustments.insert("colorCalibration".to_string(), Value::Object(calib_map));
     }
 
     let colors = [
@@ -199,8 +299,7 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
             && let Some(Value::Number(n)) = num_to_json(num)
             && let Some(val_f64) = n.as_f64()
         {
-            let adjusted_hue = val_f64 * 0.75;
-            color_map.insert("hue".to_string(), json!(adjusted_hue));
+            color_map.insert("hue".to_string(), json!(val_f64 * 0.75));
         }
         if let Some(raw) = attrs.get(&format!("SaturationAdjustment{}", src))
             && let Some(num) = parse_num(raw.trim_start_matches('+'))
@@ -231,7 +330,7 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
     if grayscale == Some(true) {
         let mut mix_map = Map::new();
         for (src, dst) in colors {
-            if let Some(val) = get_attr_as_f64(&attrs, &format!("GrayMixer{}", src)) {
+            if let Some(val) = get_attr_as_f64(attrs, &format!("GrayMixer{}", src)) {
                 mix_map.insert(dst.to_string(), json!(val.clamp(-100.0, 100.0)));
             }
         }
@@ -247,7 +346,7 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
             ("SplitToningHighlightSaturation", "highlightSaturation"),
             ("SplitToningBalance", "balance"),
         ] {
-            if let Some(val) = get_attr_as_f64(&attrs, xmp_key) {
+            if let Some(val) = get_attr_as_f64(attrs, xmp_key) {
                 toning_map.insert(rr_key.to_string(), json!(val));
             }
         }
@@ -260,77 +359,53 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
     let mut midtones_map = Map::new();
     let mut highlights_map = Map::new();
     let mut global_map = Map::new();
-    if let Some(raw) = attrs.get("SplitToningShadowHue")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        shadows_map.insert("hue".to_string(), json_val);
+    for (src_key, dst_key) in [
+        ("SplitToningShadowHue", "hue"),
+        ("SplitToningShadowSaturation", "saturation"),
+        ("ColorGradeShadowLum", "luminance"),
+    ] {
+        if let Some(raw) = attrs.get(src_key)
+            && let Some(num) = parse_num(raw)
+            && let Some(json_val) = num_to_json(num)
+        {
+            shadows_map.insert(dst_key.to_string(), json_val);
+        }
     }
-    if let Some(raw) = attrs.get("ColorGradeMidtoneHue")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        midtones_map.insert("hue".to_string(), json_val);
+    for (src_key, dst_key) in [
+        ("ColorGradeMidtoneHue", "hue"),
+        ("ColorGradeMidtoneSat", "saturation"),
+        ("ColorGradeMidtoneLum", "luminance"),
+    ] {
+        if let Some(raw) = attrs.get(src_key)
+            && let Some(num) = parse_num(raw)
+            && let Some(json_val) = num_to_json(num)
+        {
+            midtones_map.insert(dst_key.to_string(), json_val);
+        }
     }
-    if let Some(raw) = attrs.get("SplitToningHighlightHue")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        highlights_map.insert("hue".to_string(), json_val);
+    for (src_key, dst_key) in [
+        ("SplitToningHighlightHue", "hue"),
+        ("SplitToningHighlightSaturation", "saturation"),
+        ("ColorGradeHighlightLum", "luminance"),
+    ] {
+        if let Some(raw) = attrs.get(src_key)
+            && let Some(num) = parse_num(raw)
+            && let Some(json_val) = num_to_json(num)
+        {
+            highlights_map.insert(dst_key.to_string(), json_val);
+        }
     }
-    if let Some(raw) = attrs.get("SplitToningShadowSaturation")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        shadows_map.insert("saturation".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeMidtoneSat")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        midtones_map.insert("saturation".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("SplitToningHighlightSaturation")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        highlights_map.insert("saturation".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeShadowLum")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        shadows_map.insert("luminance".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeMidtoneLum")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        midtones_map.insert("luminance".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeHighlightLum")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        highlights_map.insert("luminance".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeGlobalHue")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        global_map.insert("hue".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeGlobalSat")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        global_map.insert("saturation".to_string(), json_val);
-    }
-    if let Some(raw) = attrs.get("ColorGradeGlobalLum")
-        && let Some(num) = parse_num(raw)
-        && let Some(json_val) = num_to_json(num)
-    {
-        global_map.insert("luminance".to_string(), json_val);
+    for (src_key, dst_key) in [
+        ("ColorGradeGlobalHue", "hue"),
+        ("ColorGradeGlobalSat", "saturation"),
+        ("ColorGradeGlobalLum", "luminance"),
+    ] {
+        if let Some(raw) = attrs.get(src_key)
+            && let Some(num) = parse_num(raw)
+            && let Some(json_val) = num_to_json(num)
+        {
+            global_map.insert(dst_key.to_string(), json_val);
+        }
     }
     if let Some(raw) = attrs.get("SplitToningBalance")
         && let Some(num) = parse_num(raw)
@@ -354,23 +429,9 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
         adjustments.insert("colorGrading".to_string(), Value::Object(color_grading_map));
     }
 
-    let curve_mappings = [
-        ("ToneCurvePV2012", "luma"),
-        ("ToneCurvePV2012Red", "red"),
-        ("ToneCurvePV2012Green", "green"),
-        ("ToneCurvePV2012Blue", "blue"),
-    ];
-    for (xmp_curve, rr_curve) in curve_mappings {
-        if let Some(points) = extract_tone_curve_points(xmp_content, xmp_curve) {
-            curves_map.insert(rr_curve.to_string(), Value::Array(points));
-        }
-    }
     if !curves_map.is_empty() {
         adjustments.insert("curves".to_string(), Value::Object(curves_map));
     }
-
-    let preset_name =
-        extract_xmp_name(xmp_content).unwrap_or_else(|| "Imported Preset".to_string());
 
     Ok(Preset {
         id: Uuid::new_v4().to_string(),
@@ -380,4 +441,109 @@ pub fn convert_xmp_to_preset(xmp_content: &str) -> Result<Preset, String> {
         include_crop_transform: Some(false),
         preset_type: Some("style".to_string()),
     })
+}
+
+/// Parses a Lightroom Lua `.lrtemplate` (`s = { title = "...", value = { settings = { ... } } }`) preset.
+pub fn convert_lrtemplate_to_preset(
+    content: &str,
+    fallback_name: &str,
+) -> Result<Preset, String> {
+    let mut attrs: HashMap<String, String> = HashMap::new();
+    let mut curves_map = Map::new();
+
+    let preset_name = regex!(r#"(?m)\btitle\s*=\s*"([^"]+)""#)
+        .captures(content)
+        .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback_name.to_string());
+
+    // Scalar key = value pairs (numbers, booleans, or quoted strings)
+    let scalar_re = regex!(r#"(?m)^\s*([A-Za-z0-9_]+)\s*=\s*([+-]?\d+(?:\.\d+)?|true|false|"[^"]*"),?"#);
+    for cap in scalar_re.captures_iter(content) {
+        let key = cap[1].to_string();
+        let val = cap[2].trim_matches('"').to_string();
+        attrs.insert(key, val);
+    }
+
+    // ToneCurvePV2012 flat arrays: ToneCurvePV2012 = { 0, 0, 64, 72, 255, 255 }
+    for (lua_key, rr_curve) in [
+        ("ToneCurvePV2012", "luma"),
+        ("ToneCurvePV2012Red", "red"),
+        ("ToneCurvePV2012Green", "green"),
+        ("ToneCurvePV2012Blue", "blue"),
+    ] {
+        let pattern = format!(r"(?s)\b{}\s*=\s*\{{([^}}]*)\}}", regex::escape(lua_key));
+        if let Ok(re) = Regex::new(&pattern)
+            && let Some(caps) = re.captures(content)
+        {
+            let nums: Vec<u32> = caps[1]
+                .split([',', ' ', '\t', '\r', '\n'])
+                .filter_map(|tok| tok.trim().parse::<f64>().ok())
+                .map(|v| v.round().clamp(0.0, 255.0) as u32)
+                .collect();
+            let mut pts = Vec::new();
+            for pair in nums.chunks_exact(2) {
+                let x = pair[0];
+                let y = dampen_pv2012_y(lua_key, x, pair[1]);
+                pts.push(json!({ "x": x, "y": y }));
+            }
+            if !pts.is_empty() {
+                curves_map.insert(rr_curve.to_string(), Value::Array(pts));
+            }
+        }
+    }
+
+    if attrs.is_empty() && curves_map.is_empty() {
+        return Err("Unrecognized .lrtemplate preset format (no settings found)".to_string());
+    }
+
+    build_preset_from_maps(preset_name, &attrs, curves_map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_convert_lrtemplate_parses_scalars_curves_parametric_and_calibration() {
+        let sample = r#"
+s = {
+    id = "ABC-123",
+    internalName = "Portra Warm",
+    title = "Portra 400 Warm",
+    type = "Develop",
+    value = {
+        settings = {
+            Exposure2012 = 0.35,
+            Contrast2012 = 12,
+            ParametricDarks = -8,
+            ParametricShadows = 10,
+            ParametricLights = 5,
+            ParametricHighlights = -15,
+            ShadowTint = 4,
+            RedHue = 6,
+            RedSaturation = -10,
+            BlueHue = -12,
+            BlueSaturation = 14,
+            ToneCurvePV2012 = {
+                0, 12,
+                64, 72,
+                255, 245,
+            },
+        },
+        uuid = "ABC-123",
+    },
+    version = 0,
+}
+"#;
+        let preset = convert_lrtemplate_to_preset(sample, "fallback").expect("lrtemplate parse");
+        assert_eq!(preset.name, "Portra 400 Warm");
+        assert!((preset.adjustments["exposure"].as_f64().unwrap() - 0.35).abs() < 1e-4);
+        assert_eq!(preset.adjustments["parametricCurve"]["luma"]["darks"], json!(-8.0));
+        assert_eq!(preset.adjustments["parametricCurve"]["luma"]["highlights"], json!(-15.0));
+        assert_eq!(preset.adjustments["colorCalibration"]["shadowsTint"], json!(4.0));
+        assert_eq!(preset.adjustments["colorCalibration"]["redHue"], json!(6.0));
+        assert_eq!(preset.adjustments["colorCalibration"]["blueSaturation"], json!(14.0));
+        assert_eq!(preset.adjustments["curves"]["luma"].as_array().unwrap().len(), 3);
+    }
 }

@@ -135,6 +135,8 @@ export enum WatermarkAnchor {
 
 interface WatermarkSettings {
   path: string;
+  text?: string | null;
+  textColor?: string | null;
   anchor: WatermarkAnchor;
   scale: number;
   spacing: number;
@@ -209,6 +211,7 @@ export interface ExportPreset {
   filenameTemplate: string;
   enableWatermark: boolean;
   watermarkPath: string | null;
+  watermarkText?: string;
   watermarkAnchor: string;
   watermarkScale: number;
   watermarkSpacing: number;

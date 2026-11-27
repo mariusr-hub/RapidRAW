@@ -92,6 +92,266 @@ pub fn is_skin_tone_oklab(ok_l: f32, ok_a: f32, ok_b: f32) -> bool {
     (0.60..=1.35).contains(&hue_angle)
 }
 
+/// Deterministic 3D Sliced Optimal Transport in OKLab using golden-ratio spherical directions (`alpha = 0.5`).
+pub fn sliced_optimal_transport_oklab(
+    target_samples: &[[f32; 3]],
+    reference_samples: &[[f32; 3]],
+    iterations: usize,
+    damping: f32,
+) -> Vec<[f32; 3]> {
+    let mut moved = target_samples.to_vec();
+    if moved.is_empty() || reference_samples.is_empty() || iterations == 0 {
+        return moved;
+    }
+
+    let n_t = moved.len();
+    let n_r = reference_samples.len();
+    let golden_angle = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
+    let mut t_proj: Vec<(f32, usize)> = Vec::with_capacity(n_t);
+    let mut r_proj: Vec<f32> = Vec::with_capacity(n_r);
+
+    for k in 0..iterations {
+        let z = 1.0 - 2.0 * (k as f32 + 0.5) / (iterations as f32);
+        let radius = (1.0 - z * z).max(0.0).sqrt();
+        let phi = (k as f32) * golden_angle;
+        let u = [radius * phi.cos(), radius * phi.sin(), z];
+
+        t_proj.clear();
+        for (i, p) in moved.iter().enumerate() {
+            t_proj.push((p[0] * u[0] + p[1] * u[1] + p[2] * u[2], i));
+        }
+        t_proj.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        r_proj.clear();
+        for p in reference_samples {
+            r_proj.push(p[0] * u[0] + p[1] * u[1] + p[2] * u[2]);
+        }
+        r_proj.sort_by(|a, b| a.total_cmp(&b));
+
+        for (rank, &(proj_t, idx)) in t_proj.iter().enumerate() {
+            let pos = if n_t <= 1 || n_r <= 1 {
+                0.0
+            } else {
+                (rank as f32 / (n_t - 1) as f32) * (n_r - 1) as f32
+            };
+            let i0 = (pos.floor() as usize).min(n_r - 1);
+            let i1 = (i0 + 1).min(n_r - 1);
+            let frac = pos - i0 as f32;
+            let ref_q = r_proj[i0] * (1.0 - frac) + r_proj[i1] * frac;
+            let step = damping * (ref_q - proj_t);
+            moved[idx][0] += step * u[0];
+            moved[idx][1] += step * u[1];
+            moved[idx][2] += step * u[2];
+        }
+    }
+
+    moved
+}
+
+fn sample_oklab_cloud(image: &DynamicImage, max_samples: usize) -> Vec<[f32; 3]> {
+    let rgb = image.thumbnail(256, 256).to_rgb8();
+    let total = (rgb.width() * rgb.height()) as usize;
+    if total == 0 {
+        return Vec::new();
+    }
+    let step = (total / max_samples.max(1)).max(1);
+    let raw = rgb.as_raw();
+    let mut out = Vec::with_capacity(max_samples.min(total));
+    for idx in (0..total).step_by(step) {
+        let p = idx * 3;
+        let (l, a, b) = srgb_to_oklab(raw[p] as f32, raw[p + 1] as f32, raw[p + 2] as f32);
+        out.push([l, a, b]);
+    }
+    out
+}
+
+/// Fits a smooth 33×33×33 `.cube` 3D LUT via 12-iteration OKLab Sliced Optimal Transport
+/// with physiological skin-tone preservation.
+pub fn fit_sot_cube_lut_33(
+    target_img: &DynamicImage,
+    reference_img: &DynamicImage,
+    skin_protect: f32,
+) -> String {
+    let src_samples = sample_oklab_cloud(target_img, 16_384);
+    let ref_samples = sample_oklab_cloud(reference_img, 16_384);
+    let matched = sliced_optimal_transport_oklab(&src_samples, &ref_samples, 12, 0.5);
+
+    // Coarse 8×8×8 displacement field in OKLab (L: [0,1], a: [-0.35,0.35], b: [-0.35,0.35])
+    const G: usize = 8;
+    let mut sum_delta = vec![[0.0f32; 3]; G * G * G];
+    let mut sum_w = vec![0.0f32; G * G * G];
+    let ok_to_grid = |v: [f32; 3]| -> [f32; 3] {
+        [
+            v[0].clamp(0.0, 1.0) * (G - 1) as f32,
+            ((v[1] + 0.35) / 0.70).clamp(0.0, 1.0) * (G - 1) as f32,
+            ((v[2] + 0.35) / 0.70).clamp(0.0, 1.0) * (G - 1) as f32,
+        ]
+    };
+
+    for (s, m) in src_samples.iter().zip(&matched) {
+        let delta = [m[0] - s[0], m[1] - s[1], m[2] - s[2]];
+        let gp = ok_to_grid(*s);
+        let l0 = (gp[0].floor() as usize).min(G - 1);
+        let a0 = (gp[1].floor() as usize).min(G - 1);
+        let b0 = (gp[2].floor() as usize).min(G - 1);
+        for dl in 0..=1 {
+            let li = (l0 + dl).min(G - 1);
+            let wl = if dl == 0 { 1.0 - (gp[0] - l0 as f32) } else { gp[0] - l0 as f32 };
+            for da in 0..=1 {
+                let ai = (a0 + da).min(G - 1);
+                let wa = if da == 0 { 1.0 - (gp[1] - a0 as f32) } else { gp[1] - a0 as f32 };
+                for db in 0..=1 {
+                    let bi = (b0 + db).min(G - 1);
+                    let wb = if db == 0 { 1.0 - (gp[2] - b0 as f32) } else { gp[2] - b0 as f32 };
+                    let w = (wl * wa * wb).max(0.0);
+                    let cell = (li * G + ai) * G + bi;
+                    sum_delta[cell][0] += delta[0] * w;
+                    sum_delta[cell][1] += delta[1] * w;
+                    sum_delta[cell][2] += delta[2] * w;
+                    sum_w[cell] += w;
+                }
+            }
+        }
+    }
+
+    let mut grid_delta = vec![[0.0f32; 3]; G * G * G];
+    for i in 0..G * G * G {
+        if sum_w[i] > 1e-4 {
+            grid_delta[i] = [
+                (sum_delta[i][0] / sum_w[i]).clamp(-0.35, 0.35),
+                (sum_delta[i][1] / sum_w[i]).clamp(-0.22, 0.22),
+                (sum_delta[i][2] / sum_w[i]).clamp(-0.22, 0.22),
+            ];
+        }
+    }
+
+    let sample_delta = |ok: [f32; 3]| -> [f32; 3] {
+        let gp = ok_to_grid(ok);
+        let l0 = (gp[0].floor() as usize).min(G - 2);
+        let a0 = (gp[1].floor() as usize).min(G - 2);
+        let b0 = (gp[2].floor() as usize).min(G - 2);
+        let fl = gp[0] - l0 as f32;
+        let fa = gp[1] - a0 as f32;
+        let fb = gp[2] - b0 as f32;
+        let mut out = [0.0f32; 3];
+        for dl in 0..=1 {
+            let wl = if dl == 0 { 1.0 - fl } else { fl };
+            for da in 0..=1 {
+                let wa = if da == 0 { 1.0 - fa } else { fa };
+                for db in 0..=1 {
+                    let wb = if db == 0 { 1.0 - fb } else { fb };
+                    let w = wl * wa * wb;
+                    let d = grid_delta[((l0 + dl) * G + (a0 + da)) * G + (b0 + db)];
+                    out[0] += d[0] * w;
+                    out[1] += d[1] * w;
+                    out[2] += d[2] * w;
+                }
+            }
+        }
+        out
+    };
+
+    const LUT_N: usize = 33;
+    let mut out = String::with_capacity(LUT_N * LUT_N * LUT_N * 26);
+    out.push_str("TITLE \"RapidRAW SOT Color Match\"\nLUT_3D_SIZE 33\n");
+    out.push_str("DOMAIN_MIN 0.0 0.0 0.0\nDOMAIN_MAX 1.0 1.0 1.0\n\n");
+
+    let protect = skin_protect.clamp(0.0, 1.0);
+    for bi in 0..LUT_N {
+        let bf = bi as f32 / (LUT_N - 1) as f32;
+        for gi in 0..LUT_N {
+            let gf = gi as f32 / (LUT_N - 1) as f32;
+            for ri in 0..LUT_N {
+                let rf = ri as f32 / (LUT_N - 1) as f32;
+                let (ok_l, ok_a, ok_b) = srgb_to_oklab(rf * 255.0, gf * 255.0, bf * 255.0);
+                let delta = sample_delta([ok_l, ok_a, ok_b]);
+                let skin_w = protect * calculate_skin_tone_weight(ok_l, ok_a, ok_b);
+                let keep = (1.0 - skin_w * 0.80).clamp(0.0, 1.0);
+                let (nr, ng, nb) = oklab_to_srgb(
+                    (ok_l + delta[0] * keep).clamp(0.0, 1.0),
+                    (ok_a + delta[1] * keep).clamp(-0.4, 0.4),
+                    (ok_b + delta[2] * keep).clamp(-0.4, 0.4),
+                );
+                use std::fmt::Write;
+                let _ = writeln!(
+                    out,
+                    "{:.6} {:.6} {:.6}",
+                    (nr / 255.0).clamp(0.0, 1.0),
+                    (ng / 255.0).clamp(0.0, 1.0),
+                    (nb / 255.0).clamp(0.0, 1.0),
+                );
+            }
+        }
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn generate_sot_color_match_lut(
+    reference_base64: Option<String>,
+    reference_path: Option<String>,
+    target_path: Option<String>,
+    skin_protect: Option<f32>,
+    app_handle: tauri::AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use tauri::Manager;
+        let state = app_handle.state::<AppState>();
+        let ref_img = if let Some(b64) = reference_base64 {
+            let raw_b64 = b64.split(',').nth(1).unwrap_or(&b64);
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(raw_b64)
+                .map_err(|e| format!("Invalid base64 reference: {e}"))?;
+            image::load_from_memory(&bytes).map_err(|e| e.to_string())?
+        } else if let Some(ref p) = reference_path {
+            let (src, _) = crate::library::sidecars::parse_virtual_path(p);
+            let mapped = crate::library::file_ops::read_file_mapped(&src).map_err(|e| e.to_string())?;
+            let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
+            crate::decode::image_loader::load_base_image_from_bytes(&mapped, &src.to_string_lossy(), false, &settings, None)
+                .map_err(|e| e.to_string())?
+        } else {
+            return Err("Either referenceBase64 or referencePath is required".to_string());
+        };
+
+        let target_img = if let Some(tp) = target_path {
+            let (src, _) = crate::library::sidecars::parse_virtual_path(&tp);
+            let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
+            let orig_match = {
+                let guard = state.original_image.lock().unwrap();
+                guard
+                    .as_ref()
+                    .filter(|l| l.path == tp || l.path == src.to_string_lossy())
+                    .map(|l| (*l.image).clone())
+            };
+            if let Some(img) = orig_match {
+                img
+            } else {
+                let mapped = crate::library::file_ops::read_file_mapped(&src).map_err(|e| e.to_string())?;
+                crate::decode::image_loader::load_base_image_from_bytes(&mapped, &src.to_string_lossy(), false, &settings, None)
+                    .map_err(|e| e.to_string())?
+            }
+        } else {
+            let guard = state.original_image.lock().unwrap();
+            guard
+                .as_ref()
+                .map(|l| (*l.image).clone())
+                .ok_or_else(|| "No active target image open in Editor".to_string())?
+        };
+
+        let cube_str = fit_sot_cube_lut_33(&target_img, &ref_img, skin_protect.unwrap_or(0.75));
+        let luts_dir = crate::app::settings::resolved_app_data_dir(&app_handle)?.join("luts");
+        std::fs::create_dir_all(&luts_dir).map_err(|e| e.to_string())?;
+        let hash = blake3::hash(cube_str.as_bytes()).to_hex();
+        let out_path = luts_dir.join(format!("sot_match_{}.cube", &hash[..12]));
+        std::fs::write(&out_path, cube_str).map_err(|e| e.to_string())?;
+        Ok(out_path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("SOT LUT generation failed: {e}"))?
+}
+
 /// Returns a skin presence ratio [0.0..1.0] across an image thumbnail
 pub fn calculate_skin_presence_ratio(thumb: &image::RgbImage) -> f32 {
     let (w, h) = thumb.dimensions();
@@ -608,35 +868,61 @@ pub struct HarmonizeSummary {
     pub hero_skin_temp_offset: f32,
 }
 
-/// Computes non-destructive harmonization offsets (EV, temp, tint, contrast)
-/// matching target image stats to hero reference stats with skin tone prioritization
+pub fn cluster_series_by_time_and_wb(items: &[(String, Option<i64>, f32)]) -> Vec<Vec<usize>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| items[i].1.unwrap_or(i as i64 * 10));
+
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = vec![order[0]];
+    let mut prev_ts = items[order[0]].1;
+    let mut prev_b = items[order[0]].2;
+
+    for &idx in order.iter().skip(1) {
+        let ts = items[idx].1;
+        let wb_b = items[idx].2;
+        let time_gap = match (prev_ts, ts) {
+            (Some(a), Some(b)) => (b - a).abs() > 600, // > 10 min
+            _ => false,
+        };
+        let wb_jump = (wb_b - prev_b).abs() > 0.045;
+        if time_gap || wb_jump {
+            clusters.push(std::mem::take(&mut current));
+        }
+        current.push(idx);
+        prev_ts = ts.or(prev_ts);
+        prev_b = wb_b;
+    }
+    if !current.is_empty() {
+        clusters.push(current);
+    }
+    clusters
+}
+
+/// Computes bounded non-destructive harmonization offsets (EV, temp, tint, contrast),
+/// clamped to ±1.5 EV and ±25 warmth so lighting transitions never blow out.
 pub fn compute_harmonize_deltas(
     hero_stats: &ImageColorStats,
     target_stats: &ImageColorStats,
 ) -> (f32, f32, f32, f32) {
-    // 1. Exposure delta in EV (proportional to Oklab L delta)
     let lum_diff = hero_stats.mean_oklab_l - target_stats.mean_oklab_l;
-    let exposure_ev = (lum_diff * 2.5).clamp(-2.5, 2.5);
+    let exposure_ev = (lum_diff * 2.5).clamp(-1.5, 1.5);
 
-    // 2. Skin warmth delta: if both hero and target contain identified human skin,
-    // match skin warmth directly to prevent background color changes from distorting faces
     let warmth_offset = match (hero_stats.mean_skin_oklab_b, target_stats.mean_skin_oklab_b) {
         (Some(hero_skin), Some(t_skin)) => (hero_skin - t_skin) * 160.0,
         _ => (hero_stats.mean_oklab_b - target_stats.mean_oklab_b) * 150.0,
     };
-    let delta_temp = warmth_offset.clamp(-35.0, 35.0);
+    let delta_temp = warmth_offset.clamp(-25.0, 25.0);
 
-    // 3. Tint delta (Oklab a green-magenta balance)
-    let delta_tint = ((hero_stats.mean_oklab_a - target_stats.mean_oklab_a) * 140.0).clamp(-25.0, 25.0);
-
-    // 4. Perceptual contrast delta
-    let delta_contrast = ((hero_stats.std_oklab_l - target_stats.std_oklab_l) * 45.0).clamp(-20.0, 20.0);
+    let delta_tint = ((hero_stats.mean_oklab_a - target_stats.mean_oklab_a) * 140.0).clamp(-20.0, 20.0);
+    let delta_contrast = ((hero_stats.std_oklab_l - target_stats.std_oklab_l) * 45.0).clamp(-18.0, 18.0);
 
     (exposure_ev, delta_temp, delta_tint, delta_contrast)
 }
 
-/// One-Click Photoshoot Batch Exposure & Skin Warmth Harmonizer
-/// Matches exposure and perceived skin warmth of 100+ frames to a single perfected "Hero" photo
+/// One-Click Photoshoot Batch Exposure & Skin Warmth Harmonizer with Time+WB clustering.
 #[tauri::command]
 pub async fn harmonize_photoshoot_series(
     hero_path: String,
@@ -650,7 +936,6 @@ pub async fn harmonize_photoshoot_series(
 
     let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
 
-    // 1. Analyze Hero Photo
     let (hero_src, _) = crate::library::sidecars::parse_virtual_path(&hero_path);
     let hero_img = crate::export::render_edited_image_for_batch(
         &hero_path,
@@ -671,13 +956,13 @@ pub async fn harmonize_photoshoot_series(
     })?;
 
     let hero_stats = compute_color_stats(&hero_img);
+    let hero_ts = crate::metadata::exif_processing::try_get_exif_creation_date(&hero_src).map(|d| d.timestamp());
     let target_lum = hero_stats.mean_oklab_l;
-
     let total = target_paths.len();
 
-    // 2. Harmonize Target Frames
-    for (idx, target_str) in target_paths.iter().enumerate() {
-        let (t_src, t_sidecar) = crate::library::sidecars::parse_virtual_path(target_str);
+    let mut target_analyzed: Vec<(String, ImageColorStats, Option<i64>)> = Vec::with_capacity(total);
+    for target_str in &target_paths {
+        let (t_src, _) = crate::library::sidecars::parse_virtual_path(target_str);
         let rendered_target = crate::export::render_edited_image_for_batch(
             target_str,
             &settings,
@@ -695,12 +980,48 @@ pub async fn harmonize_photoshoot_series(
             )
             .map_err(|e| e.to_string())
         });
-
         if let Ok(dyn_img) = rendered_target {
-            let t_stats = compute_color_stats(&dyn_img);
+            let stats = compute_color_stats(&dyn_img);
+            let ts = crate::metadata::exif_processing::try_get_exif_creation_date(&t_src)
+                .map(|d| d.timestamp());
+            target_analyzed.push((target_str.clone(), stats, ts));
+        }
+    }
 
+    let cluster_input: Vec<(String, Option<i64>, f32)> = target_analyzed
+        .iter()
+        .map(|(p, st, ts)| (p.clone(), *ts, st.mean_oklab_b))
+        .collect();
+    let clusters = cluster_series_by_time_and_wb(&cluster_input);
+
+    let mut processed = 0usize;
+    for cluster in clusters {
+        if cluster.is_empty() {
+            continue;
+        }
+        // Choose cluster anchor: hero if this cluster matches hero's time & WB regime, else cluster median frame
+        let cluster_matches_hero = cluster.iter().any(|&idx| {
+            let (_, ref st, ts) = target_analyzed[idx];
+            let close_ts = match (hero_ts, ts) {
+                (Some(a), Some(b)) => (a - b).abs() <= 600,
+                _ => true,
+            };
+            close_ts && (st.mean_oklab_b - hero_stats.mean_oklab_b).abs() <= 0.045
+        });
+
+        let anchor_stats = if cluster_matches_hero {
+            hero_stats.clone()
+        } else {
+            let mut by_lum: Vec<usize> = cluster.clone();
+            by_lum.sort_by(|&a, &b| target_analyzed[a].1.mean_oklab_l.total_cmp(&target_analyzed[b].1.mean_oklab_l));
+            target_analyzed[by_lum[by_lum.len() / 2]].1.clone()
+        };
+
+        for idx in cluster {
+            let (ref target_str, ref t_stats, _) = target_analyzed[idx];
+            let (_, t_sidecar) = crate::library::sidecars::parse_virtual_path(target_str);
             let (exposure_ev, delta_temp, delta_tint, delta_contrast) =
-                compute_harmonize_deltas(&hero_stats, &t_stats);
+                compute_harmonize_deltas(&anchor_stats, t_stats);
 
             let existing = crate::metadata::sidecar::load_sidecar(&t_sidecar).adjustments;
             let cur_exp = existing.get("exposure").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -719,14 +1040,16 @@ pub async fn harmonize_photoshoot_series(
                 vec![target_str.clone()],
                 adj_json,
                 app_handle.clone(),
-            ).await;
+            )
+            .await;
 
+            processed += 1;
             let _ = app_handle.emit(
                 "harmonize-progress",
                 serde_json::json!({
-                    "current": idx + 1,
+                    "current": processed,
                     "total": total,
-                    "message": format!("Harmonized shot {}/{} ({:+.2} EV, {:+.1}° warmth)", idx + 1, total, exposure_ev, delta_temp)
+                    "message": format!("Harmonized shot {}/{} ({:+.2} EV, {:+.1}° warmth)", processed, total, exposure_ev, delta_temp)
                 }),
             );
         }
@@ -1021,5 +1344,53 @@ mod tests {
         assert_eq!(temp, 0.0, "Identical frames must have 0 temp delta");
         assert_eq!(tint, 0.0, "Identical frames must have 0 tint delta");
         assert_eq!(contrast, 0.0, "Identical frames must have 0 contrast delta");
+    }
+
+    #[test]
+    fn test_sliced_optimal_transport_matches_reference_distribution_and_protects_skin() {
+        let mut t = Vec::new();
+        let mut r = Vec::new();
+        for i in 0..64 {
+            let f = i as f32 / 63.0;
+            t.push([0.30 + 0.3 * f, -0.04, -0.04]);
+            r.push([0.55 + 0.3 * f, 0.06, 0.08]);
+        }
+        let moved = sliced_optimal_transport_oklab(&t, &r, 12, 0.5);
+        let mean_before: f32 = t.iter().map(|p| p[0]).sum::<f32>() / t.len() as f32;
+        let mean_after: f32 = moved.iter().map(|p| p[0]).sum::<f32>() / moved.len() as f32;
+        let mean_ref: f32 = r.iter().map(|p| p[0]).sum::<f32>() / r.len() as f32;
+        assert!((mean_ref - mean_after).abs() < (mean_ref - mean_before).abs());
+
+        let w_skin = calculate_skin_tone_weight(0.65, 0.055, 0.075);
+        let w_cyan = calculate_skin_tone_weight(0.60, -0.10, -0.08);
+        assert!(w_skin > 0.7 && w_cyan < 0.05);
+    }
+
+    #[test]
+    fn test_cluster_series_splits_on_10min_gap_and_clamps_deltas() {
+        let clusters = cluster_series_by_time_and_wb(&[
+            ("a.arw".into(), Some(1000), 0.02),
+            ("b.arw".into(), Some(1030), 0.03),
+            ("c.arw".into(), Some(2000), 0.02), // 1000s > 600s -> new cluster
+        ]);
+        assert_eq!(clusters.len(), 2);
+
+        let extreme_a = ImageColorStats {
+            mean_oklab_l: 0.9, mean_oklab_a: 0.2, mean_oklab_b: 0.4,
+            std_oklab_l: 0.3, std_oklab_a: 0.05, std_oklab_b: 0.05,
+            mean_r: 220.0, mean_g: 200.0, mean_b: 180.0,
+            shadow_tint: (0.0, 0.0, 0.0), highlight_tint: (0.0, 0.0, 0.0),
+            skin_presence_ratio: 0.0, mean_skin_oklab_b: None,
+        };
+        let extreme_b = ImageColorStats {
+            mean_oklab_l: 0.1, mean_oklab_a: -0.2, mean_oklab_b: -0.3,
+            std_oklab_l: 0.05, std_oklab_a: 0.05, std_oklab_b: 0.05,
+            mean_r: 20.0, mean_g: 30.0, mean_b: 40.0,
+            shadow_tint: (0.0, 0.0, 0.0), highlight_tint: (0.0, 0.0, 0.0),
+            skin_presence_ratio: 0.0, mean_skin_oklab_b: None,
+        };
+        let (ev, temp, _, _) = compute_harmonize_deltas(&extreme_a, &extreme_b);
+        assert!((ev - 1.5).abs() < 1e-5);
+        assert!((temp - 25.0).abs() < 1e-5);
     }
 }

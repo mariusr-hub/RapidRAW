@@ -332,7 +332,7 @@ async fn run_edit_in(
         EditInMode::Original => source_path.clone(),
         EditInMode::Rendered => {
             let target = output_destination(&app, &source_path, "tif");
-            render_tiff(path, &target, current_edit_adjustments, state, app_handle).await?;
+            render_tiff(path, &target, current_edit_adjustments, state, app_handle.clone()).await?;
             target
         }
     };
@@ -356,7 +356,18 @@ async fn run_edit_in(
                 &cancelled,
             )?,
         };
-        Ok(output.map(|p| p.to_string_lossy().to_string()))
+        if let Some(ref out_path) = output {
+            let out_str = out_path.to_string_lossy().to_string();
+            let settings = crate::app::settings::load_settings(app_handle.clone()).unwrap_or_default();
+            crate::library::thumbnails::regenerate_thumbnails(
+                std::iter::once(out_str.clone()),
+                &app_handle,
+                &settings,
+                false,
+            );
+            return Ok(Some(out_str));
+        }
+        Ok(None)
     })
     .await
     .map_err(|e| format!("Edit task failed: {}", e))?

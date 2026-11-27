@@ -700,6 +700,7 @@ export default function PresetsPanel({ onNavigateToCommunity }: PresetsPanelProp
     duplicatePreset,
     exportPresetsToFile,
     importPresetsFromFiles,
+    importPresetsFromFolder,
     isLoading,
     movePreset,
     overwritePreset,
@@ -1256,6 +1257,28 @@ export default function PresetsPanel({ onNavigateToCommunity }: PresetsPanelProp
       });
     } catch (error) {
       console.error('Failed to import presets:', error);
+    }
+  };
+
+  const handleImportPresetFolder = async () => {
+    try {
+      const selectedDir = await openDialog({
+        directory: true,
+        multiple: false,
+        title: t('editor.presets.dialog.importPresetsTitle'),
+      });
+      if (!selectedDir || Array.isArray(selectedDir)) return;
+
+      const { failures } = await importPresetsFromFolder(selectedDir);
+      setFolderPreviewsGenerated(new Set<string>());
+      setPreviews({});
+
+      failures.forEach((failure: PresetImportFailure) => {
+        console.error(`Failed to import ${failure.fileName}: ${failure.error}`);
+        toast.error(t('editor.presets.toasts.importFailed', { fileName: failure.fileName, error: failure.error }));
+      });
+    } catch (error) {
+      console.error('Failed to import preset folder:', error);
     }
   };
 
@@ -2009,6 +2032,14 @@ export default function PresetsPanel({ onNavigateToCommunity }: PresetsPanelProp
               data-tooltip={t('editor.presets.tooltips.import')}
             >
               <FileUp size={18} />
+            </button>
+            <button
+              className="p-2 rounded-full hover:bg-surface transition-colors"
+              disabled={isLoading}
+              onClick={handleImportPresetFolder}
+              data-tooltip="Import Preset Folder..."
+            >
+              <FolderPlus size={18} />
             </button>
             <button
               className="p-2 rounded-full hover:bg-surface transition-colors"

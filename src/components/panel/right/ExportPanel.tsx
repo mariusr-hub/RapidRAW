@@ -340,6 +340,8 @@ export default function ExportPanel({
     setEnableWatermark,
     watermarkPath,
     setWatermarkPath,
+    watermarkText,
+    setWatermarkText,
     watermarkAnchor,
     setWatermarkAnchor,
     watermarkScale,
@@ -562,9 +564,10 @@ export default function ExportPanel({
       stripGps,
       exportMasks: exportMasks,
       watermark:
-        enableWatermark && watermarkPath
+        enableWatermark && (watermarkPath || watermarkText.trim())
           ? {
-              path: watermarkPath,
+              path: watermarkPath ?? '',
+              text: watermarkText.trim() || null,
               anchor: watermarkAnchor,
               scale: watermarkScale,
               spacing: watermarkSpacing,
@@ -627,6 +630,7 @@ export default function ExportPanel({
     filenameTemplate,
     enableWatermark,
     watermarkPath,
+    watermarkText,
     watermarkAnchor,
     watermarkScale,
     watermarkSpacing,
@@ -674,9 +678,10 @@ export default function ExportPanel({
       exportMasks: exportMasks,
       exportOriginal: exportOriginal ? { crop: originalCrop, keepExposure: originalKeepExposure } : null,
       watermark:
-        enableWatermark && watermarkPath
+        enableWatermark && (watermarkPath || watermarkText.trim())
           ? {
-              path: watermarkPath,
+              path: watermarkPath ?? '',
+              text: watermarkText.trim() || null,
               anchor: watermarkAnchor,
               scale: watermarkScale,
               spacing: watermarkSpacing,
@@ -1095,6 +1100,29 @@ export default function ExportPanel({
                   />
                   {enableWatermark && (
                     <div className="space-y-4 pl-2 border-l-2 border-surface">
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <Text variant={TextVariants.label}>EXIF / Text Watermark</Text>
+                          <button
+                            type="button"
+                            disabled={isExporting}
+                            onClick={() =>
+                              setWatermarkText('{camera} · {lens} · {focal}mm · f/{aperture} · {shutter} · ISO {iso} · © {year}')
+                            }
+                            className="text-[11px] px-2 py-0.5 rounded bg-surface hover:bg-card-active text-accent transition-colors"
+                          >
+                            + EXIF Template
+                          </button>
+                        </div>
+                        <input
+                          type="text"
+                          value={watermarkText}
+                          onChange={(e) => setWatermarkText(e.target.value)}
+                          disabled={isExporting}
+                          placeholder="{camera} · {lens} · © {year}"
+                          className="w-full bg-bg-primary border border-surface rounded-md px-2 py-1.5 text-xs text-text-primary focus:outline-hidden focus:border-accent"
+                        />
+                      </div>
                       <div className={isExporting ? 'opacity-50 pointer-events-none' : ''}>
                         <ImagePicker
                           label={t('export.watermark.watermarkImage')}
@@ -1103,7 +1131,7 @@ export default function ExportPanel({
                           onClear={() => setWatermarkPath(null)}
                         />
                       </div>
-                      {watermarkPath && (
+                      {(watermarkPath || watermarkText.trim()) && (
                         <>
                           <Dropdown
                             options={anchorOptions}

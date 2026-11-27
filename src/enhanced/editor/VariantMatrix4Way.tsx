@@ -110,8 +110,12 @@ export const VariantMatrix4Way: React.FC = () => {
     }
   };
 
-  const [syncZoom, setSyncZoom] = useState<number>(1.0);
-  const [syncPan, setSyncPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const compareViewport = useEditorStore((state) => state.compareViewport);
+  const setCompareViewport = useEditorStore((state) => state.setCompareViewport);
+  const syncZoom = compareViewport.zoom;
+  const syncPan = { x: compareViewport.panX, y: compareViewport.panY };
+  const setSyncZoom = (zoom: number) => setCompareViewport({ zoom });
+  const setSyncPan = (pan: { x: number; y: number }) => setCompareViewport({ panX: pan.x, panY: pan.y });
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const dragStartRef = React.useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 

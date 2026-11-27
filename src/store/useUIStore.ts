@@ -12,8 +12,9 @@ import {
   MergeSettings,
 } from '../types/library';
 import { Panel, UiVisibility, PanelRegion, CollapsibleSectionsState } from '../types/ui';
-import { WorkspaceState } from '../types/settings';
+import { SavedWorkspacePreset, WorkspaceState } from '../types/settings';
 import { useEditorStore } from './useEditorStore';
+import { useSettingsStore } from './useSettingsStore';
 import { pickCropGeometry } from '../utils/adjustments';
 
 export type SwitcherPlacement = 'bottom' | 'right' | 'left' | 'top';
@@ -493,6 +494,8 @@ export interface UIState {
   toggleFullScreen: () => void;
   toggleViewerWindow: () => void;
   resetWorkspaceLayout: (isTetheringSupported?: boolean) => WorkspaceState;
+  applyWorkspacePreset: (presetId: string) => void;
+  saveCurrentWorkspacePreset: (name: string) => void;
 }
 
 export const useUIStore = create<UIState>((set, get) => ({
@@ -766,6 +769,104 @@ export const useUIStore = create<UIState>((set, get) => ({
     return defaultWorkspace;
   },
 
+  applyWorkspacePreset: (presetId: string) => {
+    const state = get();
+    const settingsState = useSettingsStore.getState();
+    const appSettings = settingsState.appSettings;
+    const isTetheringSupported = Boolean(appSettings?.workspace?.panelLayout?.leftTop?.includes(Panel.Tethering));
+    const base = reconcileWorkspace(undefined, isTetheringSupported);
+
+    const custom = appSettings?.savedWorkspacePresets?.find((p) => p.id === presetId);
+    const builtin = BUILTIN_WORKSPACE_PRESETS.find((p) => p.id === presetId);
+
+    const chosen: SavedWorkspacePreset | undefined =
+      custom ??
+      (builtin
+        ? {
+            id: builtin.id,
+            name: builtin.name,
+            workspace: {
+              ...base,
+              ...builtin.workspacePatch,
+              activePanels: { ...base.activePanels, ...(builtin.workspacePatch.activePanels ?? {}) },
+            },
+            hideCollapsedPanels: builtin.hideCollapsedPanels,
+            activeToolsOnly: builtin.activeToolsOnly,
+            bottomPanelHeight: builtin.bottomPanelHeight,
+          }
+        : undefined);
+
+    if (!chosen) return;
+
+    const ws = chosen.workspace;
+    set({
+      leftPanelWidth: ws.leftPanelWidth,
+      rightPanelWidth: ws.rightPanelWidth,
+      leftTopHeight: ws.leftTopHeight,
+      rightTopHeight: ws.rightTopHeight,
+      panelLayout: ws.panelLayout,
+      activePanels: ws.activePanels,
+      panelSwitcherPlacement: ws.panelSwitcherPlacement,
+      filmstripColumns: ws.filmstripColumns,
+      filmstripShowFileInfo: ws.filmstripShowFileInfo,
+      bottomPanelHeight: chosen.bottomPanelHeight ?? state.bottomPanelHeight,
+      showActiveToolsOnly: chosen.activeToolsOnly,
+      activePanel: ws.activePanels.rightTop || ws.activePanels.rightBottom || state.activePanel,
+      renderedPanel: ws.activePanels.rightTop || ws.activePanels.rightBottom || state.renderedPanel,
+      uiVisibility: builtin?.uiVisibility ?? { filmstrip: true, leftPanel: true, rightPanel: true, quickFilter: false },
+    });
+
+    if (appSettings) {
+      settingsState.handleSettingsChange({
+        ...appSettings,
+        workspace: ws,
+        hideCollapsedPanels: chosen.hideCollapsedPanels,
+        enableToolFocusMode: chosen.activeToolsOnly,
+        activeWorkspacePreset: chosen.id,
+      });
+    }
+  },
+
+  saveCurrentWorkspacePreset: (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const state = get();
+    const settingsState = useSettingsStore.getState();
+    const appSettings = settingsState.appSettings;
+    if (!appSettings) return;
+
+    const currentWs: WorkspaceState = {
+      leftPanelWidth: state.leftPanelWidth,
+      rightPanelWidth: state.rightPanelWidth,
+      leftTopHeight: state.leftTopHeight,
+      rightTopHeight: state.rightTopHeight,
+      panelLayout: state.panelLayout,
+      activePanels: state.activePanels,
+      panelSwitcherPlacement: state.panelSwitcherPlacement,
+      filmstripColumns: state.filmstripColumns,
+      filmstripShowFileInfo: state.filmstripShowFileInfo,
+    };
+
+    const newPreset: SavedWorkspacePreset = {
+      id: `custom_${crypto.randomUUID().slice(0, 8)}`,
+      name: trimmed,
+      workspace: currentWs,
+      hideCollapsedPanels: Boolean(appSettings.hideCollapsedPanels),
+      activeToolsOnly: state.showActiveToolsOnly,
+      bottomPanelHeight: state.bottomPanelHeight,
+    };
+
+    const existing = (appSettings.savedWorkspacePresets ?? []).filter(
+      (p) => p.name.toLowerCase() !== trimmed.toLowerCase(),
+    );
+
+    settingsState.handleSettingsChange({
+      ...appSettings,
+      savedWorkspacePresets: [...existing, newPreset],
+      activeWorkspacePreset: newPreset.id,
+    });
+  },
+
   customEscapeHandler: null,
   setCustomEscapeHandler: (handler) => set({ customEscapeHandler: handler }),
   imageSelectHandler: null,
@@ -792,6 +893,90 @@ useEditorStore.subscribe((state, prev) => {
     useUIStore.setState({ pendingQuickAction: null });
   }
 });
+
+export const BUILTIN_WORKSPACE_PRESETS: Array<{
+  id: string;
+  name: string;
+  workspacePatch: Partial<WorkspaceState>;
+  hideCollapsedPanels: boolean;
+  activeToolsOnly: boolean;
+  bottomPanelHeight?: number;
+  uiVisibility?: UiVisibility;
+}> = [
+  {
+    id: 'default',
+    name: 'Default',
+    workspacePatch: {},
+    hideCollapsedPanels: false,
+    activeToolsOnly: false,
+    bottomPanelHeight: DEFAULT_BOTTOM_PANEL_HEIGHT,
+  },
+  {
+    id: 'compact_laptop_13',
+    name: 'Compact Laptop 13"',
+    workspacePatch: {
+      leftPanelWidth: 260,
+      rightPanelWidth: 275,
+      filmstripColumns: 1,
+      filmstripShowFileInfo: false,
+      activePanels: {
+        leftTop: Panel.FolderTree,
+        leftBottom: null,
+        rightTop: Panel.Adjustments,
+        rightBottom: null,
+      },
+    },
+    hideCollapsedPanels: true,
+    activeToolsOnly: true,
+    bottomPanelHeight: 110,
+  },
+  {
+    id: 'culling',
+    name: 'Culling',
+    workspacePatch: {
+      leftPanelWidth: 250,
+      rightPanelWidth: 260,
+      activePanels: {
+        leftTop: Panel.FolderTree,
+        leftBottom: null,
+        rightTop: Panel.Metadata,
+        rightBottom: null,
+      },
+    },
+    hideCollapsedPanels: true,
+    activeToolsOnly: false,
+    bottomPanelHeight: 168,
+    uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: false, quickFilter: true },
+  },
+  {
+    id: 'portrait_retouch',
+    name: 'Portrait & Retouch',
+    workspacePatch: {
+      activePanels: {
+        leftTop: Panel.Tones,
+        leftBottom: null,
+        rightTop: Panel.Masks,
+        rightBottom: null,
+      },
+    },
+    hideCollapsedPanels: false,
+    activeToolsOnly: true,
+  },
+  {
+    id: 'color_grading',
+    name: 'Color Grading',
+    workspacePatch: {
+      activePanels: {
+        leftTop: Panel.Tones,
+        leftBottom: null,
+        rightTop: Panel.Adjustments,
+        rightBottom: null,
+      },
+    },
+    hideCollapsedPanels: false,
+    activeToolsOnly: false,
+  },
+];
 
 export const openMergeModal = (kind: MergeKind, sourcePaths: Array<string>) => {
   useUIStore.getState().setUI({

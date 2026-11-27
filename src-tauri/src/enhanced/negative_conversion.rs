@@ -38,6 +38,16 @@ pub struct NegativeConversionParams {
     pub shadow_crossover: Option<f32>,
     pub highlight_crossover: Option<f32>,
     pub auto_crop_borders: Option<bool>,
+    #[serde(default)]
+    pub scanner_profile: Option<String>,
+    #[serde(default)]
+    pub roll_locked: Option<bool>,
+    #[serde(default)]
+    pub locked_bounds_min: Option<[f32; 3]>,
+    #[serde(default)]
+    pub locked_bounds_max: Option<[f32; 3]>,
+    #[serde(default)]
+    pub shadow_neutralize: Option<f32>,
 }
 
 impl Default for NegativeConversionParams {
@@ -57,6 +67,11 @@ impl Default for NegativeConversionParams {
             shadow_crossover: Some(0.0),
             highlight_crossover: Some(0.0),
             auto_crop_borders: Some(false),
+            scanner_profile: Some("neutral_flat".to_string()),
+            roll_locked: Some(false),
+            locked_bounds_min: None,
+            locked_bounds_max: None,
+            shadow_neutralize: Some(0.25),
         }
     }
 }
@@ -226,6 +241,55 @@ pub fn detect_negative_film_crop_bounds(img: &DynamicImage) -> (u32, u32, u32, u
     }
 }
 
+pub fn neutralize_shadow_crossover(r: f32, g: f32, b: f32, strength: f32) -> (f32, f32, f32) {
+    let s = strength.clamp(0.0, 1.0);
+    if s <= 1e-4 {
+        return (r, g, b);
+    }
+    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if luma >= 0.30 {
+        return (r, g, b);
+    }
+    let t = (0.30 - luma) / 0.30;
+    let factor = s * t * t;
+    (
+        (r + (luma - r) * factor * 0.85).clamp(0.0, 1.0),
+        (g + (luma - g) * factor * 0.95).clamp(0.0, 1.0),
+        (b + (luma - b) * factor * 0.95).clamp(0.0, 1.0),
+    )
+}
+
+pub fn apply_scanner_tone_profile(r: f32, g: f32, b: f32, profile: &str) -> (f32, f32, f32) {
+    match profile {
+        "frontier_sp3000" => {
+            let scurve = |x: f32| -> f32 {
+                let c = x.clamp(0.0, 1.0);
+                (c * c * (3.0 - 2.0 * c) * 0.35 + c * 0.65).clamp(0.0, 1.0)
+            };
+            let sr = scurve(r);
+            let sg = scurve(g);
+            let sb = scurve(b);
+            let luma = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb;
+            let mid_w = (4.0 * luma * (1.0 - luma)).clamp(0.0, 1.0);
+            let shd_w = (1.0 - luma * 2.5).clamp(0.0, 1.0);
+            (
+                (sr + 0.025 * mid_w - 0.015 * shd_w).clamp(0.0, 1.0),
+                (sg + 0.012 * mid_w + 0.008 * shd_w).clamp(0.0, 1.0),
+                (sb - 0.018 * mid_w + 0.014 * shd_w).clamp(0.0, 1.0),
+            )
+        }
+        "noritsu_hs1800" => {
+            let lift = |x: f32| -> f32 {
+                let c = x.clamp(0.0, 1.0);
+                let toe_lift = 0.035 * (1.0 - c).powi(3);
+                (c + toe_lift).clamp(0.0, 1.0)
+            };
+            (lift(r), lift(g), lift(b))
+        }
+        _ => (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)),
+    }
+}
+
 fn run_pipeline(
     input: &DynamicImage,
     params: &NegativeConversionParams,
@@ -267,6 +331,14 @@ fn run_pipeline(
 
     let bounds = if let Some(b) = override_bounds {
         b
+    } else if params.roll_locked.unwrap_or(false)
+        && let (Some(bmin), Some(bmax)) = (params.locked_bounds_min, params.locked_bounds_max)
+    {
+        [
+            ChannelBounds { min: bmin[0], max: bmax[0].max(bmin[0] + 1e-4) },
+            ChannelBounds { min: bmin[1], max: bmax[1].max(bmin[1] + 1e-4) },
+            ChannelBounds { min: bmin[2], max: bmax[2].max(bmin[2] + 1e-4) },
+        ]
     } else {
         analyze_bounds(&log_pixels, width as usize, height as usize)
     };
@@ -391,6 +463,14 @@ fn run_pipeline(
                 let h_weight = (luma - 0.60) / 0.40;
                 b += highlight_cross * 0.08 * h_weight;
                 r -= highlight_cross * 0.05 * h_weight;
+            }
+
+            let shadow_neut = params.shadow_neutralize.unwrap_or(0.0);
+            if shadow_neut > 1e-3 {
+                (r, g, b) = neutralize_shadow_crossover(r, g, b, shadow_neut);
+            }
+            if let Some(scanner) = params.scanner_profile.as_deref() {
+                (r, g, b) = apply_scanner_tone_profile(r, g, b, scanner);
             }
 
             // Monochrome profile conversion
@@ -739,6 +819,17 @@ pub async fn convert_negatives(
 ) -> Result<Vec<String>, String> {
     tokio::task::spawn_blocking(move || {
         let mut results = Vec::new();
+        let mut roll_bounds: Option<[ChannelBounds; 3]> = if params.roll_locked.unwrap_or(false)
+            && let (Some(bmin), Some(bmax)) = (params.locked_bounds_min, params.locked_bounds_max)
+        {
+            Some([
+                ChannelBounds { min: bmin[0], max: bmax[0].max(bmin[0] + 1e-4) },
+                ChannelBounds { min: bmin[1], max: bmax[1].max(bmin[1] + 1e-4) },
+                ChannelBounds { min: bmin[2], max: bmax[2].max(bmin[2] + 1e-4) },
+            ])
+        } else {
+            None
+        };
 
         for (i, path_str) in paths.iter().enumerate() {
             let _ = app_handle.emit(
@@ -764,15 +855,23 @@ pub async fn convert_negatives(
             }
             .map_err(|e| e.to_string())?;
 
-            let bounds_ref = downscale_f32_image(&img, 1080, 1080);
-            let ref_rgb = bounds_ref.to_rgb32f();
-            let (ref_w, ref_h) = ref_rgb.dimensions();
-            let log_pixels: Vec<f32> = ref_rgb
-                .as_raw()
-                .par_iter()
-                .map(|&v| -v.clamp(1e-6, 1.0).log10())
-                .collect();
-            let bounds = analyze_bounds(&log_pixels, ref_w as usize, ref_h as usize);
+            let bounds = if let Some(locked) = roll_bounds {
+                locked
+            } else {
+                let bounds_ref = downscale_f32_image(&img, 1080, 1080);
+                let ref_rgb = bounds_ref.to_rgb32f();
+                let (ref_w, ref_h) = ref_rgb.dimensions();
+                let log_pixels: Vec<f32> = ref_rgb
+                    .as_raw()
+                    .par_iter()
+                    .map(|&v| -v.clamp(1e-6, 1.0).log10())
+                    .collect();
+                let computed = analyze_bounds(&log_pixels, ref_w as usize, ref_h as usize);
+                if params.roll_locked.unwrap_or(false) {
+                    roll_bounds = Some(computed);
+                }
+                computed
+            };
 
             let processed = run_pipeline(&img, &params, Some(bounds));
 
@@ -925,6 +1024,41 @@ mod tests {
         let cropped_pos = run_pipeline(&dyn_img, &params_with_autocrop, None);
         assert_eq!(cropped_pos.width(), crop_w, "Converted positive must match auto-cropped film width");
         assert_eq!(cropped_pos.height(), crop_h, "Converted positive must match auto-cropped film height");
+    }
+
+    #[test]
+    fn test_scanner_tone_profiles_and_shadow_crossover_neutralizer() {
+        let (r, g, b) = neutralize_shadow_crossover(0.06, 0.14, 0.14, 1.0);
+        assert!(g - r < 0.08 && b - r < 0.08);
+
+        let f = apply_scanner_tone_profile(0.5, 0.5, 0.5, "frontier_sp3000");
+        let n = apply_scanner_tone_profile(0.1, 0.1, 0.1, "noritsu_hs1800");
+        assert!(f.0 > f.2, "Frontier midtone should add warm R over B");
+        assert!(n.0 > 0.11, "Noritsu should gently lift deep shadow toe");
+    }
+
+    #[test]
+    fn test_roll_locked_bounds_produce_identical_exposure_across_frames() {
+        let mut frame1 = Rgb32FImage::from_pixel(16, 16, image::Rgb([0.4, 0.3, 0.2]));
+        frame1.put_pixel(4, 4, image::Rgb([0.1, 0.08, 0.05]));
+        frame1.put_pixel(5, 5, image::Rgb([0.8, 0.7, 0.6]));
+        let dyn1 = DynamicImage::ImageRgb32F(frame1);
+
+        let locked = NegativeConversionParams {
+            roll_locked: Some(true),
+            locked_bounds_min: Some([0.05, 0.05, 0.05]),
+            locked_bounds_max: Some([1.2, 1.2, 1.2]),
+            ..Default::default()
+        };
+        let mut frame2 = Rgb32FImage::from_pixel(16, 16, image::Rgb([0.4, 0.3, 0.2]));
+        frame2.put_pixel(2, 2, image::Rgb([0.95, 0.95, 0.95]));
+        let dyn2 = DynamicImage::ImageRgb32F(frame2);
+
+        let out1 = run_pipeline(&dyn1, &locked, None).to_rgb32f();
+        let out2 = run_pipeline(&dyn2, &locked, None).to_rgb32f();
+        let p1 = out1.get_pixel(8, 8);
+        let p2 = out2.get_pixel(8, 8);
+        assert!((p1[0] - p2[0]).abs() < 1e-4 && (p1[1] - p2[1]).abs() < 1e-4);
     }
 }
 

@@ -7,6 +7,7 @@ pub mod records;
 pub mod settings;
 pub mod size_estimate;
 pub mod tasks;
+pub mod typography;
 pub mod watermark;
 
 use crate::adjustments::develop_defaults;
@@ -31,7 +32,7 @@ use crate::decode::as_shot::as_shot;
 use crate::decode::formats::is_raw_file;
 use crate::decode::image_loader::prepare_base_image;
 use crate::export::encode::{save_image_with_metadata, set_timestamps_from_exif};
-use crate::export::geometry::apply_export_geometry_and_watermark;
+use crate::export::geometry::apply_export_geometry_and_watermark_with_exif;
 use crate::export::masks::export_masks_for_image;
 use crate::export::original::{
     load_export_source_image, original_export_adjustments, original_output_path,
@@ -440,9 +441,26 @@ fn process_image_for_export(
         }
         rendered
     };
+    let sidecar_exif = if export_settings
+        .watermark
+        .as_ref()
+        .and_then(|w| w.text.as_ref())
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        let (_, sidecar_path) = crate::library::sidecars::parse_virtual_path(path);
+        crate::metadata::sidecar::load_sidecar(&sidecar_path).exif
+    } else {
+        None
+    };
+
     let mut images = rendered.into_iter().map(|image| {
-        apply_export_geometry_and_watermark(image, export_settings, color_space)
-            .map(|(image, _)| image)
+        apply_export_geometry_and_watermark_with_exif(
+            image,
+            export_settings,
+            color_space,
+            sidecar_exif.as_ref(),
+        )
+        .map(|(image, _)| image)
     });
 
     Ok(ExportImage {
@@ -1275,25 +1293,13 @@ pub async fn run_headless_export(
     cli_println!("Starting headless export...");
     let state = app_handle.state::<AppState>();
 
-    let source_path = std::path::Path::new(&session.source);
-    if !source_path.exists() {
-        return Err(format!("Source path does not exist: {}", session.source));
-    }
-
-    let mut paths = Vec::new();
-    if source_path.is_dir() {
-        let images = crate::library::listing::list_images_recursive(
-            session.source.clone(),
-            app_handle.clone(),
-        )
-        .await?;
-        paths = images.into_iter().map(|img| img.path).collect();
-    } else {
-        paths.push(session.source.clone());
-    }
+    let paths: Vec<String> = crate::app::launch_request::resolve_headless_sources(&session.source)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
 
     if paths.is_empty() {
-        return Err("No supported images found at the source path.".to_string());
+        return Err(format!("No supported images found at source '{}'.", session.source));
     }
 
     let output_path = std::path::Path::new(&session.output);
@@ -1336,6 +1342,22 @@ pub async fn run_headless_export(
     };
 
     let mut custom_adjustments = None;
+    if let Some(preset_ref) = &session.preset {
+        let preset_items = crate::library::presets::load_presets(app_handle.clone())?;
+        let target_lower = preset_ref.trim().to_ascii_lowercase();
+        let found = preset_items.iter().find_map(|item| match item {
+            crate::library::presets::PresetItem::Preset(p) => {
+                (p.id == *preset_ref || p.name.to_ascii_lowercase() == target_lower).then(|| p.clone())
+            }
+            crate::library::presets::PresetItem::Folder(f) => f.children.iter().find_map(|p| {
+                (p.id == *preset_ref || p.name.to_ascii_lowercase() == target_lower)
+                    .then(|| p.clone())
+            }),
+        });
+        let matched = found.ok_or_else(|| format!("Preset '{}' not found.", preset_ref))?;
+        cli_println!("Applying preset '{}' ({}) to export.", matched.name, matched.id);
+        custom_adjustments = Some(matched.adjustments);
+    }
     if let Some(adj_path) = &session.adjustments_override {
         let content = std::fs::read_to_string(adj_path)
             .map_err(|e| format!("Failed to read adjustments file: {}", e))?;

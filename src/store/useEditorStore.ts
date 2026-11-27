@@ -84,6 +84,7 @@ interface EditorState {
   showOriginal: boolean;
   compareView: CompareView;
   compareMode: CompareMode;
+  compareViewport: { zoom: number; panX: number; panY: number };
   splitPosition: number;
   snapshots: GradingSnapshot[];
   activeSnapshotId: string | null;
@@ -167,6 +168,7 @@ interface EditorState {
 
   // Actions
   setEditor: (updater: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void;
+  setCompareViewport: (updater: Partial<{ zoom: number; panX: number; panY: number }>) => void;
   pushHistory: (newAdjustments: Adjustments, label?: string) => void;
   undo: () => void;
   redo: () => void;
@@ -242,6 +244,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   showOriginal: false,
   compareView: 'off',
   compareMode: 'none',
+  compareViewport: { zoom: 1, panX: 0, panY: 0 },
   splitPosition: 0.5,
   snapshots: [],
   activeSnapshotId: null,
@@ -311,6 +314,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   patchesSentToBackend: new Set<string>(),
 
   setEditor: (updater) => set((state) => (typeof updater === 'function' ? updater(state) : updater)),
+  setCompareViewport: (updater) =>
+    set((state) => ({ compareViewport: { ...state.compareViewport, ...updater } })),
 
   pushHistory: (newAdj, label) =>
     set((state) => {

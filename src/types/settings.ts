@@ -46,6 +46,15 @@ export interface WorkspaceState {
   filmstripShowFileInfo: boolean;
 }
 
+export interface SavedWorkspacePreset {
+  id: string;
+  name: string;
+  workspace: WorkspaceState;
+  hideCollapsedPanels: boolean;
+  activeToolsOnly: boolean;
+  bottomPanelHeight?: number | null;
+}
+
 export interface CustomAspectRatio {
   width: number;
   height: number;
@@ -200,6 +209,8 @@ export interface AppSettings {
   aiCacheLimitsMigratedV1?: boolean;
   groupAssociatedFiles?: boolean;
   workspace?: WorkspaceState;
+  savedWorkspacePresets?: SavedWorkspacePreset[];
+  activeWorkspacePreset?: string | null;
   immich?: ImmichSettings;
 }
 
