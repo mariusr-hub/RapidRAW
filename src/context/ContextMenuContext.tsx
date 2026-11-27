@@ -66,21 +66,24 @@ function SubMenu({ cancelCloseSubmenu, closeSubmenu, hideContextMenu, options, p
         return;
       }
 
+      const viewportPadding = 8;
+      const clampedHeight = Math.min(subMenuHeight, Math.max(120, window.innerHeight - viewportPadding * 2));
+
       let top = parentRect.top;
       let left = parentRect.right - 4;
 
-      if (left + subMenuWidth > window.innerWidth) {
+      if (left + subMenuWidth > window.innerWidth - viewportPadding) {
         left = parentRect.left - subMenuWidth + 4;
       }
-      if (left < 0) {
-        left = 5;
+      if (left < viewportPadding) {
+        left = viewportPadding;
       }
 
-      if (top + subMenuHeight > window.innerHeight) {
-        top = window.innerHeight - subMenuHeight - 5;
+      if (top + clampedHeight > window.innerHeight - viewportPadding) {
+        top = window.innerHeight - clampedHeight - viewportPadding;
       }
-      if (top < 0) {
-        top = 5;
+      if (top < viewportPadding) {
+        top = viewportPadding;
       }
 
       setStyle({ top: `${top}px`, left: `${left}px`, opacity: 1 });
@@ -144,7 +147,7 @@ function SubMenu({ cancelCloseSubmenu, closeSubmenu, hideContextMenu, options, p
         <div
           className={clsx(
             'backdrop-blur-md rounded-lg shadow-xl',
-            !CustomComponent && 'bg-surface/95 p-2 w-max min-w-56 max-w-72',
+            !CustomComponent && 'bg-surface/95 p-2 w-max min-w-56 max-w-72 max-h-[calc(100vh-16px)] overflow-y-auto custom-scrollbar',
           )}
           role="menu"
         >
@@ -221,8 +224,9 @@ function MenuItem({ option, path, hideContextMenu }: MenuItemProps) {
             option.onClick();
             hideContextMenu();
           }
-          if (!option.disabled && option.submenu && hasInteractiveSubmenu) {
-            openSubmenu(path);
+          if (!option.disabled && option.submenu) {
+            const parentPath = path.slice(0, -1);
+            openSubmenu(isSubmenuOpen && !hasInteractiveSubmenu ? (parentPath.length > 0 ? parentPath : null) : path);
           }
         }}
         onMouseDown={(event) => {
@@ -237,12 +241,15 @@ function MenuItem({ option, path, hideContextMenu }: MenuItemProps) {
         ref={itemRef}
         role="menuitem"
       >
-        <div className="flex items-center gap-3">
-          {option.color && <div className="w-3 h-3 rounded-full" style={{ backgroundColor: option.color }}></div>}
-          {option.icon && <option.icon size={16} />}
-          <span>{option.label}</span>
+        <div className="flex items-center gap-3 min-w-0">
+          {option.color && <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: option.color }}></div>}
+          {option.icon && <option.icon size={16} className="shrink-0" />}
+          <span className="truncate">{option.label}</span>
         </div>
-        {option.submenu && <ChevronRight className="shrink-0" size={16} />}
+        <div className="flex items-center gap-1.5 shrink-0 ml-2">
+          {option.hint && <span className="text-[11px] text-text-secondary/70">{option.hint}</span>}
+          {option.submenu && <ChevronRight className="shrink-0" size={16} />}
+        </div>
       </button>
 
       <AnimatePresence>
@@ -264,6 +271,20 @@ function MenuItem({ option, path, hideContextMenu }: MenuItemProps) {
 function ContextMenu() {
   const { menuState, hideContextMenu, menuRef, menuId } = useContextMenu();
   const { isVisible, x, y, options } = menuState;
+  const [coords, setCoords] = useState<{ left: number; top: number }>({ left: x, top: y });
+
+  useLayoutEffect(() => {
+    setCoords({ left: x, top: y });
+  }, [x, y, menuId]);
+
+  useLayoutEffect(() => {
+    if (!isVisible || !menuRef.current) return;
+    const rect = menuRef.current.getBoundingClientRect();
+    const padding = 8;
+    const clampedLeft = Math.max(padding, Math.min(x, window.innerWidth - rect.width - padding));
+    const clampedTop = Math.max(padding, Math.min(y, window.innerHeight - rect.height - padding));
+    setCoords({ left: clampedLeft, top: clampedTop });
+  }, [isVisible, menuId, x, y, options, menuRef]);
 
   return (
     <AnimatePresence>
@@ -276,10 +297,13 @@ function ContextMenu() {
           key={menuId}
           onContextMenu={(e: any) => e.preventDefault()}
           ref={menuRef}
-          style={{ top: y, left: x }}
+          style={{ top: coords.top, left: coords.left }}
           transition={{ duration: 0.1, ease: 'easeOut' }}
         >
-          <div className="bg-surface/95 backdrop-blur-md rounded-lg shadow-xl p-2 w-max min-w-64 max-w-80" role="menu">
+          <div
+            className="bg-surface/95 backdrop-blur-md rounded-lg shadow-xl p-2 w-max min-w-64 max-w-80 max-h-[calc(100vh-16px)] overflow-y-auto custom-scrollbar"
+            role="menu"
+          >
             {options.map((option: any, index: number) => (
               <MenuItem hideContextMenu={hideContextMenu} key={index} option={option} path={[index]} />
             ))}
@@ -298,11 +322,20 @@ export function ContextMenuProvider({ children }: ContextMenuProviderProps) {
   const submenuTimeoutRef = useRef<any>(null);
 
   const showContextMenu = useCallback((x: number, y: number, options: Array<Option>) => {
+    const viewportPadding = 8;
     const menuWidth = 320;
-    const menuHeight =
-      options.reduce((acc: number, opt: Option) => acc + (opt.type === OPTION_SEPARATOR ? 9 : 40), 0) + 16;
-    const adjustedX = x + menuWidth > window.innerWidth ? window.innerWidth - menuWidth - 10 : x;
-    const adjustedY = y + menuHeight > window.innerHeight ? window.innerHeight - menuHeight - 10 : y;
+    const maxVisibleHeight = Math.max(200, window.innerHeight - viewportPadding * 2);
+    const estimatedHeight =
+      options.reduce((acc: number, opt: Option) => acc + (opt.type === OPTION_SEPARATOR ? 9 : 36), 0) + 16;
+    const clampedHeight = Math.min(estimatedHeight, maxVisibleHeight);
+    const adjustedX = Math.max(
+      viewportPadding,
+      Math.min(x, window.innerWidth - menuWidth - viewportPadding),
+    );
+    const adjustedY = Math.max(
+      viewportPadding,
+      Math.min(y, window.innerHeight - clampedHeight - viewportPadding),
+    );
 
     setMenuState({ isVisible: true, x: adjustedX, y: adjustedY, options });
     setMenuId((id) => id + 1);
@@ -350,6 +383,19 @@ export function ContextMenuProvider({ children }: ContextMenuProviderProps) {
       }
     };
 
+    const handleScroll = (event: Event) => {
+      const target = event.target as Node | null;
+      if (target) {
+        const menuElements = document.querySelectorAll('[role="menu"]');
+        for (const menuEl of menuElements) {
+          if (menuEl.contains(target)) {
+            return;
+          }
+        }
+      }
+      hideContextMenu();
+    };
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         hideContextMenu();
@@ -358,13 +404,13 @@ export function ContextMenuProvider({ children }: ContextMenuProviderProps) {
 
     if (menuState.isVisible) {
       document.addEventListener('mousedown', handleClickOutside);
-      window.addEventListener('scroll', hideContextMenu, true);
+      window.addEventListener('scroll', handleScroll, true);
       document.addEventListener('keydown', handleKeyDown);
     }
 
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
-      window.removeEventListener('scroll', hideContextMenu, true);
+      window.removeEventListener('scroll', handleScroll, true);
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [menuState.isVisible, hideContextMenu]);

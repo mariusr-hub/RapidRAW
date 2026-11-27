@@ -866,8 +866,11 @@ fn get_global_adjustments_from_json(
         has_lut,
         lut_intensity,
 
-        tonemapper_mode: tonemapper_override
-            .unwrap_or_else(|| if tone_mapper == "agx" { 1 } else { 0 }),
+        tonemapper_mode: tonemapper_override.unwrap_or_else(|| match tone_mapper {
+            "agx" => 1,
+            "legacy" => 2,
+            _ => 0,
+        }),
         lut_is_scene_referred,
         vignette_center_x: get_val("vignette", "vignetteCenterX", 1.0, Some(0.5)),
         vignette_center_y: get_val("vignette", "vignetteCenterY", 1.0, Some(0.5)),
@@ -987,7 +990,7 @@ fn get_global_adjustments_from_json(
         lights_brightness: get_scoped_val("lights", &["lightsBrightness", "lights_brightness", "brightness"], 1.0, 0.0),
         lights_contrast: get_scoped_val("lights", &["lightsContrast", "lights_contrast", "contrast"], 1.0, 0.0),
         lights_details: get_scoped_val("lights", &["lightsDetails", "lights_details", "details"], 1.0, 0.0),
-        contrast_cleaner_strength: get_scoped_val("presence", &["contrastCleaner", "contrast_cleaner_strength"], 1.0, 1.0),
+        contrast_cleaner_strength: get_scoped_val("presence", &["contrastCleaner", "contrast_cleaner_strength"], 1.0, 0.0),
         lights_wb_temp: get_scoped_val("lights", &["lightsTemperature", "lights_wb_temp", "wbTemp"], 1.0, 0.0),
         lights_wb_tint: get_scoped_val("lights", &["lightsTint", "lights_wb_tint", "wbTint"], 1.0, 0.0),
         lights_saturation: get_scoped_val("lights", &["lightsSaturation", "lights_saturation", "saturation"], 1.0, 0.0),
@@ -996,7 +999,7 @@ fn get_global_adjustments_from_json(
         supercontrast_midtones: get_scoped_val("supercontrast", &["supercontrastMidtones", "supercontrast_midtones", "midtones"], 1.0, 0.0),
         supercontrast_highlights: get_scoped_val("supercontrast", &["supercontrastHighlights", "supercontrast_highlights", "highlights"], 1.0, 0.0),
         supercontrast_pivots: get_scoped_val("supercontrast", &["supercontrastPivots", "supercontrast_pivots", "pivots"], 1.0, 0.0),
-        skin_shield_strength: get_scoped_val("creative", &["skinShield", "skin_shield_strength"], 1.0, 0.85),
+        skin_shield_strength: get_scoped_val("presence", &["skinShield", "skin_shield_strength"], 1.0, 0.0),
         orton_spread: get_scoped_val("creative", &["ortonSpread", "orton_spread"], 1.0, 0.0),
         foliage_enhancer: get_scoped_val("colorPresence", &["foliageEnhancer", "foliage_enhancer"], 1.0, 0.0),
         hsl_mode: if is_visible("colorMixer")
@@ -1023,7 +1026,7 @@ fn get_global_adjustments_from_json(
             && js_adjustments
                 .get("hlrEnabled")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true)
+                .unwrap_or(false)
         {
             1
         } else {

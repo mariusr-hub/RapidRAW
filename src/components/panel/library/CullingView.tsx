@@ -540,7 +540,7 @@ function CullingPreview({
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        onContextMenu(e, image.path, true);
+        onContextMenu(e, image.path);
       }}
       onClick={handleClick}
       onWheel={handleWheel}

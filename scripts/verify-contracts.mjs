@@ -901,8 +901,39 @@ if (tsIfaceKeys.size === 0 || rustAvailKeys.size === 0) {
   );
 }
 
+// =========================================================================
+// 20. Neutral Default Color Safety & Context Menu Discoverability Check
+// =========================================================================
+console.log('\n=== 20. Neutral Color & Context Menu Contract Check ===');
+const defaultAdjJson = JSON.parse(fs.readFileSync(path.join(TS_SRC, 'utils', 'defaultAdjustments.json'), 'utf8'));
+if (defaultAdjJson.hlrEnabled !== false || defaultAdjJson.skinShield !== 0 || defaultAdjJson.contrastCleaner !== 0) {
+  console.error(
+    `NEUTRAL COLOR GUARD: defaultAdjustments.json must keep hlrEnabled=false, skinShield=0, contrastCleaner=0 (got hlrEnabled=${defaultAdjJson.hlrEnabled}, skinShield=${defaultAdjJson.skinShield}, contrastCleaner=${defaultAdjJson.contrastCleaner})`,
+  );
+  errors++;
+}
+const shaderWgsl = fs.readFileSync(path.join(ROOT, 'src-tauri', 'src', 'shaders', 'shader.wgsl'), 'utf8');
+if (shaderWgsl.includes('apply_deep_shadow_chroma_damping')) {
+  console.error('NEUTRAL COLOR GUARD: shader.wgsl must not call apply_deep_shadow_chroma_damping');
+  errors++;
+}
+const contextMenuCtx = fs.readFileSync(path.join(TS_SRC, 'context', 'ContextMenuContext.tsx'), 'utf8');
+if (!contextMenuCtx.includes('overflow-y-auto') || !contextMenuCtx.includes('Math.max(')) {
+  console.error('CONTEXT MENU GUARD: ContextMenuContext.tsx must clamp viewport bounds and enable overflow-y-auto');
+  errors++;
+}
+const appContextMenus = fs.readFileSync(path.join(TS_SRC, 'hooks', 'useAppContextMenus.ts'), 'utf8');
+const mergeMenuCalls = (appContextMenus.match(/buildMergeMenu\(/g) || []).length;
+if (mergeMenuCalls < 2) {
+  console.error(
+    `CONTEXT MENU GUARD: Expected buildMergeMenu() in both handleEditorContextMenu and handleThumbnailContextMenu (found ${mergeMenuCalls} call(s))`,
+  );
+  errors++;
+}
+console.log('Checked neutral default color safety & context menu discoverability.');
+
 if (errors > 0) {
   console.error(`\nContract verification FAILED with ${errors} error(s).`);
   process.exit(1);
 }
-console.log('\nAll 19 contract checks PASSED.');
+console.log('\nAll 20 contract checks PASSED.');

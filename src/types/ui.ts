@@ -45,6 +45,7 @@ export type PanelRegion = 'leftTop' | 'leftBottom' | 'rightTop' | 'rightBottom';
 export interface Option {
   color?: string;
   disabled?: boolean;
+  hint?: string;
   icon?: any;
   isDestructive?: boolean;
   label?: string;

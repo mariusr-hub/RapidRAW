@@ -330,6 +330,139 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
     [handleEditInApp, t],
   );
 
+  const buildMergeMenu = useCallback(
+    (targetPaths: string[], anchorPath: string): Option => {
+      const { imageList } = useLibraryStore.getState();
+      const { setUI } = useUIStore.getState();
+      const selectionCount = targetPaths.length;
+      const needTwoHint = selectionCount < 2 ? '2+ photos' : undefined;
+      const stitchLabel = t('contextMenus.editor.stitchPanorama');
+      const mergeLabel = t('contextMenus.editor.mergeHdr');
+      const collageLabel = t('contextMenus.thumbnail.collage', { count: selectionCount });
+
+      return {
+        label: t('contextMenus.merge.title'),
+        icon: LayersArrowDown,
+        submenu: [
+          {
+            disabled: selectionCount < 2 || selectionCount > 30,
+            hint: needTwoHint,
+            icon: SquaresUnite,
+            label: stitchLabel,
+            onClick: () => openMergeModal('panorama', targetPaths),
+          },
+          {
+            disabled: selectionCount < 2 || selectionCount > 30,
+            hint: needTwoHint,
+            icon: Images,
+            label: mergeLabel,
+            onClick: () => openMergeModal('hdr', targetPaths),
+          },
+          {
+            disabled: selectionCount < 2,
+            hint: needTwoHint,
+            icon: Layers,
+            label: t('contextMenus.merge.focusStack'),
+            onClick: () => openMergeModal('focusStack', targetPaths),
+          },
+          {
+            disabled: selectionCount < 2,
+            hint: needTwoHint,
+            icon: Sparkles,
+            label: t('contextMenus.merge.astroStack', 'Astro Stack (Kappa-Sigma)'),
+            onClick: () => {
+              const toastId = toast.info('Aligning stars & stacking frames...', { autoClose: false });
+              invoke(Invokes.StackAstroFrames, {
+                options: {
+                  paths: targetPaths,
+                  sigma_clip: 2.5,
+                  stack_mode: 'kappa_sigma',
+                  auto_dark_subtract: true,
+                },
+              })
+                .then(() => {
+                  toast.dismiss(toastId);
+                  toast.success('Astro stack complete!');
+                  props.refreshImageList();
+                })
+                .catch((err) => {
+                  toast.dismiss(toastId);
+                  toast.error(`Astro stack failed: ${String(err)}`);
+                });
+            },
+          },
+          {
+            disabled: selectionCount < 2,
+            hint: needTwoHint,
+            icon: Telescope,
+            label: t('contextMenus.merge.drizzle', 'Hubble Drizzle Super-Resolution (2x/3x/4x)...'),
+            onClick: () =>
+              setUI((s) => ({
+                drizzleModalState: {
+                  ...s.drizzleModalState,
+                  isOpen: true,
+                  error: null,
+                  finalImageBase64: null,
+                  originalBase64: null,
+                  progressMessage: null,
+                  sourcePaths: targetPaths,
+                },
+              })),
+          },
+          {
+            disabled: imageList.length < 2,
+            icon: Wand2,
+            label: t('contextMenus.merge.detectPanoSequences', 'Auto-Detect Panorama Sequence'),
+            onClick: () => {
+              const folderPaths = imageList.map((img) => img.path);
+              const toastId = toast.info('Scanning folder EXIF for panorama sequences...', {
+                autoClose: false,
+              });
+              invoke<Array<{ id: string; paths: string[]; isHdr: boolean; count: number }>>(
+                Invokes.DetectPanoramaSequences,
+                { imagePaths: folderPaths },
+              )
+                .then((groups) => {
+                  toast.dismiss(toastId);
+                  const matched = groups.find((g) => g.paths.includes(anchorPath)) || groups[0];
+                  if (matched && matched.paths.length >= 2) {
+                    toast.info(
+                      `Detected ${matched.isHdr ? 'HDR Panorama' : 'Panorama'} sequence (${matched.count} frames)`,
+                    );
+                    openMergeModal('panorama', matched.paths);
+                  } else {
+                    toast.info('No consecutive panorama sequences detected in this folder.');
+                  }
+                })
+                .catch((err) => {
+                  toast.dismiss(toastId);
+                  toast.error(`Sequence detection failed: ${String(err)}`);
+                });
+            },
+          },
+          { type: OPTION_SEPARATOR },
+          {
+            icon: LayoutTemplate,
+            label: collageLabel,
+            onClick: () => {
+              const imagesForCollage = imageList.filter((img) => targetPaths.includes(img.path));
+              const fallbackImage = useEditorStore.getState().selectedImage;
+              setUI({
+                collageModalState: {
+                  isOpen: true,
+                  sourceImages:
+                    imagesForCollage.length > 0 ? imagesForCollage : fallbackImage ? [fallbackImage] : [],
+                },
+              });
+            },
+            disabled: selectionCount === 0 || selectionCount > 9,
+          },
+        ],
+      };
+    },
+    [props, t],
+  );
+
   const handleEditorContextMenu = useCallback(
     (event: any) => {
       event.preventDefault();
@@ -346,14 +479,19 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
         copiedAdjustments,
         setEditor,
       } = useEditorStore.getState();
+      const { multiSelectedPaths } = useLibraryStore.getState();
       const { appSettings, osPlatform } = useSettingsStore.getState();
-      const { setPanel, setUI, isViewerOpen, toggleViewerWindow } = useUIStore.getState();
+      const { setPanel, isViewerOpen, toggleViewerWindow } = useUIStore.getState();
 
       if (!selectedImage) return;
 
       const canUndo = historyIndex > 0 || adjustments !== history[historyIndex];
       const canRedo = historyIndex < history.length - 1;
       const commonTags = getCommonTags([selectedImage.path]);
+      const mergeSelection =
+        multiSelectedPaths.length >= 2 && multiSelectedPaths.includes(selectedImage.path)
+          ? multiSelectedPaths
+          : [selectedImage.path];
 
       const options: Array<Option> = [
         {
@@ -371,6 +509,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               },
             ]
           : []),
+        buildMergeMenu(mergeSelection, selectedImage.path),
         { type: OPTION_SEPARATOR },
         { label: t('contextMenus.editor.undo'), icon: Undo, onClick: undo, disabled: !canUndo },
         { label: t('contextMenus.editor.redo'), icon: Redo, onClick: redo, disabled: !canRedo },
@@ -468,13 +607,6 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
             },
           ],
         },
-        {
-          icon: LayoutTemplate,
-          label: t('contextMenus.editor.frameImage'),
-          onClick: () => {
-            setUI({ collageModalState: { isOpen: true, sourceImages: [selectedImage] } });
-          },
-        },
         { type: OPTION_SEPARATOR },
         buildRatingMenu(),
         buildFlagMenu(),
@@ -539,6 +671,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
       buildRatingMenu,
       buildFlagMenu,
       buildColorLabelMenu,
+      buildMergeMenu,
       handleTagsChanged,
       buildEditInOptions,
       showContextMenu,
@@ -645,11 +778,8 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
       const autoAdjustLabel = t('contextMenus.thumbnail.autoAdjust', { count: selectionCount });
       const renameLabel = t('contextMenus.thumbnail.renameImage', { count: selectionCount });
       const cullLabel = t('contextMenus.thumbnail.cullImage', { count: selectionCount });
-      const collageLabel = t('contextMenus.thumbnail.collage', { count: selectionCount });
-      const stitchLabel = t('contextMenus.editor.stitchPanorama');
       const denoiseLabel = t('contextMenus.thumbnail.denoise', { count: selectionCount });
       const superResolutionLabel = t('contextMenus.thumbnail.superResolution', { count: selectionCount });
-      const mergeLabel = t('contextMenus.editor.mergeHdr');
 
       const handleCreateVirtualCopy = async (sourcePath: string) => {
         try {
@@ -763,6 +893,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
             ]
           : [{ icon: FileInput, label: exportLabel, onClick: onExportClick }]),
         ...(isSingleSelection ? buildEditInOptions(finalSelection[0]) : []),
+        buildMergeMenu(finalSelection, path),
         { type: OPTION_SEPARATOR },
         {
           icon: Copy,
@@ -927,116 +1058,8 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
           ],
         },
         {
-          label: t('contextMenus.merge.title'),
-          icon: LayersArrowDown,
-          submenu: [
-            {
-              disabled: selectionCount < 2 || selectionCount > 30,
-              icon: SquaresUnite,
-              label: stitchLabel,
-              onClick: () => openMergeModal('panorama', finalSelection),
-            },
-            {
-              disabled: selectionCount < 2 || selectionCount > 30,
-              icon: Images,
-              label: mergeLabel,
-              onClick: () => openMergeModal('hdr', finalSelection),
-            },
-            {
-              disabled: selectionCount < 2,
-              icon: Layers,
-              label: t('contextMenus.merge.focusStack'),
-              onClick: () => openMergeModal('focusStack', finalSelection),
-            },
-            {
-              disabled: selectionCount < 2,
-              icon: Sparkles,
-              label: t('contextMenus.merge.astroStack', 'Astro Stack (Kappa-Sigma)'),
-              onClick: () => {
-                const toastId = toast.info('Aligning stars & stacking frames...', { autoClose: false });
-                invoke(Invokes.StackAstroFrames, {
-                  options: {
-                    paths: finalSelection,
-                    sigma_clip: 2.5,
-                    stack_mode: 'kappa_sigma',
-                    auto_dark_subtract: true,
-                  },
-                })
-                  .then(() => {
-                    toast.dismiss(toastId);
-                    toast.success('Astro stack complete!');
-                    props.refreshImageList();
-                  })
-                  .catch((err) => {
-                    toast.dismiss(toastId);
-                    toast.error(`Astro stack failed: ${String(err)}`);
-                  });
-              },
-            },
-            {
-              disabled: selectionCount < 2,
-              icon: Telescope,
-              label: t('contextMenus.merge.drizzle', 'Hubble Drizzle Super-Resolution (2x/3x/4x)...'),
-              onClick: () =>
-                setUI((s) => ({
-                  drizzleModalState: {
-                    ...s.drizzleModalState,
-                    isOpen: true,
-                    error: null,
-                    finalImageBase64: null,
-                    originalBase64: null,
-                    progressMessage: null,
-                    sourcePaths: finalSelection,
-                  },
-                })),
-            },
-            {
-              disabled: imageList.length < 2,
-              icon: Wand2,
-              label: t('contextMenus.merge.detectPanoSequences', 'Auto-Detect Panorama Sequence'),
-              onClick: () => {
-                const folderPaths = imageList.map((img) => img.path);
-                const toastId = toast.info('Scanning folder EXIF for panorama sequences...', {
-                  autoClose: false,
-                });
-                invoke<Array<{ id: string; paths: string[]; isHdr: boolean; count: number }>>(
-                  Invokes.DetectPanoramaSequences,
-                  { imagePaths: folderPaths },
-                )
-                  .then((groups) => {
-                    toast.dismiss(toastId);
-                    const matched =
-                      groups.find((g) => g.paths.includes(path)) || groups[0];
-                    if (matched && matched.paths.length >= 2) {
-                      toast.info(
-                        `Detected ${matched.isHdr ? 'HDR Panorama' : 'Panorama'} sequence (${matched.count} frames)`,
-                      );
-                      openMergeModal('panorama', matched.paths);
-                    } else {
-                      toast.info('No consecutive panorama sequences detected in this folder.');
-                    }
-                  })
-                  .catch((err) => {
-                    toast.dismiss(toastId);
-                    toast.error(`Sequence detection failed: ${String(err)}`);
-                  });
-              },
-            },
-            { type: OPTION_SEPARATOR },
-            {
-              icon: LayoutTemplate,
-              label: collageLabel,
-              onClick: () => {
-                const imagesForCollage = imageList.filter((img) => finalSelection.includes(img.path));
-                setUI({ collageModalState: { isOpen: true, sourceImages: imagesForCollage } });
-              },
-              disabled: selectionCount === 0 || selectionCount > 9,
-            },
-          ],
-        },
-        {
-          label: 'Culling & Selection',
-          icon: Users,
+          label: 'AI & Studio',
+          icon: Wand2,
           submenu: [
             {
               icon: Zap,
@@ -1059,6 +1082,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               icon: Trophy,
               label: 'AI Hero-Shot Curator...',
               disabled: selectionCount < 2,
+              hint: selectionCount < 2 ? '2+ photos' : undefined,
               onClick: () =>
                 setUI({
                   heroCuratorModalState: {
@@ -1067,12 +1091,56 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
                   },
                 }),
             },
-          ],
-        },
-        {
-          label: 'AI Studio & Color',
-          icon: Wand2,
-          submenu: [
+            {
+              disabled: !isSingleSelection,
+              icon: Sparkles,
+              label: t('contextMenus.thumbnail.findVisuallySimilar', 'Find Visually Similar Photos'),
+              onClick: () => {
+                const targetPath = finalSelection[0];
+                invoke<SemanticSearchHit[]>(Invokes.FindVisuallySimilar, { path: targetPath, limit: 60 })
+                  .then((hits) => {
+                    if (hits.length === 0) {
+                      toast.info(
+                        'No visually similar photos indexed yet. Enable AI Tagging or rebuild the search index.',
+                      );
+                      return;
+                    }
+                    const { imageList: currentList } = useLibraryStore.getState();
+                    const existingMap = new globalThis.Map(currentList.map((im) => [im.path, im]));
+                    const scores: Record<string, number> = {};
+                    const similarItems: ImageFile[] = hits.map((hit) => {
+                      scores[hit.path] = hit.score;
+                      const existing = existingMap.get(hit.path);
+                      if (existing) return existing;
+                      return {
+                        path: hit.path,
+                        modified: 0,
+                        is_edited: false,
+                        rating: 0,
+                        flag: null,
+                        tags: null,
+                        exif: null,
+                        is_virtual_copy: hit.path.includes('?vc='),
+                        is_cloud_placeholder: false,
+                        is_raw: /\.(arw|cr2|cr3|dng|nef|raf|orf|rw2|pef|srw|raw)$/i.test(hit.path),
+                        group_id: null,
+                        needs_ai: false,
+                      };
+                    });
+                    useLibraryStore.getState().setLibrary({
+                      imageList: similarItems,
+                      semanticScores: scores,
+                      similarSourcePath: targetPath,
+                      activeSmartCollectionId: null,
+                      activeAlbumId: null,
+                      multiSelectedPaths: [],
+                      libraryActivePath: similarItems[0]?.path ?? null,
+                    });
+                  })
+                  .catch((err) => toast.error(`Similarity search failed: ${err}`));
+              },
+            },
+            { type: OPTION_SEPARATOR },
             {
               icon: Wand2,
               label: 'Universal AI Shoot Polish...',
@@ -1103,6 +1171,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               icon: Wand2,
               label: 'Harmonize Series to Hero Photo...',
               disabled: selectionCount < 2,
+              hint: selectionCount < 2 ? '2+ photos' : undefined,
               onClick: () =>
                 setUI({
                   colorMatcherModalState: {
@@ -1148,6 +1217,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               icon: Sparkles,
               label: 'Build & Sync Shoot Sensor-Dust Map',
               disabled: selectionCount < 2,
+              hint: selectionCount < 2 ? '2+ photos' : undefined,
               onClick: () => {
                 const toastId = toast.info(`Mapping persistent sensor dust across ${selectionCount} frames...`, {
                   autoClose: false,
@@ -1177,12 +1247,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
                   });
               },
             },
-          ],
-        },
-        {
-          label: 'Studio & Delivery',
-          icon: Package,
-          submenu: [
+            { type: OPTION_SEPARATOR },
             {
               icon: Download,
               label: 'Advanced Multi-Export & Watermark...',
@@ -1293,54 +1358,6 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               },
             ]
           : []),
-        { type: OPTION_SEPARATOR },
-        {
-          disabled: !isSingleSelection,
-          icon: Sparkles,
-          label: t('contextMenus.thumbnail.findVisuallySimilar', 'Find Visually Similar Photos'),
-          onClick: () => {
-            const targetPath = finalSelection[0];
-            invoke<SemanticSearchHit[]>(Invokes.FindVisuallySimilar, { path: targetPath, limit: 60 })
-              .then((hits) => {
-                if (hits.length === 0) {
-                  toast.info('No visually similar photos indexed yet. Enable AI Tagging or rebuild the search index.');
-                  return;
-                }
-                const { imageList } = useLibraryStore.getState();
-                const existingMap = new globalThis.Map(imageList.map((im) => [im.path, im]));
-                const scores: Record<string, number> = {};
-                const similarItems: ImageFile[] = hits.map((hit) => {
-                  scores[hit.path] = hit.score;
-                  const existing = existingMap.get(hit.path);
-                  if (existing) return existing;
-                  return {
-                    path: hit.path,
-                    modified: 0,
-                    is_edited: false,
-                    rating: 0,
-                    flag: null,
-                    tags: null,
-                    exif: null,
-                    is_virtual_copy: hit.path.includes('?vc='),
-                    is_cloud_placeholder: false,
-                    is_raw: /\.(arw|cr2|cr3|dng|nef|raf|orf|rw2|pef|srw|raw)$/i.test(hit.path),
-                    group_id: null,
-                    needs_ai: false,
-                  };
-                });
-                useLibraryStore.getState().setLibrary({
-                  imageList: similarItems,
-                  semanticScores: scores,
-                  similarSourcePath: targetPath,
-                  activeSmartCollectionId: null,
-                  activeAlbumId: null,
-                  multiSelectedPaths: [],
-                  libraryActivePath: similarItems[0]?.path ?? null,
-                });
-              })
-              .catch((err) => toast.error(`Similarity search failed: ${err}`));
-          },
-        },
         {
           disabled: !isSingleSelection,
           icon: Folder,
@@ -1394,6 +1411,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
       buildRatingMenu,
       buildFlagMenu,
       buildColorLabelMenu,
+      buildMergeMenu,
       handleTagsChanged,
       handleResetAdjustments,
       buildEditInOptions,

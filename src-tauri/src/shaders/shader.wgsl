@@ -2431,6 +2431,9 @@ fn apply_lights_subpipeline(
     lights_vib: f32,
     detail_structure: f32
 ) -> vec3<f32> {
+    if (abs(lights_bright) < 0.001 && abs(lights_con) < 0.001 && abs(lights_det) < 0.001 && abs(lights_temp) < 0.001 && abs(lights_tint) < 0.001 && abs(lights_sat) < 0.001 && abs(lights_vib) < 0.001) {
+        return color_in;
+    }
     let luma = get_luma(max(color_in, vec3<f32>(0.0)));
     let w_lights = smoothstep(0.45, 0.85, luma);
     if (w_lights <= 0.001) {
@@ -2629,15 +2632,6 @@ fn apply_atmospheric_haze_inversion(
     return max(final_dehazed, vec3<f32>(0.0));
 }
 
-fn apply_deep_shadow_chroma_damping(rgb: vec3<f32>) -> vec3<f32> {
-    let luma = get_luma(rgb);
-    if (luma < 0.045) {
-        let t = smoothstep(0.005, 0.045, max(luma, 0.0));
-        return mix(vec3<f32>(luma), rgb, t);
-    }
-    return rgb;
-}
-
 fn store_output(coords: vec2<u32>, color: vec4<f32>) {
     textureStore(output_texture, coords, color);
 }
@@ -2786,16 +2780,6 @@ fn main(
         }
     }
 
-    t_contrast = clamp(t_contrast, -1.0, 1.0);
-    t_highlights = clamp(t_highlights, -1.0, 1.0);
-    t_shadows = clamp(t_shadows, -1.0, 1.0);
-    t_whites = clamp(t_whites, -1.0, 1.0);
-    t_blacks = clamp(t_blacks, -1.0, 1.0);
-    t_saturation = clamp(t_saturation, -1.0, 1.0);
-    t_vibrance = clamp(t_vibrance, -1.0, 1.0);
-    t_clarity = clamp(t_clarity, -1.0, 1.0);
-    t_dehaze = clamp(t_dehaze, -1.0, 1.0);
-
     let final_hsl = array<HslColor, 8>(
         HslColor(h0_h, h0_s, h0_l, 0.0), HslColor(h1_h, h1_s, h1_l, 0.0),
         HslColor(h2_h, h2_s, h2_l, 0.0), HslColor(h3_h, h3_s, h3_l, 0.0),
@@ -2904,13 +2888,19 @@ fn main(
         (LC_CLARITY_GAIN * boost_fine + LC_CLARITY_BROAD * boost_broad) * lc_gate,
         clarity_total > 0.0
     ) * clarity_total;
-    let skin_factor = compute_skin_shield(locally_contrasted_rgb);
-    let skin_shield_strength = adjustments.global.skin_shield_strength;
-    let skin_suppression = 1.0 - clamp(skin_factor * max(skin_shield_strength, 0.85), 0.0, 0.92);
-
-    let cleaner_strength = adjustments.global.contrast_cleaner_strength;
-    let gradient_overshoot = clamp(abs(detail_broad) - 0.45, 0.0, 1.0);
-    let halo_cleaner = 1.0 - smoothstep(0.0, 0.5, gradient_overshoot * max(cleaner_strength, 1.0));
+    let skin_shield_strength = max(adjustments.global.skin_shield_strength, 0.0);
+    let cleaner_strength = max(adjustments.global.contrast_cleaner_strength, 0.0);
+    var skin_factor = 0.0;
+    var skin_suppression = 1.0;
+    if (skin_shield_strength > 0.001) {
+        skin_factor = compute_skin_shield(locally_contrasted_rgb);
+        skin_suppression = 1.0 - clamp(skin_factor * skin_shield_strength, 0.0, 0.92);
+    }
+    var halo_cleaner = 1.0;
+    if (cleaner_strength > 0.001) {
+        let gradient_overshoot = clamp(abs(detail_broad) - 0.45, 0.0, 1.0);
+        halo_cleaner = 1.0 - smoothstep(0.0, 0.5, gradient_overshoot * cleaner_strength);
+    }
 
     let structure_term = select(
         (detail_fine + detail_broad) * LC_STRUCTURE_SOFTEN,
@@ -2920,8 +2910,10 @@ fn main(
 
     let lc_log_gain = limit_local_gain(clarity_term + structure_term);
     locally_contrasted_rgb *= exp2(lc_log_gain);
-    let deflash_strength = adjustments.global.skin_shield_strength * 0.65;
-    locally_contrasted_rgb = apply_skin_deflash_specular_rolloff(locally_contrasted_rgb, skin_factor, deflash_strength);
+    if (skin_shield_strength > 0.001) {
+        let deflash_strength = skin_shield_strength * 0.65;
+        locally_contrasted_rgb = apply_skin_deflash_specular_rolloff(locally_contrasted_rgb, skin_factor, deflash_strength);
+    }
 
     if (has_feature(F_DEHAZE)) {
         let gf = sample_gf_tex(gf_coeffs_texture, absolute_coord).xy;
@@ -3112,8 +3104,6 @@ fn main(
         let grained = luma / (luma + (1.0 - luma) * exp(-grain * adjustments.global.grain_amount));
         final_rgb += vec3<f32>(grained - luma);
     }
-
-    final_rgb = apply_deep_shadow_chroma_damping(final_rgb);
 
     final_rgb = output_transform(final_rgb);
 

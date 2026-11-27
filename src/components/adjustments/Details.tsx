@@ -81,8 +81,8 @@ function DetailsPanel({
     (adjustments.bokehMaskProtection ?? 0) > 0;
   const hasEnhancedPresenceActive =
     (adjustments.clearView ?? 0) > 0 ||
-    Math.abs((adjustments.skinShield ?? 0.9) - 0.9) > 1e-4 ||
-    Math.abs((adjustments.contrastCleaner ?? 1.0) - 1.0) > 1e-4;
+    (adjustments.skinShield ?? 0) > 1e-4 ||
+    (adjustments.contrastCleaner ?? 0) > 1e-4;
 
   return (
     <div className="flex flex-col gap-4">
@@ -263,10 +263,10 @@ function DetailsPanel({
                       label={t('adjustments.details.skinShield', 'Skin Shield')}
                       max={1.5}
                       min={0}
-                      defaultValue={0.9}
+                      defaultValue={0}
                       onChange={(e: any) => handleFloatAdjustmentChange('skinShield', String(e.target.value))}
                       step={0.05}
-                      value={adjustments.skinShield ?? 0.9}
+                      value={adjustments.skinShield ?? 0}
                       onDragStateChange={onDragStateChange}
                       fillOrigin="min"
                     />
@@ -276,10 +276,10 @@ function DetailsPanel({
                       label={t('adjustments.details.contrastCleaner', 'Halo Contrast Cleaner')}
                       max={2}
                       min={0}
-                      defaultValue={1.0}
+                      defaultValue={0}
                       onChange={(e: any) => handleFloatAdjustmentChange('contrastCleaner', String(e.target.value))}
                       step={0.05}
-                      value={adjustments.contrastCleaner ?? 1.0}
+                      value={adjustments.contrastCleaner ?? 0}
                       onDragStateChange={onDragStateChange}
                       fillOrigin="min"
                     />
@@ -308,17 +308,17 @@ function DetailsPanel({
           id="hlr"
           order={toolOrder.indexOf('hlr')}
           title={t('adjustments.details.hlr', 'Highlight Reconstruction')}
-          hasActiveAdjustment={adjustments.hlrEnabled === false || Math.abs((adjustments.hlrClipCeiling ?? 0.95) - 0.95) > 1e-3}
+          hasActiveAdjustment={adjustments.hlrEnabled === true}
         >
           <div className="space-y-2">
             <Switch
-              checked={adjustments.hlrEnabled ?? true}
+              checked={adjustments.hlrEnabled ?? false}
               label={t('adjustments.details.hlrEnabled', 'Highlight Chroma Recovery')}
               onChange={(checked) =>
                 setAdjustments((prev: Partial<Adjustments>) => ({ ...prev, hlrEnabled: checked }))
               }
             />
-            {(adjustments.hlrEnabled ?? true) && (
+            {(adjustments.hlrEnabled ?? false) && (
               <Slider
                 resetKey="hlrClipCeiling"
                 label={t('adjustments.details.hlrClipCeiling', 'Clip Ceiling')}

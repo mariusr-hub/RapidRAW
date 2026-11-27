@@ -601,7 +601,7 @@ pub fn get_sns_hdr_reference_presets() -> Vec<PhotographicReferencePreset> {
                 "blacks": 0.0,
                 "clarity": 0.0,
                 "structure": 0.0,
-                "contrastCleaner": 1.0,
+                "contrastCleaner": 0.0,
                 "lightsBrightness": 0.0,
                 "lightsContrast": 0.0,
                 "lightsDetails": 0.0,
@@ -613,7 +613,7 @@ pub fn get_sns_hdr_reference_presets() -> Vec<PhotographicReferencePreset> {
                 "supercontrastMidtones": 0.0,
                 "supercontrastHighlights": 0.0,
                 "supercontrastPivots": 0.0,
-                "skinShield": 0.90,
+                "skinShield": 0.0,
                 "foliageEnhancer": 0.0,
                 "ortonSpread": 0.0
             }),

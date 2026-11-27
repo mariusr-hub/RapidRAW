@@ -12,7 +12,7 @@ export function isDirectWgpuSwapchainActive(
   if (isWgpuSupported === false) {
     return false;
   }
-  if (osPlatform === 'windows' || osPlatform === 'android') {
+  if (osPlatform === 'android') {
     return false;
   }
   if (appSettings?.useWgpuRenderer !== undefined) {
