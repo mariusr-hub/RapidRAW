@@ -501,4 +501,30 @@ mod tests {
         assert!(!remove_legacy_rating(&mut untouched));
         assert!(!remove_legacy_rating(&mut metadata(Value::Null)));
     }
+
+    #[test]
+    fn test_v1674_and_v171_sidecar_deserialize_preserve_fields() {
+        let v1674_sidecar = json!({
+            "version": 1,
+            "rating": 3,
+            "adjustments": { "exposure": 0.4, "contrast": 15 }
+        });
+        let parsed_1674: ImageMetadata = serde_json::from_value(v1674_sidecar).unwrap();
+        assert_eq!(parsed_1674.rating, 3);
+        assert_eq!(parsed_1674.flag, None);
+        assert!(parsed_1674.snapshots.is_none());
+
+        let v171_sidecar = json!({
+            "version": 1,
+            "rating": 4,
+            "flag": "pick",
+            "tags": ["portrait"],
+            "adjustments": { "exposure": 0.5, "baselineExposure": true }
+        });
+        let parsed_171: ImageMetadata = serde_json::from_value(v171_sidecar).unwrap();
+        assert_eq!(parsed_171.rating, 4);
+        assert_eq!(parsed_171.flag, Some(ImageFlag::Pick));
+        assert_eq!(parsed_171.tags.as_deref(), Some(&["portrait".to_string()][..]));
+        assert!(parsed_171.snapshots.is_none());
+    }
 }

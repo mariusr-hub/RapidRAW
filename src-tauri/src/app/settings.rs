@@ -1433,4 +1433,67 @@ mod tests {
         let turned_off: AppSettings = serde_json::from_value(saved).unwrap();
         assert!(!turned_off.enable_baseline_exposure);
     }
+
+    #[test]
+    fn test_v1674_legacy_settings_deserialize_without_default_reset() {
+        let v1674_payload = serde_json::json!({
+            "lastRootPath": "D:/Photos/2025",
+            "rootFolders": ["D:/Photos/2025"],
+            "editorPreviewResolution": 2560,
+            "theme": "grey",
+            "comfyuiAddress": "http://127.0.0.1:8188",
+            "rawHighlightCompression": 3.0,
+            "groupAssociatedFiles": true,
+            "groupPreferredType": "raw",
+            "enableXmpSync": true,
+            "aiCacheLimitGb": 15
+        });
+        let parsed: AppSettings = serde_json::from_value(v1674_payload)
+            .expect("v1.6.7.4 settings must deserialize cleanly without Default reset");
+        assert_eq!(parsed.last_root_path.as_deref(), Some("D:/Photos/2025"));
+        assert_eq!(parsed.editor_preview_resolution, Some(2560));
+        assert_eq!(parsed.theme.as_deref(), Some("grey"));
+        assert_eq!(parsed.ai_connector_address.as_deref(), Some("http://127.0.0.1:8188"));
+        assert_eq!(parsed.raw_highlight_compression, Some(3.0));
+        assert_eq!(parsed.ai_cache_limit_gb, Some(15));
+        assert!(parsed.saved_workspace_presets.is_empty());
+    }
+
+    #[test]
+    fn test_v171_settings_deserialize_without_default_reset() {
+        let v171_payload = serde_json::json!({
+            "lastRootPath": "D:/Photos/Studio",
+            "theme": "dark",
+            "enableBaselineExposure": false,
+            "baselineExposure": 0.55,
+            "hdrDisplay": true,
+            "workspace": {
+                "leftPanelWidth": 285,
+                "rightPanelWidth": 285,
+                "leftTopHeight": 420,
+                "rightTopHeight": 420,
+                "panelLayout": { "leftTop": ["folderTree"], "leftBottom": [], "rightTop": ["adjustments"], "rightBottom": [] },
+                "activePanels": { "leftTop": "folderTree", "leftBottom": null, "rightTop": "adjustments", "rightBottom": null },
+                "panelSwitcherPlacement": { "leftTop": "bottom", "leftBottom": "bottom", "rightTop": "right", "rightBottom": "right" },
+                "filmstripColumns": 2,
+                "filmstripShowFileInfo": true
+            },
+            "immich": {
+                "serverUrl": "https://immich.example.com",
+                "cacheLimitGb": 12,
+                "exportAlbum": "Client",
+                "exportWithOriginal": false
+            }
+        });
+        let parsed: AppSettings = serde_json::from_value(v171_payload)
+            .expect("v1.7.1 settings must deserialize cleanly without Default reset");
+        assert!(!parsed.enable_baseline_exposure);
+        assert!((parsed.baseline_exposure - 0.55).abs() < 1e-4);
+        assert!(parsed.hdr_display);
+        assert_eq!(parsed.workspace.left_panel_width, 285);
+        assert!(parsed.workspace.filmstrip_show_file_info);
+        assert_eq!(parsed.immich.server_url, "https://immich.example.com");
+        assert!(parsed.saved_workspace_presets.is_empty());
+        assert_eq!(parsed.active_workspace_preset, None);
+    }
 }

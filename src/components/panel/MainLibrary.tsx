@@ -94,7 +94,7 @@ interface DisplayModeSwitchProps {
   t: any;
 }
 
-const APP_DISPLAY_VERSION = '1.7.1.2';
+const APP_DISPLAY_VERSION = '1.7.1.3';
 
 function DisplayModeSwitch({ displayMode, setDisplayMode, t }: DisplayModeSwitchProps) {
   const options = useMemo(

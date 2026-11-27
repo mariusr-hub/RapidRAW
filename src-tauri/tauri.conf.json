@@ -231,7 +231,7 @@
         "installerHooks": "nsis-hooks.nsh"
       },
       "wix": {
-        "version": "1.7.1.2"
+        "version": "1.7.1.3"
       }
     }
   },
