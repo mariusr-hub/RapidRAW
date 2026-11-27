@@ -21,6 +21,9 @@
 
 > A beautiful, non-destructive, and GPU-accelerated RAW image editor built with performance in mind.
 
+> [!TIP]
+> **New in `v1.7.1.3`:** Explore the **[Complete Visual Feature Guide & What's New (v1.7.1 → v1.7.1.3)](docs/README.md)** — with 26 annotated screenshots covering all core features, AI Denoise, Speed Culler, Unified Merge, Drizzle Super-Res, Client Delivery, and more.
+
 RapidRAW is a modern, high-performance alternative to Adobe Lightroom®. It delivers a simple, beautiful editing experience in a lightweight package for Windows, macOS, Linux, and Android.
 
 I started developing this project as a personal challenge when I was 18. My goal was to create a high-performance tool for my own photography workflow while deepening my understanding of React, WGSL and Rust.
